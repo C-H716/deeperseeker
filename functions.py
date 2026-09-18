@@ -226,7 +226,19 @@ def get_headers(auth_token, pow=None):
 
 def _extract_login_token(payload):
     """Find a bearer token across the login response shapes used by DeepSeek."""
+    if isinstance(payload, str):
+        candidate = payload.strip()
+        if candidate.startswith("{") or candidate.startswith("["):
+            try:
+                return _extract_login_token(json.loads(candidate))
+            except json.JSONDecodeError:
+                return None
+        return None
     if isinstance(payload, dict):
+        # Current web login shape: data.biz_data.user.token.
+        user = payload.get("data", {}).get("biz_data", {}).get("user") if isinstance(payload.get("data"), dict) else None
+        if isinstance(user, dict) and isinstance(user.get("token"), str) and user["token"].strip():
+            return user["token"].strip()
         for key in ("token", "access_token", "auth_token"):
             value = payload.get(key)
             if isinstance(value, str) and value.strip():
@@ -279,6 +291,12 @@ async def login_deepseek_account(email, password, device_id=None):
             raise Exception("DeepSeek 登录接口返回了无效 JSON") from e
     token = _extract_login_token(data)
     if not token:
+        if isinstance(data, dict):
+            logger.warning(
+                "DeepSeek login returned no token; response keys=%s data keys=%s",
+                sorted(data.keys()),
+                sorted(data.get("data", {}).keys()) if isinstance(data.get("data"), dict) else type(data.get("data")).__name__,
+            )
         raise Exception("DeepSeek 登录成功但响应中没有找到 Token")
     return token
 
