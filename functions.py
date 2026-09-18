@@ -1523,9 +1523,13 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
     )
     async with response:
         resp_json = await response.json()
-    file_id = resp_json["data"]["biz_data"]["id"]
+    biz_data = (resp_json.get("data") or {}).get("biz_data") or {}
+    file_id = biz_data.get("id")
+    if not file_id:
+        # Server returned no file id (WAF block / rate limit / malformed response).
+        raise Exception(f"File upload failed: {json.dumps(resp_json, ensure_ascii=False)[:500]}")
     yield ("uploaded", file_id)
-    js_data = resp_json["data"]["biz_data"]
+    js_data = biz_data
     status = js_data["status"]
     headers = get_headers(auth_token)
     deadline = time.time() + 300
@@ -1538,7 +1542,13 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
             # cookies=cookie,  # Backup WAF fallback
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
-            js_data = (await resp.json())["data"]["biz_data"]["files"][0]
+            resp_json = await resp.json()
+        biz_data = (resp_json.get("data") or {}).get("biz_data") or {}
+        files = biz_data.get("files") or []
+        if not files:
+            # File still being registered server-side; keep waiting.
+            continue
+        js_data = files[0]
         status = js_data["status"]
     if status == "SUCCESS":
         tp_data = datetime.fromtimestamp(js_data["updated_at"], timezone.utc)
