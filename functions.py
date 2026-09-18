@@ -236,7 +236,9 @@ def _extract_login_token(payload):
         return None
     if isinstance(payload, dict):
         # Current web login shape: data.biz_data.user.token.
-        user = payload.get("data", {}).get("biz_data", {}).get("user") if isinstance(payload.get("data"), dict) else None
+        data_section = payload.get("data")
+        biz_data = data_section.get("biz_data") if isinstance(data_section, dict) else None
+        user = biz_data.get("user") if isinstance(biz_data, dict) else None
         if isinstance(user, dict) and isinstance(user.get("token"), str) and user["token"].strip():
             return user["token"].strip()
         for key in ("token", "access_token", "auth_token"):

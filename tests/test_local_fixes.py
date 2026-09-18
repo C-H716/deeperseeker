@@ -10,7 +10,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import API_KEY, SINGLE_MODEL, convert_anthropic_messages, resolve_model
-from functions import parse_tools
+from functions import _extract_login_token, parse_tools
 from plugin_helper import build_prompt, generate_signature_sync
 
 
@@ -103,6 +103,13 @@ def test_single_model_resolution():
     # normalize to it so legacy clients (instant/expert/vision/claude-*) work.
     for legacy in ("instant", "expert", "vision", "anthropic/claude-expert", "gpt-4o", "", None):
         assert resolve_model(legacy) == SINGLE_MODEL == "v4.1flash"
+
+
+def test_login_token_extraction_handles_null_sections():
+    # Failed logins may return null data sections instead of a user object.
+    assert _extract_login_token({"data": None}) is None
+    assert _extract_login_token({"data": {"biz_data": None}}) is None
+    assert _extract_login_token({"data": {"biz_data": {"user": {"token": "abc"}}}}) == "abc"
 
 
 def main():
