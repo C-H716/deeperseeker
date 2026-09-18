@@ -6,6 +6,7 @@ import mimetypes
 import os
 import random
 import re
+import secrets
 import sqlite3
 import string
 import time
@@ -75,7 +76,18 @@ def init_db():
             token TEXT,
             status TEXT DEFAULT 'ACTIVE',
             last_checked_at TEXT,
-            last_check_error TEXT
+            last_check_error TEXT,
+            account_id INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            alias TEXT,
+            token_id INTEGER,
+            status TEXT DEFAULT 'ACTIVE',
+            last_login_at TEXT,
+            last_error TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS sessions (
             signature TEXT PRIMARY KEY,
@@ -96,6 +108,8 @@ def init_db():
         conn.execute("ALTER TABLE tokens ADD COLUMN last_checked_at TEXT")
     if "last_check_error" not in token_columns:
         conn.execute("ALTER TABLE tokens ADD COLUMN last_check_error TEXT")
+    if "account_id" not in token_columns:
+        conn.execute("ALTER TABLE tokens ADD COLUMN account_id INTEGER")
     conn.commit()
     conn.close()
     try:
@@ -208,6 +222,65 @@ def get_headers(auth_token, pow=None):
     if pow:
         headers["x-ds-pow-response"] = pow
     return headers
+
+
+def _extract_login_token(payload):
+    """Find a bearer token across the login response shapes used by DeepSeek."""
+    if isinstance(payload, dict):
+        for key in ("token", "access_token", "auth_token"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in payload.values():
+            token = _extract_login_token(value)
+            if token:
+                return token
+    elif isinstance(payload, list):
+        for value in payload:
+            token = _extract_login_token(value)
+            if token:
+                return token
+    return None
+
+
+async def login_deepseek_account(email, password, device_id=None):
+    """Log in through DeepSeek's web endpoint and return its bearer token."""
+    if not email or not password:
+        raise ValueError("邮箱和密码不能为空")
+    headers = get_headers(None)
+    headers.update({
+        "accept": "application/json",
+        "origin": "https://chat.deepseek.com",
+        "referer": "https://chat.deepseek.com/",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    })
+    payload = {
+        "email": email,
+        "mobile": "",
+        "password": password,
+        "area_code": "",
+        "device_id": device_id or secrets.token_urlsafe(48),
+        "os": "web",
+    }
+    response = await post_with_failover(
+        "/api/v0/users/login",
+        headers=headers,
+        json=payload,
+        timeout=aiohttp.ClientTimeout(total=30),
+    )
+    async with response:
+        raw = await response.text()
+        if response.status != 200:
+            # Never include the submitted password in an error or log message.
+            raise Exception(f"HTTP {response.status}: {raw[:300]}")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise Exception("DeepSeek 登录接口返回了无效 JSON") from e
+    token = _extract_login_token(data)
+    if not token:
+        raise Exception("DeepSeek 登录成功但响应中没有找到 Token")
+    return token
 
 
 # ==============================================================================
@@ -352,7 +425,7 @@ def get_auth_token():
     return None
 
 
-def add_token(token, alias=None):
+def add_token(token, alias=None, account_id=None):
     conn = get_db()
     if not conn.execute("SELECT 1 FROM tokens WHERE id = 1").fetchone():
         next_id = 1
@@ -364,21 +437,25 @@ def add_token(token, alias=None):
             WHERE t2.id IS NULL
         """).fetchone()
         next_id = row[0] if row and row[0] else 1
-    conn.execute("INSERT INTO tokens (id, alias, token, status) VALUES (?, ?, ?, 'ACTIVE')", (next_id, alias, token))
+    conn.execute(
+        "INSERT INTO tokens (id, alias, token, status, account_id) VALUES (?, ?, ?, 'ACTIVE', ?)",
+        (next_id, alias, token, account_id),
+    )
     conn.commit()
     conn.close()
+    return next_id
 
 
 def get_tokens():
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, alias, token, status, last_checked_at, last_check_error FROM tokens ORDER BY id"
+        "SELECT id, alias, token, status, last_checked_at, last_check_error, account_id FROM tokens ORDER BY id"
     ).fetchall()
     conn.close()
     return [
         {
             "id": r[0], "alias": r[1], "token": r[2], "status": r[3],
-            "last_checked_at": r[4], "last_check_error": r[5],
+            "last_checked_at": r[4], "last_check_error": r[5], "account_id": r[6],
         }
         for r in rows
     ]
@@ -387,14 +464,14 @@ def get_tokens():
 def get_token(token_id):
     conn = get_db()
     row = conn.execute(
-        "SELECT id, alias, token, status, last_checked_at, last_check_error FROM tokens WHERE id = ?",
+        "SELECT id, alias, token, status, last_checked_at, last_check_error, account_id FROM tokens WHERE id = ?",
         (token_id,),
     ).fetchone()
     conn.close()
     if row:
         return {
             "id": row[0], "alias": row[1], "token": row[2], "status": row[3],
-            "last_checked_at": row[4], "last_check_error": row[5],
+            "last_checked_at": row[4], "last_check_error": row[5], "account_id": row[6],
         }
     return None
 
@@ -432,12 +509,91 @@ def mark_active(token_id):
     conn.close()
 
 
+def get_accounts():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, email, alias, token_id, status, last_login_at, last_error, created_at "
+        "FROM accounts ORDER BY id"
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def delete_account(account_id):
+    conn = get_db()
+    row = conn.execute("SELECT token_id FROM accounts WHERE id = ?", (account_id,)).fetchone()
+    if row and row[0]:
+        conn.execute("DELETE FROM tokens WHERE id = ?", (row[0],))
+    conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+    conn.commit()
+    conn.close()
+
+
+def _set_account_result(account_id, status, error=None, token_id=None):
+    conn = get_db()
+    conn.execute(
+        "UPDATE accounts SET status = ?, last_login_at = ?, last_error = ?, token_id = COALESCE(?, token_id) WHERE id = ?",
+        (status, datetime.now(timezone.utc).isoformat(), error, token_id, account_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_account_login(email, alias, auth_token):
+    """Create or replace an account and its corresponding pool token."""
+    conn = get_db()
+    existing = conn.execute("SELECT id, token_id FROM accounts WHERE email = ?", (email,)).fetchone()
+    if existing:
+        account_id, token_id = existing[0], existing[1]
+        if token_id:
+            conn.execute(
+                "UPDATE tokens SET alias = ?, token = ?, status = 'ACTIVE', last_check_error = NULL, account_id = ? WHERE id = ?",
+                (alias or email, auth_token, account_id, token_id),
+            )
+        else:
+            token_id = None
+    else:
+        account_id = None
+        token_id = None
+
+    if token_id is None:
+        conn.commit()
+        conn.close()
+        token_id = add_token(auth_token, alias or email, account_id=None)
+        conn = get_db()
+        if account_id is None:
+            cur = conn.execute(
+                "INSERT INTO accounts (email, alias, token_id, status, last_login_at, last_error) VALUES (?, ?, ?, 'ACTIVE', ?, NULL)",
+                (email, alias, token_id, datetime.now(timezone.utc).isoformat()),
+            )
+            account_id = cur.lastrowid
+        else:
+            conn.execute(
+                "UPDATE accounts SET alias = ?, token_id = ?, status = 'ACTIVE', last_login_at = ?, last_error = NULL WHERE id = ?",
+                (alias, token_id, datetime.now(timezone.utc).isoformat(), account_id),
+            )
+        conn.execute("UPDATE tokens SET account_id = ? WHERE id = ?", (account_id, token_id))
+    else:
+        conn.execute(
+            "UPDATE accounts SET alias = ?, status = 'ACTIVE', last_login_at = ?, last_error = NULL WHERE id = ?",
+            (alias, datetime.now(timezone.utc).isoformat(), account_id),
+        )
+    conn.commit()
+    conn.close()
+    return account_id
+
+
 def update_token_check(token_id, status, error=None):
     """Persist the latest periodic/manual token check result."""
     conn = get_db()
     conn.execute(
         "UPDATE tokens SET status = ?, last_checked_at = ?, last_check_error = ? WHERE id = ?",
         (status, datetime.now(timezone.utc).isoformat(), error, token_id),
+    )
+    conn.execute(
+        "UPDATE accounts SET status = ?, last_error = ? WHERE id = "
+        "(SELECT account_id FROM tokens WHERE id = ? AND account_id IS NOT NULL)",
+        (status, error, token_id),
     )
     conn.commit()
     conn.close()

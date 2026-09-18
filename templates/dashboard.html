@@ -3,6 +3,49 @@
 {% block content %}
 <h1>DeeperSeeker 控制台</h1>
 
+{% if account_error %}<p class="error">{{ account_error }}</p>{% endif %}
+{% if account_message %}<p class="success">{{ account_message }}</p>{% endif %}
+
+<section>
+    <h2>添加 DeepSeek 账号</h2>
+    <p class="hint">输入账号密码后，系统调用 DeepSeek 登录接口，成功后只保存返回的 Token，不保存密码。</p>
+    <form method="post" action="/accounts/add">
+        <input type="text" name="alias" placeholder="别名（可选）" style="width:180px">
+        <input type="email" name="email" placeholder="邮箱" required style="width:260px">
+        <input type="password" name="password" placeholder="密码" required style="width:220px" autocomplete="new-password">
+        <button type="submit">登录并加入号池</button>
+    </form>
+</section>
+
+<section>
+    <h2>账号列表（{{ accounts|length }}）</h2>
+    {% if accounts %}
+    <table>
+        <thead>
+            <tr><th>编号</th><th>邮箱</th><th>别名</th><th>状态</th><th>最近登录</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+        {% for account in accounts %}
+            <tr>
+                <td>{{ account['id'] }}</td>
+                <td>{{ account['email'] }}</td>
+                <td>{{ account['alias'] or '—' }}</td>
+                <td><span class="status {% if account['status'] == 'ACTIVE' %}ok{% elif account['status'] == 'CHECK_ERROR' %}warn{% else %}err{% endif %}">
+                    {% if account['status'] == 'ACTIVE' %}有效{% elif account['status'] == 'INVALID' %}已失效{% elif account['status'] == 'RATE_LIMITED' %}被限流{% else %}检查失败{% endif %}
+                </span></td>
+                <td>{{ account['last_login_at'] or '未登录' }}</td>
+                <td><form method="post" action="/accounts/{{ account['id'] }}/delete" style="display:inline" onsubmit="return confirm('确定删除这个账号及其 Token 吗？')">
+                    <button type="submit" class="btn-sm btn-danger">删除</button>
+                </form></td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>还没有通过账号登录添加账号。</p>
+    {% endif %}
+</section>
+
 <section>
     <h2>添加 DeepSeek 账号 Token</h2>
     <div class="steps">

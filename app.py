@@ -10,7 +10,7 @@ import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import deepseek_tokenizer
 import uvicorn
@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from uvicorn.logging import AccessFormatter
 from fastapi import FastAPI, Request, Depends, HTTPException, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -55,6 +55,10 @@ from functions import (
     save_session,
     send_message,
     check_token_status,
+    delete_account,
+    get_accounts,
+    login_deepseek_account,
+    save_account_login,
     StreamToolParser,
     upload_file,
     get_file_content,
@@ -1712,10 +1716,20 @@ async def dashboard(request: Request):
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     tokens = get_tokens()
+    accounts = get_accounts()
+    account_error = request.query_params.get("account_error")
+    account_message = request.query_params.get("account_message")
     return templates.TemplateResponse(
         request,
         "dashboard.html",
-        {"tokens": tokens, "token_check_state": _token_check_state, "check_interval": TOKEN_CHECK_INTERVAL},
+        {
+            "tokens": tokens,
+            "accounts": accounts,
+            "account_error": account_error,
+            "account_message": account_message,
+            "token_check_state": _token_check_state,
+            "check_interval": TOKEN_CHECK_INTERVAL,
+        },
     )
 
 
@@ -1731,6 +1745,38 @@ async def tokens_add(request: Request):
     if auth_token:
         add_token(auth_token, alias)
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
+
+
+@app.post("/accounts/add")
+async def accounts_add(request: Request):
+    """Log in an account and add only its returned bearer token to the pool."""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    form = await request.form()
+    email = str(form.get("email", "")).strip()
+    password = str(form.get("password", ""))
+    alias = str(form.get("alias", "")).strip() or None
+    if not email or not password:
+        return RedirectResponse("/dashboard?account_error=" + quote("邮箱和密码不能为空"), status_code=303)
+    try:
+        auth_token = await login_deepseek_account(email, password)
+        save_account_login(email, alias, auth_token)
+        return RedirectResponse("/dashboard?account_message=" + quote("账号登录成功，已加入 Token 号池"), status_code=303)
+    except Exception as e:
+        logger.warning("DeepSeek account login failed for %s: %s", email, str(e)[:300])
+        return RedirectResponse("/dashboard?account_error=" + quote("登录失败：" + str(e)[:180]), status_code=303)
+
+
+@app.post("/accounts/{account_id}/delete")
+async def accounts_delete(account_id: int, request: Request):
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    delete_account(account_id)
+    return RedirectResponse("/dashboard?account_message=" + quote("账号及其 Token 已删除"), status_code=303)
 
 
 @app.post("/tokens/check")

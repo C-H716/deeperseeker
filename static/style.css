@@ -35,6 +35,7 @@ th { color: #8b949e; font-weight: 600; }
 code { background: #0d1117; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
 .hint { color: #8b949e; font-size: 0.85em; margin-top: 8px; }
 .error { color: #ff7b72; margin-bottom: 12px; }
+.success { color: #7ee787; margin-bottom: 12px; }
 .form-row { margin-bottom: 10px; }
 .check-error { color: #e3b341; margin-left: 6px; cursor: help; }
 details { margin-top: 8px; }

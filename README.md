@@ -87,6 +87,8 @@ cp .env.example .env
 2. Console (F12): `JSON.parse(localStorage.getItem("userToken")).value`
 3. Paste raw token string into Dashboard (`/dashboard`). Close incognito window.
 
+The Chinese dashboard also supports adding an account directly with its DeepSeek email and password. The bridge calls `/api/v0/users/login`, stores only the returned bearer token, and does not persist the submitted password.
+
 ## API Endpoints & Usage
 
 - **OpenAI Base**: `http://localhost:4000/v1`
