@@ -173,21 +173,28 @@ async def extract_tools(tools):
         return None
     final_tools = []
     for i in tools:
+        if not isinstance(i, dict):
+            continue
         if i.get("type") == "function":
-            fn = i.get("function", {})
+            # Chat Completions nests the definition under ``function`` while
+            # Responses API places name/description/parameters at the top level.
+            fn = i.get("function") if isinstance(i.get("function"), dict) else i
             name = fn.get("name", "")
             desc = fn.get("description", "")
             params = fn.get("parameters", {})
-            final_tools.append(f"Tool: {name}\nDescription: {desc}\nParameters: {json.dumps(params)}")
+            if name:
+                final_tools.append(f"Tool: {name}\nDescription: {desc}\nParameters: {json.dumps(params)}")
         elif "name" in i:
             name = i.get("name", "")
             desc = i.get("description", "")
             params = i.get("input_schema", i.get("parameters", {}))
-            final_tools.append(f"Tool: {name}\nDescription: {desc}\nParameters: {json.dumps(params)}")
+            if name:
+                final_tools.append(f"Tool: {name}\nDescription: {desc}\nParameters: {json.dumps(params)}")
         elif i.get("type") in ["computer_use", "text_editor", "bash"]:
             final_tools.append(f"Tool: {i['type']}\nDescription: {json.dumps(i)}")
-        else:
-            final_tools.append(f"Tool: {json.dumps(i)}")
+        # Built-in Responses tools (web_search/file_search/etc.) cannot be
+        # invoked through the XML function bridge, so do not advertise them as
+        # empty or unusable function definitions to the upstream model.
     return "\n\n".join(final_tools) if final_tools else None
 
 

@@ -1092,72 +1092,330 @@ async def chat_completions(request: Request):
     return await handle_chat(messages, model, thinking, search, stream, tools, scope=get_api_key(request))
 
 
+def _responses_content_to_chat(content):
+    """Convert Responses API content parts into the bridge's chat format."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    converted = []
+    for part in content:
+        if isinstance(part, str):
+            converted.append({"type": "text", "text": part})
+            continue
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type in {"input_text", "output_text", "text"}:
+            converted.append({"type": "text", "text": part.get("text", "")})
+        elif part_type == "input_image":
+            if part.get("image_url"):
+                converted.append({"type": "image_url", "image_url": {"url": part["image_url"]}})
+            elif part.get("file_id"):
+                converted.append({"type": "image", "source": {"type": "file", "file_id": part["file_id"]}})
+        elif part_type == "input_file":
+            file_data = {key: part[key] for key in ("file_id", "file_data", "filename") if part.get(key) is not None}
+            if file_data:
+                converted.append({"type": "file", "file": file_data})
+        elif part_type == "refusal" and part.get("refusal"):
+            converted.append({"type": "text", "text": part["refusal"]})
+    return converted
+
+
+def convert_responses_input(body):
+    """Normalize OpenAI Responses input items into chat messages."""
+    messages = []
+    instructions = body.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        messages.append({"role": "system", "content": instructions})
+
+    inputs = body.get("input", [])
+    if isinstance(inputs, (str, dict)):
+        inputs = [inputs]
+    if not isinstance(inputs, list):
+        return messages
+
+    for item in inputs:
+        if isinstance(item, str):
+            messages.append({"role": "user", "content": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type", "message")
+        if item_type in {"message", None} or "role" in item:
+            role = item.get("role", "user")
+            if role == "developer":
+                role = "system"
+            content = _responses_content_to_chat(item.get("content", ""))
+            if content:
+                messages.append({"role": role, "content": content})
+            continue
+
+        if item_type == "function_call":
+            call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+            arguments = item.get("arguments", "{}")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments)
+            if item.get("name"):
+                messages.append({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": item["name"], "arguments": arguments},
+                    }],
+                })
+        elif item_type == "function_call_output":
+            output = item.get("output", "")
+            if isinstance(output, (dict, list)):
+                output = json.dumps(output, ensure_ascii=False)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": item.get("call_id") or item.get("id", ""),
+                "content": str(output),
+            })
+    return messages
+
+
+def _responses_payload(result, model, instructions=None):
+    """Convert an internal Chat Completions result to a Responses object."""
+    message = result["choices"][0]["message"]
+    response_id = result["id"].replace("chatcmpl-", "resp_", 1)
+    output = []
+    if message.get("content"):
+        output.append({
+            "type": "message",
+            "id": f"msg_{uuid.uuid4().hex}",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": message["content"], "annotations": []}],
+        })
+    for tool_call in message.get("tool_calls") or []:
+        function = tool_call.get("function", {})
+        output.append({
+            "type": "function_call",
+            "id": f"fc_{uuid.uuid4().hex}",
+            "call_id": tool_call.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+            "name": function.get("name", ""),
+            "arguments": function.get("arguments", "{}"),
+            "status": "completed",
+        })
+
+    usage = result.get("usage", {})
+    input_tokens = usage.get("prompt_tokens", 0)
+    output_tokens = usage.get("completion_tokens", 0)
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": result.get("created", int(time.time())),
+        "status": "completed",
+        "completed_at": int(time.time()),
+        "error": None,
+        "incomplete_details": None,
+        "instructions": instructions,
+        "model": model,
+        "output": output,
+        "parallel_tool_calls": True,
+        "previous_response_id": None,
+        "usage": {
+            "input_tokens": input_tokens,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": output_tokens,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": usage.get("total_tokens", input_tokens + output_tokens),
+        },
+    }
+
+
+def _responses_stream_state(response_id, model, instructions, status, output=None):
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": status,
+        "error": None,
+        "incomplete_details": None,
+        "instructions": instructions,
+        "model": model,
+        "output": output or [],
+        "parallel_tool_calls": True,
+        "previous_response_id": None,
+        "usage": None,
+    }
+
+
+def _responses_sse(event_type, payload):
+    return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def stream_openai_responses(chat_body_iterator, model, instructions=None):
+    """Translate the internal Chat Completions SSE stream to Responses events."""
+    response_id = f"resp_{uuid.uuid4().hex}"
+    message_id = f"msg_{uuid.uuid4().hex}"
+    response = _responses_stream_state(response_id, model, instructions, "in_progress")
+    yield _responses_sse("response.created", {"type": "response.created", "response": response})
+    yield _responses_sse("response.in_progress", {"type": "response.in_progress", "response": response})
+
+    buffer = ""
+    text_started = False
+    full_text = ""
+    tool_calls = {}
+
+    async for raw_chunk in chat_body_iterator:
+        if isinstance(raw_chunk, bytes):
+            raw_chunk = raw_chunk.decode("utf-8", errors="replace")
+        buffer += raw_chunk
+        while "\n\n" in buffer:
+            block, buffer = buffer.split("\n\n", 1)
+            data_lines = [line[5:].lstrip() for line in block.splitlines() if line.startswith("data:")]
+            if not data_lines:
+                continue
+            raw_data = "\n".join(data_lines)
+            if raw_data == "[DONE]":
+                continue
+            try:
+                event = json.loads(raw_data)
+            except Exception as e:
+                logger.warning("Could not translate internal Responses stream event: %s", e)
+                continue
+            if event.get("error"):
+                error = event["error"]
+                yield _responses_sse("error", {
+                    "type": "error",
+                    "message": error.get("message", "Upstream stream failed") if isinstance(error, dict) else str(error),
+                })
+                return
+
+            for choice in event.get("choices", []):
+                delta = choice.get("delta", {})
+                text_delta = delta.get("content")
+                if text_delta:
+                    if not text_started:
+                        text_started = True
+                        yield _responses_sse("response.output_item.added", {
+                            "type": "response.output_item.added",
+                            "output_index": 0,
+                            "item": {"id": message_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []},
+                        })
+                        yield _responses_sse("response.content_part.added", {
+                            "type": "response.content_part.added",
+                            "item_id": message_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "part": {"type": "output_text", "text": "", "annotations": []},
+                        })
+                    full_text += text_delta
+                    yield _responses_sse("response.output_text.delta", {
+                        "type": "response.output_text.delta",
+                        "item_id": message_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": text_delta,
+                    })
+
+                for tool_delta in delta.get("tool_calls", []):
+                    index = tool_delta.get("index", len(tool_calls))
+                    current = tool_calls.setdefault(index, {
+                        "id": tool_delta.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                        "name": "",
+                        "arguments": "",
+                    })
+                    function = tool_delta.get("function", {})
+                    current["name"] += function.get("name", "")
+                    current["arguments"] += function.get("arguments", "")
+
+    output = []
+    if text_started:
+        message_item = {
+            "id": message_id,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": full_text, "annotations": []}],
+        }
+        output.append(message_item)
+        yield _responses_sse("response.output_text.done", {
+            "type": "response.output_text.done",
+            "item_id": message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": full_text,
+        })
+        yield _responses_sse("response.content_part.done", {
+            "type": "response.content_part.done",
+            "item_id": message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": message_item["content"][0],
+        })
+        yield _responses_sse("response.output_item.done", {
+            "type": "response.output_item.done", "output_index": 0, "item": message_item,
+        })
+
+    for _, tool_call in sorted(tool_calls.items()):
+        output_index = len(output)
+        item = {
+            "type": "function_call",
+            "id": f"fc_{uuid.uuid4().hex}",
+            "call_id": tool_call["id"],
+            "name": tool_call["name"],
+            "arguments": tool_call["arguments"] or "{}",
+            "status": "completed",
+        }
+        output.append(item)
+        yield _responses_sse("response.output_item.added", {
+            "type": "response.output_item.added", "output_index": output_index, "item": {**item, "status": "in_progress"},
+        })
+        yield _responses_sse("response.function_call_arguments.done", {
+            "type": "response.function_call_arguments.done",
+            "item_id": item["id"],
+            "output_index": output_index,
+            "arguments": item["arguments"],
+        })
+        yield _responses_sse("response.output_item.done", {
+            "type": "response.output_item.done", "output_index": output_index, "item": item,
+        })
+
+    completed = _responses_stream_state(response_id, model, instructions, "completed", output)
+    completed["completed_at"] = int(time.time())
+    yield _responses_sse("response.completed", {"type": "response.completed", "response": completed})
+
+
 @app.post("/v1/responses")
 async def openai_responses(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
     body = await request.json()
     model = resolve_model(body.get("model"))
-    inputs = body.get("input", [])
-    if isinstance(inputs, str):
-        inputs = [inputs]
-    elif isinstance(inputs, dict):
-        inputs = [inputs]
-
-    messages = []
-    for item in inputs:
-        if isinstance(item, str):
-            messages.append({"role": "user", "content": item})
-            continue
-
-        role = item.get("role", "user")
-        content = item.get("content", [])
-        msg_content = []
-        if isinstance(content, str):
-            msg_content = content
-        else:
-            for c in content:
-                if c.get("type") == "input_text":
-                    msg_content.append({"type": "text", "text": c.get("text")})
-                elif c.get("type") == "input_file":
-                    msg_content.append({"type": "file", "file_id": c.get("file_id")})
-                else:
-                    msg_content.append(c)
-        messages.append({"role": role, "content": msg_content})
+    messages = convert_responses_input(body)
+    if not messages or not any(m.get("role") in {"user", "tool"} for m in messages):
+        return JSONResponse(
+            {"error": {"message": "Responses request contains no usable input", "type": "invalid_request_error"}},
+            status_code=400,
+        )
 
     thinking = is_thinking_enabled(body, request)
-    search = body.get("search", False)
+    search = body.get("search", False) or any(
+        isinstance(tool, dict) and tool.get("type") in {"web_search", "web_search_preview"}
+        for tool in body.get("tools", [])
+    )
     stream = body.get("stream", False)
     tools = body.get("tools", None)
 
     result = await handle_chat(messages, model, thinking, search, stream, tools, scope=get_api_key(request))
 
     if stream:
+        if isinstance(result, StreamingResponse):
+            return StreamingResponse(
+                stream_openai_responses(result.body_iterator, model, body.get("instructions")),
+                media_type="text/event-stream",
+            )
         return result
 
     if isinstance(result, dict) and "choices" in result:
-        message = result["choices"][0]["message"]
-        out_content = []
-        if message.get("content"):
-            out_content.append({"type": "text", "text": message["content"]})
-        if message.get("tool_calls"):
-            out_content.extend([{"type": "tool_call", "id": tc["id"], "name": tc["function"]["name"], "arguments": tc["function"]["arguments"]} for tc in message["tool_calls"]])
-
-        msg_output = {
-            "type": "message",
-            "role": "assistant",
-            "content": out_content
-        }
-        if message.get("reasoning_content"):
-            msg_output["reasoning_content"] = message["reasoning_content"]
-
-        return {
-            "id": result["id"],
-            "object": "response",
-            "model": result["model"],
-            "output": [msg_output],
-            "usage": result.get("usage", {})
-        }
+        return _responses_payload(result, model, body.get("instructions"))
     return result
 
 

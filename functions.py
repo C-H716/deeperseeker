@@ -1060,6 +1060,69 @@ async def create_new_chat(auth_token):
     return data["data"]["biz_data"]["chat_session"]["id"]
 
 
+def _deepseek_event_fragments(data):
+    """Extract response fragments from both direct and batched DeepSeek SSE events."""
+    found = []
+
+    def add_fragment(fragment):
+        if not isinstance(fragment, dict):
+            return
+        content = fragment.get("content")
+        if content is None:
+            return
+        fragment_type = str(fragment.get("type") or "RESPONSE").upper()
+        if fragment_type in {"RESPONSE", "THINK"}:
+            found.append((fragment_type, str(content)))
+
+    def visit(node):
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+            return
+        if not isinstance(node, dict):
+            return
+
+        if node.get("p") == "response/fragments" and isinstance(node.get("v"), list):
+            for fragment in node["v"]:
+                add_fragment(fragment)
+            return
+
+        response = node.get("response")
+        if isinstance(response, dict) and isinstance(response.get("fragments"), list):
+            for fragment in response["fragments"]:
+                add_fragment(fragment)
+            return
+
+        if "content" in node and str(node.get("type") or "").upper() in {"RESPONSE", "THINK"}:
+            add_fragment(node)
+            return
+
+        # Large replies are sometimes wrapped in BATCH operations. Walk only
+        # structured values so status strings are never mistaken for output.
+        for key in ("v", "data", "value"):
+            value = node.get(key)
+            if isinstance(value, (dict, list)):
+                visit(value)
+
+    visit(data)
+    return found
+
+
+def _deepseek_event_finished(data):
+    """Return True when a direct or batched event marks generation finished."""
+    if isinstance(data, list):
+        return any(_deepseek_event_finished(item) for item in data)
+    if not isinstance(data, dict):
+        return False
+    if data.get("p") in {"response/status", "quasi_status"} and data.get("v") == "FINISHED":
+        return True
+    return any(
+        _deepseek_event_finished(data.get(key))
+        for key in ("v", "data", "value")
+        if isinstance(data.get(key), (dict, list))
+    )
+
+
 async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, file_ids_=None):
     # Backup: WAF cookies not required with Android headers. Kept as fallback:
     # cookie = await get_cookies()
@@ -1082,6 +1145,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
 
     think_open = False
     got_output = False
+    recent_events = []
     resp = await post_with_failover(
         "/api/v0/chat/completion",
         headers=headers, json=json_data,
@@ -1097,73 +1161,52 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
             if not line:
                 continue
             decoded_line = line.decode("utf-8").strip()
-            if not decoded_line.startswith("data: "):
+            if not decoded_line.startswith("data:"):
                 continue
             try:
-                data = json.loads(decoded_line[6:])
-            except Exception:
+                data = json.loads(decoded_line[5:].lstrip())
+            except Exception as e:
+                logger.debug("Ignoring malformed DeepSeek SSE data for chat %s: %s", chat_id, e)
                 continue
-            if data.get("p") == "response/status" and data.get("v") == "FINISHED":
+            recent_events.append(data)
+            recent_events = recent_events[-5:]
+
+            for fragment_type, content in _deepseek_event_fragments(data):
+                if fragment_type == "THINK":
+                    if not think_open:
+                        yield "<think>\n"
+                        think_open = True
+                elif think_open:
+                    yield "\n</think>\n\n"
+                    think_open = False
+                if content:
+                    got_output = True
+                    yield content
+
+            v = data.get("v")
+            if not _deepseek_event_finished(data) and isinstance(v, str) and v:
+                got_output = True
+                yield v
+            if _deepseek_event_finished(data):
                 if think_open:
                     yield "\n</think>\n\n"
                 if not got_output:
-                    raise Exception("Empty response from DeepSeek (prompt may exceed the session context limit)")
+                    logger.warning(
+                        "DeepSeek finished without recognized output for chat %s; recent events=%s",
+                        chat_id,
+                        json.dumps(recent_events, ensure_ascii=False)[:2000],
+                    )
+                    raise Exception("DeepSeek finished without recognized output")
                 return
-            if data.get("o") == "BATCH" and isinstance(data.get("v"), list):
-                for op in data["v"]:
-                    if isinstance(op, dict) and op.get("p") == "quasi_status" and op.get("v") == "FINISHED":
-                        if think_open:
-                            yield "\n</think>\n\n"
-                        if not got_output:
-                            raise Exception("Empty response from DeepSeek (prompt may exceed the session context limit)")
-                        return
-            if "v" in data and isinstance(data["v"], dict) and "response" in data["v"]:
-                fragments = data["v"]["response"].get("fragments")
-                if fragments:
-                    for fragment in fragments:
-                        if fragment.get("type") == "THINK":
-                            if not think_open:
-                                yield "<think>\n"
-                                think_open = True
-                            got_output = True
-                            yield fragment.get("content", "")
-                        else:
-                            if think_open:
-                                yield "\n</think>\n\n"
-                                think_open = False
-                            got_output = True
-                            yield fragment.get("content", "")
-                continue
-
-            if data.get("p") == "response/fragments" and data.get("o") == "APPEND":
-                fragments = data.get("v")
-                if isinstance(fragments, list):
-                    for fragment in fragments:
-                        if fragment.get("type") == "RESPONSE":
-                            if think_open:
-                                yield "\n</think>\n\n"
-                                think_open = False
-                            got_output = True
-                            yield fragment.get("content", "")
-                        elif fragment.get("type") == "THINK":
-                            if not think_open:
-                                yield "<think>\n"
-                                think_open = True
-                            got_output = True
-                            yield fragment.get("content", "")
-                        else:
-                            got_output = True
-                            yield fragment.get("content", "")
-                continue
-
-            v = data.get("v")
-            if isinstance(v, str) and v:
-                got_output = True
-                yield v
         if think_open:
             yield "\n</think>\n\n"
         if not got_output:
-            raise Exception("Empty response from DeepSeek (prompt may exceed the session context limit)")
+            logger.warning(
+                "DeepSeek stream ended without recognized output for chat %s; recent events=%s",
+                chat_id,
+                json.dumps(recent_events, ensure_ascii=False)[:2000],
+            )
+            raise Exception("DeepSeek stream ended without recognized output")
 
 
 async def upload_file(file_bytes, file_name, file_content_type, auth_token):
