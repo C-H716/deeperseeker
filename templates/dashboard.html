@@ -1,45 +1,53 @@
 {% extends "base.html" %}
-{% block title %}Dashboard - DeeperSeeker{% endblock %}
+{% block title %}控制台 - DeeperSeeker{% endblock %}
 {% block content %}
-<h1>Dashboard</h1>
+<h1>DeeperSeeker 控制台</h1>
 
 <section>
-    <h2>Add Auth Token</h2>
+    <h2>添加 DeepSeek 账号 Token</h2>
     <div class="steps">
-        <p><strong>Steps:</strong></p>
+        <p><strong>获取步骤：</strong></p>
         <ol>
-            <li>Open <strong>incognito/private</strong> window</li>
-            <li>Go to <a href="https://chat.deepseek.com" target="_blank">chat.deepseek.com</a> and login</li>
-            <li>Open DevTools (F12) → Console → paste:</li>
+            <li>打开浏览器无痕/隐私窗口</li>
+            <li>访问 <a href="https://chat.deepseek.com" target="_blank">chat.deepseek.com</a> 并登录</li>
+            <li>打开开发者工具（F12）→ Console，粘贴：</li>
         </ol>
         <code>JSON.parse(localStorage.getItem("userToken")).value</code>
         <ol start="4">
-            <li>Copy the token and paste below</li>
-            <li><strong>Remove any surrounding quotes</strong> — paste only the raw token string</li>
-            <li><strong>Close the incognito window</strong> to preserve the login</li>
+            <li>复制 Token 并粘贴到下面的输入框</li>
+            <li><strong>去掉首尾引号</strong>，只保留原始 Token</li>
+            <li><strong>关闭无痕窗口</strong>以保留登录状态</li>
         </ol>
     </div>
     <div class="warning">
-        If you logout from DeepSeek in browser, this token stops working.
+        如果在浏览器中退出 DeepSeek，该 Token 将失效。
     </div>
     <form method="post" action="/tokens/add">
-        <input type="text" name="alias" placeholder="Alias (optional, e.g. personal, work)" style="width:200px">
-        <input type="text" name="auth_token" placeholder="Paste auth token here (no quotes)" style="width:400px">
-        <button type="submit">Add Token</button>
+        <input type="text" name="alias" placeholder="别名（可选，例如：个人、工作）" style="width:220px">
+        <input type="text" name="auth_token" placeholder="粘贴 Token（不要带引号）" style="width:400px">
+        <button type="submit">添加 Token</button>
     </form>
 </section>
 
 <section>
-    <h2>Tokens ({{ tokens|length }})</h2>
+    <div class="section-heading">
+        <h2>Token 号池（{{ tokens|length }}）</h2>
+        <button type="button" id="check-all" class="btn-secondary">立即检查全部</button>
+    </div>
+    <p class="hint">系统每 {{ (check_interval // 60) }} 分钟自动检查一次。检查只调用认证探测接口，不发送模型消息。</p>
+    <p id="check-message" class="hint" aria-live="polite">
+        {% if token_check_state.last_run_at %}上次检查：{{ token_check_state.last_run_at }}{% else %}尚未执行检查{% endif %}
+    </p>
     {% if tokens %}
     <table>
         <thead>
             <tr>
-                <th>ID</th>
-                <th>Alias</th>
+                <th>编号</th>
+                <th>别名</th>
                 <th>Token</th>
-                <th>Status</th>
-                <th>Actions</th>
+                <th>状态</th>
+                <th>最近检查</th>
+                <th>操作</th>
             </tr>
         </thead>
         <tbody>
@@ -49,14 +57,19 @@
                 <td>{{ tok['alias'] or '—' }}</td>
                 <td><code>{{ tok['token'][:12] }}…{{ tok['token'][-4:] }}</code></td>
                 <td>
-                    <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] == 'RATE_LIMITED' %}warn{% else %}err{% endif %}">
-                        {{ tok['status'] }}
+                    <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] in ('RATE_LIMITED', 'CHECK_ERROR') %}warn{% else %}err{% endif %}">
+                        {% if tok['status'] == 'ACTIVE' %}有效{% elif tok['status'] == 'RATE_LIMITED' %}被限流{% elif tok['status'] == 'INVALID' %}已失效{% elif tok['status'] == 'CHECK_ERROR' %}检查失败{% else %}{{ tok['status'] }}{% endif %}
                     </span>
                 </td>
                 <td>
+                    {% if tok['last_checked_at'] %}{{ tok['last_checked_at'] }}{% else %}未检查{% endif %}
+                    {% if tok['last_check_error'] %}<span class="check-error" title="{{ tok['last_check_error'] }}">⚠</span>{% endif %}
+                </td>
+                <td>
+                    <button type="button" class="btn-sm check-one" data-token-id="{{ tok['id'] }}">检查</button>
                     <form method="post" action="/tokens/{{ tok['id'] }}/delete" style="display:inline"
-                          onsubmit="return confirm('Delete?')">
-                        <button type="submit" class="btn-sm btn-danger">Delete</button>
+                          onsubmit="return confirm('确定删除这个 Token 吗？')">
+                        <button type="submit" class="btn-sm btn-danger">删除</button>
                     </form>
                 </td>
             </tr>
@@ -64,14 +77,38 @@
         </tbody>
     </table>
     {% else %}
-    <p>No tokens yet.</p>
+    <p>号池中还没有 Token。</p>
     {% endif %}
 </section>
 
 <section>
-    <h2>API</h2>
-    <p>OpenAI: <code>http://localhost:4000/v1</code></p>
-    <p>Anthropic: <code>http://localhost:4000</code></p>
-    <p>Model: <code>v4.1flash</code> (single default DeepSeek model)</p>
+    <h2>接口信息</h2>
+    <p>OpenAI 兼容接口：<code>http://localhost:4000/v1</code></p>
+    <p>Anthropic 兼容接口：<code>http://localhost:4000</code></p>
+    <p>默认模型：<code>v4.1flash</code></p>
 </section>
+<script>
+const message = document.getElementById('check-message');
+const checkButtons = document.querySelectorAll('.check-one');
+const checkAll = document.getElementById('check-all');
+async function checkToken(tokenId) {
+    const url = tokenId ? `/tokens/check?token_id=${encodeURIComponent(tokenId)}` : '/tokens/check';
+    message.textContent = '正在检查，请稍候…';
+    checkButtons.forEach(button => button.disabled = true);
+    if (checkAll) checkAll.disabled = true;
+    try {
+        const response = await fetch(url, {method: 'POST', headers: {'Accept': 'application/json'}});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || '检查失败');
+        message.textContent = `检查完成：${data.results.length} 个 Token，页面即将刷新`;
+        window.setTimeout(() => window.location.reload(), 500);
+    } catch (error) {
+        message.textContent = `检查失败：${error.message}`;
+        checkButtons.forEach(button => button.disabled = false);
+        if (checkAll) checkAll.disabled = false;
+    }
+}
+checkButtons.forEach(button => button.addEventListener('click', () => checkToken(button.dataset.tokenId)));
+if (checkAll) checkAll.addEventListener('click', () => checkToken(null));
+</script>
 {% endblock %}

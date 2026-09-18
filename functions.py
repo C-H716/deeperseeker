@@ -73,7 +73,9 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             alias TEXT,
             token TEXT,
-            status TEXT DEFAULT 'ACTIVE'
+            status TEXT DEFAULT 'ACTIVE',
+            last_checked_at TEXT,
+            last_check_error TEXT
         );
         CREATE TABLE IF NOT EXISTS sessions (
             signature TEXT PRIMARY KEY,
@@ -88,6 +90,12 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
+    # Keep existing Docker volumes compatible with the token health metadata.
+    token_columns = {row[1] for row in conn.execute("PRAGMA table_info(tokens)").fetchall()}
+    if "last_checked_at" not in token_columns:
+        conn.execute("ALTER TABLE tokens ADD COLUMN last_checked_at TEXT")
+    if "last_check_error" not in token_columns:
+        conn.execute("ALTER TABLE tokens ADD COLUMN last_check_error TEXT")
     conn.commit()
     conn.close()
     try:
@@ -363,17 +371,31 @@ def add_token(token, alias=None):
 
 def get_tokens():
     conn = get_db()
-    rows = conn.execute("SELECT id, alias, token, status FROM tokens").fetchall()
+    rows = conn.execute(
+        "SELECT id, alias, token, status, last_checked_at, last_check_error FROM tokens ORDER BY id"
+    ).fetchall()
     conn.close()
-    return [{"id": r[0], "alias": r[1], "token": r[2], "status": r[3]} for r in rows]
+    return [
+        {
+            "id": r[0], "alias": r[1], "token": r[2], "status": r[3],
+            "last_checked_at": r[4], "last_check_error": r[5],
+        }
+        for r in rows
+    ]
 
 
 def get_token(token_id):
     conn = get_db()
-    row = conn.execute("SELECT id, alias, token, status FROM tokens WHERE id = ?", (token_id,)).fetchone()
+    row = conn.execute(
+        "SELECT id, alias, token, status, last_checked_at, last_check_error FROM tokens WHERE id = ?",
+        (token_id,),
+    ).fetchone()
     conn.close()
     if row:
-        return {"id": row[0], "alias": row[1], "token": row[2], "status": row[3]}
+        return {
+            "id": row[0], "alias": row[1], "token": row[2], "status": row[3],
+            "last_checked_at": row[4], "last_check_error": row[5],
+        }
     return None
 
 
@@ -408,6 +430,43 @@ def mark_active(token_id):
     conn.execute("UPDATE tokens SET status = ? WHERE id = ?", ("ACTIVE", token_id))
     conn.commit()
     conn.close()
+
+
+def update_token_check(token_id, status, error=None):
+    """Persist the latest periodic/manual token check result."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET status = ?, last_checked_at = ?, last_check_error = ? WHERE id = ?",
+        (status, datetime.now(timezone.utc).isoformat(), error, token_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+async def check_token_status(token_id):
+    """Probe authentication without creating a chat or sending model content."""
+    token = get_token(token_id)
+    if not token:
+        return {"id": token_id, "status": "NOT_FOUND", "error": "Token 不存在"}
+
+    try:
+        # The challenge endpoint authenticates the bearer token and has no model
+        # side effect, unlike chat_session/create or chat/completion.
+        challenge = await create_challange_pow("/api/v0/chat/completion", token["token"])
+        if isinstance(challenge, dict) and challenge.get("challenge"):
+            update_token_check(token_id, "ACTIVE")
+            return {"id": token_id, "status": "ACTIVE", "error": None}
+        error = "上游返回了无效的认证挑战"
+        update_token_check(token_id, "CHECK_ERROR", error)
+        return {"id": token_id, "status": "CHECK_ERROR", "error": error}
+    except Exception as e:
+        message = str(e)[:300]
+        match = re.match(r"HTTP (\d{3}):", message)
+        code = int(match.group(1)) if match else None
+        status = "INVALID" if code in (401, 403) else "RATE_LIMITED" if code == 429 else "CHECK_ERROR"
+        update_token_check(token_id, status, message)
+        logger.warning("Token #%s health check failed (%s): %s", token_id, status, message)
+        return {"id": token_id, "status": status, "error": message}
 
 
 def find_session(sig):

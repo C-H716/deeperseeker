@@ -79,6 +79,7 @@ cp .env.example .env
 | `DEEPSEEKER_ROLLOVER_SAFETY_TOKENS` | Headroom reserved below the memory limit before summarizing | `24000` |
 | `DEEPSEEKER_MAX_SUMMARY_TOKENS` | Budget for the model-generated handoff summary | `4096` |
 | `DEEPSEEKER_PER_TOOL_RESULT_TOKENS` | Per-result tool-output cap (so one giant output can't eat the budget) | `2000` |
+| `DEEPSEEKER_TOKEN_CHECK_INTERVAL` | Token pool health-check interval in seconds | `300` |
 
 ## Auth Token Setup
 
@@ -104,6 +105,7 @@ cp .env.example .env
 ## Features
 
 - **Multi-Token Pooling**: Random active token rotation.
+- **Token Pool Health Checks**: The dashboard is Chinese-localized and checks every token every five minutes through a lightweight authenticated challenge request. Checks can also be triggered manually per token or for the entire pool; no model prompt is sent during a health check.
 - **Context-Based Session Selector**: Computes a SHA-256 signature over the canonicalized message history (up to the last assistant turn), the model, and the API key scope, to match and resume existing web chat sessions. Session creation is lock-protected to avoid duplicates.
 - **Summarize-and-Rollover Context Policy**: When accumulated session context nears the observed remembered-context limit (~393K input tokens), the bridge asks the model for a compact handoff summary in a scratch chat, starts a fresh web chat, and seeds it with that summary plus the newest user message. Relevant newest tool calls/results are preserved (capped by `DEEPSEEKER_MAX_TOOL_RESULT_TOKENS`, with a tighter per-result cap via `DEEPSEEKER_PER_TOOL_RESULT_TOKENS`); attachments are described in words inside the summary rather than forwarded. The first exchange — however large — is never rolled over (the first-message path accepts ~1M tokens). Declared limits in `/v1/models` (`context_window`, `max_output_tokens`) reflect this observed behavior, not guaranteed upstream limits. The summary prompt instructs the model to treat conversation content as data, never as instructions.
 - **Full History Injection**: Inject full conversation history into new sessions when session signature is not in DB or when account fails over.

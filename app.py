@@ -54,6 +54,7 @@ from functions import (
     pick_token,
     save_session,
     send_message,
+    check_token_status,
     StreamToolParser,
     upload_file,
     get_file_content,
@@ -147,11 +148,60 @@ def count_tok(text):
     return len(deepseek_tokenizer.ds_token.encode(text))
 
 
+TOKEN_CHECK_INTERVAL = int(os.getenv("DEEPSEEKER_TOKEN_CHECK_INTERVAL", "300"))
+_token_check_lock = asyncio.Lock()
+_token_check_task = None
+_token_check_state = {"running": False, "last_run_at": None, "last_results": []}
+
+
+async def _run_token_checks():
+    """Check every token sequentially and expose a compact dashboard summary."""
+    if _token_check_lock.locked():
+        return list(_token_check_state["last_results"])
+    async with _token_check_lock:
+        _token_check_state["running"] = True
+        results = []
+        try:
+            for token in get_tokens():
+                results.append(await check_token_status(token["id"]))
+            _token_check_state["last_results"] = results
+            _token_check_state["last_run_at"] = time.time()
+            return results
+        except Exception:
+            logger.exception("Token health-check batch failed")
+            raise
+        finally:
+            _token_check_state["running"] = False
+
+
+async def _token_check_loop():
+    """Run one delayed check, then repeat every configured five-minute interval."""
+    while True:
+        await asyncio.sleep(TOKEN_CHECK_INTERVAL)
+        try:
+            await _run_token_checks()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Scheduled token health-check failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _token_check_task
     init_db()
     _install_key_access_formatter()
+    _token_check_task = asyncio.create_task(_token_check_loop(), name="token-health-check")
     yield
+    if _token_check_task:
+        _token_check_task.cancel()
+        try:
+            await _token_check_task
+        except asyncio.CancelledError:
+            logger.info("Token health-check task stopped")
+        except Exception:
+            logger.exception("Token health-check task stopped with an error")
+        _token_check_task = None
 
 
 app = FastAPI(title="DeeperSeeker", lifespan=lifespan)
@@ -1631,7 +1681,7 @@ async def login_submit(request: Request):
     username = form.get("username", "")
     password = form.get("password", "")
     if time.time() < _login_fails["locked_until"]:
-        return templates.TemplateResponse(request, "login.html", {"error": "Too many attempts. Try again later."})
+        return templates.TemplateResponse(request, "login.html", {"error": "登录尝试次数过多，请 5 分钟后再试。"})
     if secrets.compare_digest(username.encode("utf-8"), ADMIN_USER.encode("utf-8")) and secrets.compare_digest(password.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8")):
         _login_fails["count"] = 0
         sid = str(uuid.uuid4())
@@ -1643,7 +1693,7 @@ async def login_submit(request: Request):
     if _login_fails["count"] >= 5:
         _login_fails["locked_until"] = time.time() + 300
         _login_fails["count"] = 0
-    return templates.TemplateResponse(request, "login.html", {"error": "Invalid username or password"})
+    return templates.TemplateResponse(request, "login.html", {"error": "用户名或密码错误。"})
 
 
 @app.get("/logout")
@@ -1662,7 +1712,11 @@ async def dashboard(request: Request):
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     tokens = get_tokens()
-    return templates.TemplateResponse(request, "dashboard.html", {"tokens": tokens})
+    return templates.TemplateResponse(
+        request,
+        "dashboard.html",
+        {"tokens": tokens, "token_check_state": _token_check_state, "check_interval": TOKEN_CHECK_INTERVAL},
+    )
 
 
 @app.post("/tokens/add")
@@ -1677,6 +1731,24 @@ async def tokens_add(request: Request):
     if auth_token:
         add_token(auth_token, alias)
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
+
+
+@app.post("/tokens/check")
+async def tokens_check(request: Request, token_id: int | None = None):
+    """Run a manual check for one token or the complete token pool."""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return JSONResponse({"error": "未登录或登录已过期"}, status_code=401)
+    if token_id is None:
+        results = await _run_token_checks()
+    else:
+        async with _token_check_lock:
+            results = [await check_token_status(token_id)]
+            _token_check_state["last_results"] = results
+            _token_check_state["last_run_at"] = time.time()
+    # The page reloads to show updated rows; never echo raw bearer tokens in JSON.
+    return JSONResponse({"results": results, "checked_at": _token_check_state["last_run_at"]})
 
 
 @app.post("/tokens/{token_id}/delete")
