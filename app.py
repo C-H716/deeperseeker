@@ -1626,6 +1626,9 @@ async def list_models(request: Request):
             "owned_by": "deeperseeker",
             "context_window": context_window_tokens(),
             "max_output_tokens": max_output_tokens(),
+            # OpenAI-compatible modality declaration
+            "input_modalities": ["text", "image", "pdf"],
+            "output_modalities": ["text"],
             "capabilities": {
                 "batch": {"supported": True},
                 "code_execution": {"supported": True},
