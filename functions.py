@@ -261,19 +261,23 @@ async def login_deepseek_account(email, password, device_id=None):
     """Log in through DeepSeek's web endpoint and return its bearer token."""
     if not email or not password:
         raise ValueError("邮箱和密码不能为空")
-    headers = get_headers(None)
-    headers.update({
+    # Match the browser login request; Android client headers can change the response shape.
+    headers = {
+        "content-type": "application/json",
         "accept": "application/json",
         "origin": "https://chat.deepseek.com",
         "referer": "https://chat.deepseek.com/",
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    })
+    }
+    normalized_email = str(email).strip().replace("\\@", "@")
+    # Web login device IDs are base64-encoded 64-byte values (88 characters).
+    normalized_device_id = str(device_id).strip() if device_id else base64.b64encode(secrets.token_bytes(64)).decode("ascii")
     payload = {
-        "email": email,
+        "email": normalized_email,
         "mobile": "",
         "password": password,
         "area_code": "",
-        "device_id": device_id or secrets.token_urlsafe(48),
+        "device_id": normalized_device_id,
         "os": "web",
     }
     response = await post_with_failover(

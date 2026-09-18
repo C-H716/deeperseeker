@@ -10,7 +10,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import API_KEY, SINGLE_MODEL, convert_anthropic_messages, resolve_model
-from functions import _extract_login_token, parse_tools
+from functions import _extract_login_token, login_deepseek_account, parse_tools
 from plugin_helper import build_prompt, generate_signature_sync
 
 
@@ -110,6 +110,40 @@ def test_login_token_extraction_handles_null_sections():
     assert _extract_login_token({"data": None}) is None
     assert _extract_login_token({"data": {"biz_data": None}}) is None
     assert _extract_login_token({"data": {"biz_data": {"user": {"token": "abc"}}}}) == "abc"
+
+
+def test_account_login_uses_browser_contract():
+    import functions
+
+    captured = {}
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def text(self):
+            return '{"data":{"biz_data":{"user":{"token":"abc"}}}}'
+
+    async def fake_post(path, *, headers, **kwargs):
+        captured.update(path=path, headers=headers, payload=kwargs["json"])
+        return FakeResponse()
+
+    original_post = functions.post_with_failover
+    functions.post_with_failover = fake_post
+    try:
+        token = asyncio.run(login_deepseek_account(r"user\@example.com", "password"))
+    finally:
+        functions.post_with_failover = original_post
+
+    assert token == "abc"
+    assert captured["payload"]["email"] == "user@example.com"
+    assert len(captured["payload"]["device_id"]) == 88
+    assert captured["headers"]["user-agent"].startswith("Mozilla/5.0")
 
 
 def main():
