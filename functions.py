@@ -257,6 +257,26 @@ def _extract_login_token(payload):
     return None
 
 
+def _redact_login_response(value):
+    """Redact credentials before writing a DeepSeek login response to logs."""
+    sensitive_markers = ("token", "password", "authorization", "cookie", "secret")
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            key_text = str(key).lower()
+            redacted[key] = "[REDACTED]" if any(marker in key_text for marker in sensitive_markers) else _redact_login_response(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_login_response(item) for item in value]
+    return value
+
+
+def _generate_web_device_id():
+    """Generate the browser-style device ID accepted by the web login endpoint."""
+    alphabet = string.ascii_letters + string.digits + "+/"
+    return "B" + "".join(secrets.choice(alphabet) for _ in range(86)) + "=="
+
+
 async def login_deepseek_account(email, password, device_id=None):
     """Log in through DeepSeek's web endpoint and return its bearer token."""
     if not email or not password:
@@ -271,7 +291,9 @@ async def login_deepseek_account(email, password, device_id=None):
     }
     normalized_email = str(email).strip().replace("\\@", "@")
     # Web login device IDs are base64-encoded 64-byte values (88 characters).
-    normalized_device_id = str(device_id).strip() if device_id else base64.b64encode(secrets.token_bytes(64)).decode("ascii")
+    normalized_device_id = str(device_id).strip() if device_id else (
+        os.getenv("DEEPSEEKER_DEVICE_ID", "").strip() or _generate_web_device_id()
+    )
     payload = {
         "email": normalized_email,
         "mobile": "",
@@ -280,6 +302,13 @@ async def login_deepseek_account(email, password, device_id=None):
         "device_id": normalized_device_id,
         "os": "web",
     }
+    # Log the outbound contract for diagnosis, while never exposing the password.
+    logger.info(
+        "DeepSeek login request path=%s headers=%s payload=%s",
+        "/api/v0/users/login",
+        json.dumps(_redact_login_response(headers), ensure_ascii=False, separators=(",", ":")),
+        json.dumps(_redact_login_response(payload), ensure_ascii=False, separators=(",", ":")),
+    )
     response = await post_with_failover(
         "/api/v0/users/login",
         headers=headers,
@@ -288,9 +317,18 @@ async def login_deepseek_account(email, password, device_id=None):
     )
     async with response:
         raw = await response.text()
+        # Log non-JSON responses too; 202 responses are often empty during upstream checks.
+        try:
+            response_for_log = json.dumps(
+                _redact_login_response(json.loads(raw)), ensure_ascii=False, separators=(",", ":")
+            ) if raw else "<empty>"
+        except json.JSONDecodeError:
+            response_for_log = raw[:4000] or "<empty>"
+        logger.info("DeepSeek login response status=%s body=%s", response.status, response_for_log)
         if response.status != 200:
             # Never include the submitted password in an error or log message.
-            raise Exception(f"HTTP {response.status}: {raw[:300]}")
+            detail = raw[:300] if raw else "empty response body"
+            raise Exception(f"HTTP {response.status}: {detail}")
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
@@ -298,11 +336,18 @@ async def login_deepseek_account(email, password, device_id=None):
     token = _extract_login_token(data)
     if not token:
         if isinstance(data, dict):
+            response_data = data.get("data") if isinstance(data.get("data"), dict) else {}
+            biz_code = response_data.get("biz_code")
+            biz_msg = response_data.get("biz_msg")
             logger.warning(
-                "DeepSeek login returned no token; response keys=%s data keys=%s",
+                "DeepSeek login returned no token; biz_code=%s biz_msg=%s response keys=%s data keys=%s",
+                biz_code,
+                biz_msg,
                 sorted(data.keys()),
-                sorted(data.get("data", {}).keys()) if isinstance(data.get("data"), dict) else type(data.get("data")).__name__,
+                sorted(response_data.keys()) if response_data else type(data.get("data")).__name__,
             )
+            if biz_code or biz_msg:
+                raise Exception(f"DeepSeek 登录失败（{biz_code or 'unknown'}: {biz_msg or 'unknown'}）")
         raise Exception("DeepSeek 登录成功但响应中没有找到 Token")
     return token
 

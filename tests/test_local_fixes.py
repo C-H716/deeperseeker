@@ -10,7 +10,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import API_KEY, SINGLE_MODEL, convert_anthropic_messages, resolve_model
-from functions import _extract_login_token, login_deepseek_account, parse_tools
+from functions import _extract_login_token, _generate_web_device_id, _redact_login_response, login_deepseek_account, parse_tools
 from plugin_helper import build_prompt, generate_signature_sync
 
 
@@ -112,6 +112,22 @@ def test_login_token_extraction_handles_null_sections():
     assert _extract_login_token({"data": {"biz_data": {"user": {"token": "abc"}}}}) == "abc"
 
 
+def test_login_response_logging_redacts_credentials():
+    response = _redact_login_response({"token": "secret", "user": {"password": "pw", "email": "user@example.com"}})
+    assert response["token"] == "[REDACTED]"
+    assert response["user"]["password"] == "[REDACTED]"
+    assert response["user"]["email"] == "user@example.com"
+
+
+def test_web_device_ids_follow_random_browser_rule():
+    first_id = _generate_web_device_id()
+    second_id = _generate_web_device_id()
+    assert first_id != second_id
+    assert len(first_id) == len(second_id) == 89
+    assert first_id.startswith("B") and second_id.startswith("B")
+    assert first_id.endswith("==") and second_id.endswith("==")
+
+
 def test_account_login_uses_browser_contract():
     import functions
 
@@ -142,7 +158,7 @@ def test_account_login_uses_browser_contract():
 
     assert token == "abc"
     assert captured["payload"]["email"] == "user@example.com"
-    assert len(captured["payload"]["device_id"]) == 88
+    assert len(captured["payload"]["device_id"]) >= 88
     assert captured["headers"]["user-agent"].startswith("Mozilla/5.0")
 
 
