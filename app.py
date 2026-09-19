@@ -68,6 +68,7 @@ from plugin_helper import (
     build_prompt,
     build_summary_request_prompt,
     context_window_tokens,
+    estimate_conversation_tokens,
     extract_and_upload_files,
     generate_signature,
     generate_signature_sync,
@@ -237,6 +238,10 @@ app.add_middleware(RecovererMiddleware)
 
 SESSIONS = {}
 SESSION_TTL = 7 * 24 * 3600
+# Short-lived handoff summaries bridge concurrent requests that observe the
+# same pre-rollover signature while the first request is migrating the chat.
+ROLLOVER_HANDOFFS = OrderedDict()
+ROLLOVER_HANDOFFS_MAX = 1024
 # One asyncio.Lock per conversation signature, used to serialize first-time
 # session creation. Signatures are unique per message prefix, so without a cap
 # this dict grows FOREVER — after many chats it becomes a serious memory leak.
@@ -451,9 +456,22 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
     if not auth_token:
         return JSONResponse({"error": "No auth token. Add via dashboard."}, status_code=401)
 
+    estimated_context = estimate_conversation_tokens(messages)
+    rollover_limit = context_window_tokens()
+    if estimated_context >= int(rollover_limit * 0.8):
+        logger.info(
+            "Context check: estimated=%d limit=%d messages=%d (rollover=%s)",
+            estimated_context,
+            rollover_limit,
+            len(messages),
+            estimated_context > rollover_limit,
+        )
+
     sig = await generate_signature(messages, model, scope)
     sess = find_session(sig)
-    rollover_summary = None
+    # A concurrent request may already have migrated this exact signature.
+    # Reuse its handoff summary when sending the first turn on the new chat.
+    rollover_summary = ROLLOVER_HANDOFFS.get(sig)
 
     if sess:
 
@@ -461,6 +479,59 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         session_id = sess["session_id"]
         parent_message_id = sess["parent_message_id"]
         tok = get_token(token_id)
+        # Proactively migrate a live chat before the upstream memory ceiling is
+        # hit. Previously rollover only ran on new-chat/token-rotation paths,
+        # so long-lived sessions could fail first and lose their parent chain.
+        if tok and tok.get("status") != "RATE_LIMITED" and parent_message_id != 0 and needs_rollover(messages):
+            old_session_id = session_id
+            old_lock = await _own_chat_lock(old_session_id)
+            try:
+                # Another request may have completed this signature while we
+                # waited for the old-chat lock; reuse its mapping instead of
+                # creating a second fresh upstream conversation.
+                current = find_session(sig)
+                if current and current["session_id"] != old_session_id:
+                    session_id = current["session_id"]
+                    parent_message_id = current["parent_message_id"]
+                    rollover_summary = ROLLOVER_HANDOFFS.get(sig)
+                else:
+                    scratch_chat = await create_new_chat(tok["token"])
+                    summary_gen = send_message(
+                        scratch_chat,
+                        tok["token"],
+                        build_summary_request_prompt(messages),
+                        0,
+                        False,
+                        False,
+                        [],
+                    )
+                    rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
+                    new_session_id = await create_new_chat(tok["token"])
+                    # Replace old mappings only after summary and fresh chat
+                    # creation both succeed.
+                    delete_sessions_for_chat(token_id, old_session_id)
+                    session_id = new_session_id
+                    parent_message_id = 0
+                    save_session(sig, token_id, session_id, parent_message_id)
+                    ROLLOVER_HANDOFFS[sig] = rollover_summary
+                    ROLLOVER_HANDOFFS.move_to_end(sig)
+                    while len(ROLLOVER_HANDOFFS) > ROLLOVER_HANDOFFS_MAX:
+                        ROLLOVER_HANDOFFS.popitem(last=False)
+                    logger.info(
+                        "Context rollover: migrated live chat %s -> %s (summary ~%d tokens)",
+                        old_session_id,
+                        new_session_id,
+                        count_tok(rollover_summary),
+                    )
+            except Exception:
+                # A failed preflight must not destroy the working upstream chat;
+                # continue on the existing session and let normal retry logic
+                # handle an actual upstream failure.
+                rollover_summary = None
+                session_id = old_session_id
+                logger.exception("Live context rollover failed; keeping chat %s", old_session_id)
+            finally:
+                old_lock.release()
         if not tok or tok["status"] == "RATE_LIMITED":
             new_token_id = pick_token()
             if new_token_id and (not tok or new_token_id != token_id):
@@ -563,6 +634,11 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
 
                 session_id = await create_new_chat(tok["token"])
                 save_session(sig, token_id, session_id, 0)
+                if rollover_summary:
+                    ROLLOVER_HANDOFFS[sig] = rollover_summary
+                    ROLLOVER_HANDOFFS.move_to_end(sig)
+                    while len(ROLLOVER_HANDOFFS) > ROLLOVER_HANDOFFS_MAX:
+                        ROLLOVER_HANDOFFS.popitem(last=False)
                 parent_message_id = 0
             else:
                 token_id = sess["token_id"]

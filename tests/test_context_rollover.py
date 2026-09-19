@@ -32,6 +32,7 @@ from plugin_helper import (
     build_prompt,
     build_summary_request_prompt,
     build_summary_seed_prompt,
+    build_fact_memory,
     estimate_conversation_tokens,
     needs_rollover,
     strip_summary_tags,
@@ -124,6 +125,30 @@ def test_summary_request_prompt_shape():
     assert "[SUMMARY]" in prompt
     assert "Output ONLY the summary" in prompt
     assert "tokenword" in prompt  # conversation text embedded
+
+
+def test_summary_preserves_tool_calls_and_fact_memory():
+    msgs = [
+        {"role": "user", "content": "修复登录问题，必须保持 API 兼容"},
+        {"role": "assistant", "tool_calls": [{"function": {"name": "Bash", "arguments": {"command": "pytest tests/test_auth.py"}}}]},
+        {"role": "tool", "name": "Bash", "content": "FAILED tests/test_auth.py::test_login"},
+        {"role": "assistant", "content": "当前仍有一个登录测试失败，待修复"},
+    ]
+    facts = build_fact_memory(msgs)
+    prompt = build_summary_request_prompt(msgs)
+    assert "Bash" in facts and "pytest tests/test_auth.py" in facts
+    assert "Modified files" in prompt or "已修改文件" in prompt
+    assert "FACT MEMORY" in prompt and "FAILED tests/test_auth.py" in prompt
+
+
+def test_opencode_compaction_summary_is_carried_as_fact():
+    msgs = [
+        {"role": "assistant", "content": "## Objective\n- 修复上下文\n## Next Move\n1. 保留文件路径"},
+        {"role": "user", "content": "继续处理"},
+    ]
+    facts = build_fact_memory(msgs)
+    assert "OpenCode compaction summaries" in facts
+    assert "## Objective" in facts
 
 
 def test_summary_seed_prompt_preserves_newest_and_summary():
