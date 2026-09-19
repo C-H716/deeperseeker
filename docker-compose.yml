@@ -2,8 +2,7 @@ services:
   deeperseeker:
     build: .
     container_name: deeperseeker
-    ports:
-      - "0.0.0.0:4000:4000"
+    network_mode: host
     environment:
       - HOST=0.0.0.0
     env_file:
