@@ -10,6 +10,7 @@ import secrets
 import sqlite3
 import string
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 
 import aiohttp
@@ -25,6 +26,13 @@ logger = logging.getLogger("deeperseeker.functions")
 wasm_path = "wasm/deepseek_pow_solver.wasm"
 _session = None
 _db = os.getenv("DB_PATH", "deeperseeker.db")
+
+
+class DeepSeekRateLimitError(Exception):
+    """Upstream rate limiting reported inside an otherwise successful SSE response."""
+
+    def __init__(self, message="DeepSeek rate limit reached"):
+        super().__init__(f"HTTP 429: {message}")
 
 
 def cookie_file_path():
@@ -799,6 +807,47 @@ def count_tokens(text, model="deepseek-v4.1-flash"):
     return len(deepseek_tokenizer.ds_token.encode(text))
 
 
+# --- Prompt-cache accounting ------------------------------------------------
+# The DeepSeek web endpoint returns no token metadata, so the usage this bridge
+# reports is computed locally and an upstream cache hit can never be read back.
+# Caching still applies upstream, but on a different axis than the one the
+# reported figure describes. The upstream chat is a stateful conversation that
+# already holds every earlier turn, so the history a client resends is not
+# reprocessed; only the new suffix is. The reported usage, however, describes
+# the client's own full prompt (count_tok over the whole message list), so the
+# cache figure must share that basis to mean anything to the caller.
+#
+# The two agree because the client resends the whole conversation every turn:
+# the previous turn's prompt is exactly the reusable prefix of this turn's, and
+# the difference is the genuinely new material. Remembering that size per
+# conversation signature reproduces the figure DeepSeek's own API reports as
+# `prompt_cache_hit_tokens` — for a session that has not been rebuilt.
+# reset_cached_input() drops the entry whenever a rollover rewrites history,
+# because then the previous prompt is no longer a prefix of the current one.
+_CACHED_INPUT_HISTORY = OrderedDict()
+_CACHED_INPUT_HISTORY_MAX = 512
+
+
+def peek_cached_input(sig):
+    """Prompt tokens this conversation can reuse from its previous turn."""
+    return _CACHED_INPUT_HISTORY.get(sig, 0)
+
+
+def record_cached_input(sig, input_tokens):
+    """Remember this turn's input size as the next turn's cached prefix."""
+    if not sig:
+        return
+    _CACHED_INPUT_HISTORY.pop(sig, None)
+    _CACHED_INPUT_HISTORY[sig] = max(0, input_tokens)
+    while len(_CACHED_INPUT_HISTORY) > _CACHED_INPUT_HISTORY_MAX:
+        _CACHED_INPUT_HISTORY.popitem(last=False)
+
+
+def reset_cached_input(sig):
+    """Forget the remembered prefix after a rollover rebuilds the history."""
+    _CACHED_INPUT_HISTORY.pop(sig, None)
+
+
 def normalize_tool_call(tool_data_or_name, args_if_name=None):
     if isinstance(tool_data_or_name, str):
         name = tool_data_or_name
@@ -1371,6 +1420,26 @@ def _deepseek_event_fragments(data):
                 add_fragment(fragment)
             return
 
+        # Some upstream deployments expose the same generation through an
+        # OpenAI-compatible delta envelope instead of the native fragment
+        # protocol. Keep this fallback narrow so status strings are not emitted
+        # as assistant text.
+        choices = node.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta")
+                if not isinstance(delta, dict):
+                    delta = choice.get("message")
+                if not isinstance(delta, dict):
+                    continue
+                if delta.get("reasoning_content") is not None:
+                    found.append(("THINK", str(delta["reasoning_content"])))
+                if delta.get("content") is not None:
+                    found.append(("RESPONSE", str(delta["content"])))
+            return
+
         response = node.get("response")
         if isinstance(response, dict) and isinstance(response.get("fragments"), list):
             for fragment in response["fragments"]:
@@ -1407,6 +1476,113 @@ def _deepseek_event_finished(data):
     )
 
 
+def _deepseek_event_rate_limited(data):
+    """Detect rate-limit errors encoded in a successful SSE response."""
+    rate_markers = (
+        "rate_limit",
+        "rate limit",
+        "rate-limited",
+        "too frequent",
+        "too many requests",
+    )
+
+    if isinstance(data, list):
+        return any(_deepseek_event_rate_limited(item) for item in data)
+    if not isinstance(data, dict):
+        return False
+
+    finish_reason = data.get("finish_reason")
+    if isinstance(finish_reason, str):
+        normalized_reason = finish_reason.lower().replace("-", "_")
+        if any(marker in normalized_reason for marker in ("rate_limit", "too_frequent")):
+            return True
+
+    event_type = str(data.get("type") or "").lower()
+    nested_error = data.get("error")
+    if event_type in {"error", "exception", "rate_limit", "rate_limited"} or isinstance(nested_error, dict):
+        error_text = " ".join(
+            str(data.get(key) or "")
+            for key in ("content", "message", "error", "code", "reason")
+        ).lower()
+        if isinstance(nested_error, dict):
+            error_text += " " + " ".join(str(nested_error.get(key) or "") for key in (
+                "message", "code", "reason", "type"
+            )).lower()
+        if event_type in {"rate_limit", "rate_limited"} or any(
+            marker in error_text for marker in rate_markers
+        ):
+            return True
+
+    return any(
+        _deepseek_event_rate_limited(data.get(key))
+        for key in ("v", "data", "value", "error")
+        if isinstance(data.get(key), (dict, list))
+    )
+
+
+class _DeepSeekSSEParser:
+    """Accept native SSE framing while tolerating direct JSON responses."""
+
+    def __init__(self):
+        self._data_lines = []
+
+    @staticmethod
+    def _is_json(value):
+        try:
+            json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return True
+
+    def _flush_data(self):
+        if not self._data_lines:
+            return []
+        payload = "\n".join(self._data_lines).strip()
+        self._data_lines = []
+        return [payload] if payload else []
+
+    def feed(self, raw_line):
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8", errors="replace")
+        else:
+            line = str(raw_line)
+        line = line.lstrip("\ufeff").rstrip("\r\n")
+        stripped = line.strip()
+
+        if not stripped:
+            return self._flush_data()
+        if stripped.startswith(":"):
+            return []
+
+        if stripped.startswith("data:"):
+            self._data_lines.append(stripped[5:].lstrip())
+            # Normal DeepSeek events are one JSON object per data line. Emit
+            # them immediately; multiline JSON remains buffered until blank.
+            payload = "\n".join(self._data_lines).strip()
+            if self._is_json(payload):
+                self._data_lines = []
+                return [payload]
+            return []
+
+        # A few proxies strip the SSE field name from a JSON-only response.
+        # Accept only complete JSON here; HTML and diagnostic text are ignored.
+        if not self._data_lines and stripped[:1] in "[{" and self._is_json(stripped):
+            return [stripped]
+        return []
+
+    def flush(self):
+        return self._flush_data()
+
+
+async def _iter_deepseek_sse_payloads(content):
+    parser = _DeepSeekSSEParser()
+    async for raw_line in content:
+        for payload in parser.feed(raw_line):
+            yield payload
+    for payload in parser.flush():
+        yield payload
+
+
 async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, file_ids_=None):
     # Backup: WAF cookies not required with Android headers. Kept as fallback:
     # cookie = await get_cookies()
@@ -1430,6 +1606,8 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
     think_open = False
     got_output = False
     recent_events = []
+    payload_count = 0
+    saw_done = False
     resp = await post_with_failover(
         "/api/v0/chat/completion",
         headers=headers, json=json_data,
@@ -1441,19 +1619,30 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
             logger.warning("DeepSeek completion HTTP %d for chat %s: %s", resp.status, chat_id, error_text[:300])
             raise Exception(f"HTTP {resp.status}: {error_text}")
 
-        async for line in resp.content:
-            if not line:
-                continue
-            decoded_line = line.decode("utf-8").strip()
-            if not decoded_line.startswith("data:"):
+        async for payload in _iter_deepseek_sse_payloads(resp.content):
+            payload_count += 1
+            if payload == "[DONE]":
+                saw_done = True
+                if think_open:
+                    yield "\n</think>\n\n"
+                    think_open = False
+                if got_output:
+                    return
                 continue
             try:
-                data = json.loads(decoded_line[5:].lstrip())
+                data = json.loads(payload)
             except Exception as e:
-                logger.debug("Ignoring malformed DeepSeek SSE data for chat %s: %s", chat_id, e)
+                logger.debug("Ignoring malformed DeepSeek SSE payload for chat %s: %s", chat_id, e)
                 continue
             recent_events.append(data)
             recent_events = recent_events[-5:]
+
+            if _deepseek_event_rate_limited(data):
+                logger.warning(
+                    "DeepSeek rate limit reported for chat %s; rotating token",
+                    chat_id,
+                )
+                raise DeepSeekRateLimitError()
 
             for fragment_type, content in _deepseek_event_fragments(data):
                 if fragment_type == "THINK":
@@ -1485,12 +1674,16 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
         if think_open:
             yield "\n</think>\n\n"
         if not got_output:
+            content_type = getattr(resp, "headers", {}).get("Content-Type", "unknown")
             logger.warning(
-                "DeepSeek stream ended without recognized output for chat %s; recent events=%s",
-                chat_id,
+                "DeepSeek stream ended without recognized output for chat %s; payloads=%d done=%s content_type=%s recent events=%s",
+                chat_id, payload_count, saw_done, content_type,
                 json.dumps(recent_events, ensure_ascii=False)[:2000],
             )
-            raise Exception("DeepSeek stream ended without recognized output")
+            raise Exception(
+                "DeepSeek stream ended without recognized output "
+                f"(payloads={payload_count}, done={saw_done}, content_type={content_type})"
+            )
 
 
 async def upload_file(file_bytes, file_name, file_content_type, auth_token):

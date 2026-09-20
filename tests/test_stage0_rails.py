@@ -833,7 +833,7 @@ def test_handle_chat_retry_surrenders_lock_before_recursing():
             ("delete_sessions_for_chat", fake_delete),
             ("save_session", fake_save),
             ("parse_tools", lambda t: ([], t)),
-            ("format_response", lambda text, model, messages, tools=None: "FORMATTED"),
+            ("format_response", lambda text, model, messages, tools=None, **kwargs: "FORMATTED"),
         ]
         saved = [(name, getattr(app_module, name)) for name, _ in patches]
         for name, fn in patches:

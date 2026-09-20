@@ -4,3 +4,23 @@ deeperseeker.db
 *.db.bak
 .venv/
 .omo/
+
+# --- local/editor/tooling (never commit) ---
+.env
+.idea/
+.vscode/
+.pytest_cache/
+*.egg-info/
+.dsh-drop/
+
+# local debug artifacts
+_tps_denom.mjs
+_tps_denom_out.txt
+_copy.zstd
+*.zstd
+DISM
+sfc
+...
+
+# local database
+*.db

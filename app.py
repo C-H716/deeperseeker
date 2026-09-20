@@ -54,6 +54,9 @@ from functions import (
     pick_token,
     save_session,
     send_message,
+    peek_cached_input,
+    record_cached_input,
+    reset_cached_input,
     check_token_status,
     delete_account,
     get_accounts,
@@ -597,7 +600,9 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         save_session(next_sig, new_token_id, new_session_id, next_parent(0))
                         if rot_owner is not None:
                             rot_owner.release()
-                        return format_response(resp_text, model, messages, tools)
+                        in_tokens = count_tok(_messages_text(messages))
+                        _remember_prompt_tokens(next_sig, in_tokens)
+                        return format_response(resp_text, model, messages, tools, cached_tokens=_cached_prompt_tokens(sig, in_tokens), prompt_tokens=in_tokens)
             return JSONResponse({"error": {"message": "No active tokens available (all rate limited). Try again later.", "type": "rate_limit_error"}}, status_code=429)
     else:
 
@@ -658,6 +663,11 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
     lock_transferred = False
     try:
         file_ids = await extract_and_upload_files(messages, tok["token"], last_user_only=not is_first)
+        # Rollover rebuilds the prompt from a summary instead of the accumulated
+        # history, so the previous turn's prompt is no longer a prefix of this
+        # one and any remembered cache size would overstate the real hit.
+        if rollover_summary:
+            reset_cached_input(sig)
         prompt = await build_prompt(messages, tools or [], model, is_first, rollover_summary=rollover_summary)
 
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids)
@@ -686,7 +696,9 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
 
             save_session(sig, token_id, session_id, next_parent(parent_message_id))
             save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
-            return format_response(resp_text, model, messages, tools)
+            in_tokens = count_tok(_messages_text(messages))
+            _remember_prompt_tokens(next_sig, in_tokens)
+            return format_response(resp_text, model, messages, tools, cached_tokens=_cached_prompt_tokens(sig, in_tokens), prompt_tokens=in_tokens)
     except Exception as e:
         logger.exception("Chat request failed (session %s, parent %s): %s", session_id, parent_message_id, e)
         m = re.match(r"HTTP (\d{3}):", str(e))
@@ -730,6 +742,25 @@ def _messages_text(messages):
         else:
             parts.append(str(c))
     return "\n".join(parts)
+
+
+def _cached_prompt_tokens(sig, prompt_tokens):
+    """Prompt tokens this turn can read from the upstream prompt cache.
+
+    The DeepSeek web endpoint reports no token metadata, so the bridge cannot
+    read a real cache-hit figure back. Caching still applies upstream: the
+    client resends the whole conversation every turn, so the previous turn's
+    full prompt is a prefix of this turn's prompt. That remembered size is the
+    closest honest reproduction of DeepSeek's own `prompt_cache_hit_tokens`.
+    """
+    cached = peek_cached_input(sig)
+    return max(0, min(cached, prompt_tokens))
+
+
+def _remember_prompt_tokens(next_sig, prompt_tokens):
+    """Record this turn's prompt size as the next turn's cacheable prefix."""
+    if next_sig:
+        record_cached_input(next_sig, prompt_tokens)
 
 
 async def _hold_think_tags(gen):
@@ -835,6 +866,14 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                     yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'tool_calls'}]})}\n\n"
                 else:
                     yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                # 流式 usage：OpenAI 规范要求 include_usage 时在 [DONE] 之前补一条只含 usage 的 chunk。
+                # 原先直接发 [DONE]，客户端拿不到 completion_tokens，DSH 的 tok/s 面板因此不显示。
+                in_tokens = count_tok(_messages_text(messages))
+                out_tokens = count_tok(full_text)
+                cached_tokens = _cached_prompt_tokens(sig, in_tokens)
+                if not failed:
+                    _remember_prompt_tokens(next_sig, in_tokens)
+                yield f"data: {json.dumps({'choices': [], 'usage': {'prompt_tokens': in_tokens, 'completion_tokens': out_tokens, 'total_tokens': in_tokens + out_tokens, 'prompt_tokens_details': {'cached_tokens': cached_tokens}}})}\n\n"
                 yield "data: [DONE]\n\n"
             except asyncio.CancelledError:
                 pass
@@ -843,8 +882,9 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
 async def stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model=None, parent_message_id=0, scope=""):
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     in_tokens = count_tok(_messages_text(messages))
+    cached_tokens = _cached_prompt_tokens(sig, in_tokens)
     model_name = req_model if req_model else model
-    start_evt = f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model_name, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': in_tokens, 'output_tokens': 1}}})}\n\n"
+    start_evt = f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model_name, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': in_tokens, 'output_tokens': 1, 'cache_read_input_tokens': cached_tokens}}})}\n\n"
     yield start_evt
 
     parser = StreamToolParser()
@@ -932,6 +972,7 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
             next_sig = generate_signature_sync(next_messages, model, scope)
             save_session(sig, token_id, session_id, next_parent(parent_message_id))
             save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
+            _remember_prompt_tokens(next_sig, in_tokens)
 
         def _tb(text):
             return (f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index_local[0], 'content_block': {'type': 'text', 'text': ''}})}\n\n"
@@ -977,7 +1018,7 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
                 pass
 
 
-def format_response(text, model, messages, tools=None):
+def format_response(text, model, messages, tools=None, cached_tokens=0, prompt_tokens=None):
     from functions import DEEPSEEK_TARIFFS
     parsed_tools, clean_text = parse_tools(text)
 
@@ -988,7 +1029,7 @@ def format_response(text, model, messages, tools=None):
     clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
     clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
 
-    in_tokens = count_tok(_messages_text(messages))
+    in_tokens = prompt_tokens if prompt_tokens is not None else count_tok(_messages_text(messages))
     out_tokens = count_tok(text)
     tariff = DEEPSEEK_TARIFFS["deepseek-v4.1-flash"]
     cost = (in_tokens / 1_000_000 * tariff["cache_miss_input"]) + (out_tokens / 1_000_000 * tariff["output_generation"])
@@ -1015,6 +1056,7 @@ def format_response(text, model, messages, tools=None):
             "prompt_tokens": in_tokens,
             "completion_tokens": out_tokens,
             "total_tokens": in_tokens + out_tokens,
+            "prompt_tokens_details": {"cached_tokens": cached_tokens},
             "cost": round(cost, 6),
         },
     }
@@ -1059,6 +1101,7 @@ def format_anthropic_response(result, model):
         "usage": {
             "input_tokens": usage.get("prompt_tokens", 0),
             "output_tokens": usage.get("completion_tokens", 0),
+            "cache_read_input_tokens": usage.get("prompt_tokens_details", {}).get("cached_tokens", 0),
         },
     }
 
@@ -1351,7 +1394,7 @@ def _responses_payload(result, model, instructions=None):
         "previous_response_id": None,
         "usage": {
             "input_tokens": input_tokens,
-            "input_tokens_details": {"cached_tokens": 0},
+            "input_tokens_details": {"cached_tokens": usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)},
             "output_tokens": output_tokens,
             "output_tokens_details": {"reasoning_tokens": 0},
             "total_tokens": usage.get("total_tokens", input_tokens + output_tokens),
