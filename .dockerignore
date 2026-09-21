@@ -10,3 +10,17 @@ __pycache__
 aws_cookies_deepseek.json
 .codegraph
 .opencode
+
+# 本地调试残留：不参与构建，且部分文件名会让 buildkit 打包上下文时失败
+# （`...` 在 Windows 上是保留名，Get-Item 甚至解析不到，tar 打包会直接 cancel）
+.pytest_cache
+.idea
+.dsh-drop
+tests
+_copy.zstd
+_tps_denom.mjs
+_tps_denom_out.txt
+*.zstd
+DISM
+sfc
+...
