@@ -512,9 +512,13 @@ def check_key(request: Request):
     return secrets.compare_digest(key.encode("utf-8"), API_KEY.encode("utf-8"))
 
 
+def _upstream_http_code(exc):
+    m = re.match(r"HTTP (\d{3}):", str(exc))
+    return int(m.group(1)) if m else None
+
+
 def _api_error_response(e, is_anthropic=False):
-    m = re.match(r"HTTP (\d{3}):", str(e))
-    code = int(m.group(1)) if m else 502
+    code = _upstream_http_code(e) or 502
     if isinstance(e, CookieGenerationError):
         code = 503  # WAF cookies cannot be produced right now — upstream unreachable, not a client error
     if code < 400 or code > 599:
@@ -522,7 +526,8 @@ def _api_error_response(e, is_anthropic=False):
     if is_anthropic:
         payload = {"type": "error", "error": {"type": "api_error", "message": str(e)[:500]}}
     else:
-        payload = {"error": {"message": str(e)[:500], "type": "api_error", "code": code}}
+        err_type = "rate_limit_error" if code == 429 else "api_error"
+        payload = {"error": {"message": str(e)[:500], "type": err_type, "code": code}}
     return JSONResponse(payload, status_code=code)
 
 
@@ -888,15 +893,44 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         await _db(delete_sessions_for_chat, token_id, session_id)
         raise
     except Exception as e:
-        logger.exception("Chat request failed (session %s, parent %s): %s", session_id, parent_message_id, e)
-        m = re.match(r"HTTP (\d{3}):", str(e))
-        code = int(m.group(1)) if m else None
+        code = _upstream_http_code(e)
+        # c181d06：按真实状态码区分处置。被上游拒绝（401/403/429）时标记限流，
+        # 并以 warning 记录原因——此前一律走 logger.exception，把可预期的限流
+        # 与真正的故障混为一谈。会话映射在两种路径下都必须清除，否则已失效的
+        # parent_message_id 会让下一轮从错误分支继续，造成会话分叉。
         if code in (401, 403, 429):
             await _db(mark_limited, token_id)
+            await _db(delete_sessions_for_chat, token_id, session_id)
+            logger.warning(
+                "Chat request rejected by upstream (session %s, parent %s): %s",
+                session_id,
+                parent_message_id,
+                e,
+            )
+            if _retried:
+                return _api_error_response(e, is_anthropic)
+            # 标记限流后递归重试：下一帧读取到 RATE_LIMITED 状态，由入口处的
+            # 轮换段挑选新账号重建会话。锁与在途占用须先交还，否则重试会等待
+            # 本帧持有的锁而挂起（与下方通用重试路径同理）。
+            lock_owner.release()
+            lease.release()
+            return await handle_chat(
+                messages,
+                model,
+                thinking,
+                search,
+                stream,
+                tools,
+                is_anthropic,
+                req_model,
+                scope,
+                search_sink=search_sink,
+                _retried=True,
+            )
+
+        logger.exception("Chat request failed (session %s, parent %s): %s", session_id, parent_message_id, e)
         await _db(delete_sessions_for_chat, token_id, session_id)
         if _retried:
-            return _api_error_response(e, is_anthropic)
-        if code not in (401, 403, 429) and parent_message_id == 0:
             return _api_error_response(e, is_anthropic)
         # PR #26 review fix (Blocker 2 — retry self-deadlock): the recursive
         # call can resolve to the SAME chat (the retry re-derives the session
@@ -911,7 +945,19 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         # 在途占用同样须在递归前交还：重试会重新选取 token，本帧登记的计数
         # 若留着，旧账号会持续显得繁忙，干扰后续的负载均衡决策。
         lease.release()
-        return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, search_sink=search_sink, _retried=True)
+        return await handle_chat(
+            messages,
+            model,
+            thinking,
+            search,
+            stream,
+            tools,
+            is_anthropic,
+            req_model,
+            scope,
+            search_sink=search_sink,
+            _retried=True,
+        )
     finally:
         if not lock_transferred:
             lock_owner.release()
@@ -1029,11 +1075,16 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
         raise
     except Exception as e:
         failed = True
-        m = re.match(r"HTTP (\d{3}):", str(e))
-        code = int(m.group(1)) if m else None
+        code = _upstream_http_code(e)
+        # c181d06：限流属可预期状态，以 warning 记录并按码标记；其它异常才是
+        # 故障，走 exception。两条路径都清除会话映射，避免失效的 parent 造成分叉。
         if code in (401, 403, 429):
             await _db(mark_limited, token_id)
-        logger.exception("stream_response failed")
+            await _db(delete_sessions_for_chat, token_id, session_id)
+            logger.warning("stream_response upstream HTTP %s: %s", code, e)
+        else:
+            await _db(delete_sessions_for_chat, token_id, session_id)
+            logger.exception("stream_response failed")
         try:
             yield f"data: {json.dumps({'error': {'message': str(e)[:300]}})}\n\n"
         except Exception:
@@ -1164,11 +1215,16 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
         raise
     except Exception as e:
         failed = True
-        m = re.match(r"HTTP (\d{3}):", str(e))
-        code = int(m.group(1)) if m else None
+        code = _upstream_http_code(e)
+        # c181d06：与 stream_response 同理，限流按 warning 记录并标记，其它异常
+        # 走 exception；两条路径均清除会话映射。
         if code in (401, 403, 429):
             await _db(mark_limited, token_id)
-        logger.exception("stream_anthropic_response failed")
+            await _db(delete_sessions_for_chat, token_id, session_id)
+            logger.warning("stream_anthropic_response upstream HTTP %s: %s", code, e)
+        else:
+            await _db(delete_sessions_for_chat, token_id, session_id)
+            logger.exception("stream_anthropic_response failed")
         try:
             yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)[:300]}})}\n\n"
         except Exception:

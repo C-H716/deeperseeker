@@ -2212,6 +2212,117 @@ async def _iter_deepseek_sse_payloads(content):
         yield payload
 
 
+_EMPTY_SSE_DEFAULT = (
+    "Empty response from DeepSeek (no parseable SSE content): "
+    "stream ended with no assistant fragments"
+)
+_EMPTY_SSE_CONTEXT = (
+    "Empty response from DeepSeek (prompt may exceed the session context limit)"
+)
+_CONTEXT_LIMIT_HINT_RE = re.compile(
+    r"context|token.?limit|maximum.?context|too.?long|exceed",
+    re.IGNORECASE,
+)
+_SSE_RECENT_LINES = 8
+
+
+class _SseStreamFinished(Exception):
+    pass
+
+
+def _redact_sse_line(line: str) -> str:
+    if len(line) > 500:
+        return line[:500] + "..."
+    return line
+
+
+def _remember_sse_line(recent_lines, line: str):
+    recent_lines.append(_redact_sse_line(line))
+    if len(recent_lines) > _SSE_RECENT_LINES:
+        del recent_lines[0]
+
+
+def _sse_context_limit_hint(recent_lines, parsed_events):
+    for obj in parsed_events:
+        try:
+            blob = json.dumps(obj, ensure_ascii=False)
+        except Exception:
+            blob = str(obj)
+        if _CONTEXT_LIMIT_HINT_RE.search(blob):
+            return True
+    for line in recent_lines:
+        if _CONTEXT_LIMIT_HINT_RE.search(line):
+            return True
+    return False
+
+
+def _scan_recent_sse_errors(parsed_events):
+    """Return (http_status, message) if a recent parsed event is an upstream error."""
+    for obj in reversed(parsed_events):
+        if not isinstance(obj, dict) or obj.get("type") != "error":
+            continue
+        content = obj.get("content") or obj.get("message") or "Upstream error"
+        finish = str(obj.get("finish_reason") or "")
+        if finish == "rate_limit_reached" or "rate_limit" in finish.lower():
+            return 429, content
+        if finish in ("permission_denied", "forbidden"):
+            return 403, content
+        return 502, content
+    return None
+
+
+def _raise_empty_sse_response(recent_lines, parsed_events, protocol_detail=""):
+    """Raise for a stream that ended without assistant output (c181d06).
+
+    `protocol_detail` 由调用方附带流层统计（payload 数、是否见 [DONE]、
+    Content-Type）。缺少该统计时，协议层故障与真正的上下文超限无法区分，
+    排查只能靠猜测，因此该参数在 send_message 的正常路径上必传。
+    """
+    err = _scan_recent_sse_errors(parsed_events)
+    if err:
+        code, msg = err
+        logger.warning(
+            "DeepSeek SSE error event (not empty stream); last events: %s",
+            recent_lines[-_SSE_RECENT_LINES:],
+        )
+        if code == 429:
+            # 限流有专用异常类型，上层据其类型驱动 token 轮换；此处保留上游
+            # 原始措辞于日志，异常消息仍用固定文案，避免上游文案漂移影响判定。
+            raise DeepSeekRateLimitError()
+        raise Exception(f"HTTP {code}: {msg}")
+    if _sse_context_limit_hint(recent_lines, parsed_events):
+        msg = _EMPTY_SSE_CONTEXT
+    else:
+        msg = _EMPTY_SSE_DEFAULT
+    logger.warning(
+        "DeepSeek SSE ended without assistant output; last events: %s",
+        recent_lines[-_SSE_RECENT_LINES:],
+    )
+    raise Exception(msg + protocol_detail)
+
+
+def _raise_sse_error_event(data, recent_lines):
+    """Raise a status-carrying exception for an upstream SSE error event (c181d06).
+
+    状态码经 'HTTP <code>: ' 前缀编码，app._upstream_http_code 据此驱动 token
+    轮换与限流标记；上游改动措辞时该前缀由本函数统一产出，不会漂移。
+    """
+    content = data.get("content") or data.get("message") or "Upstream error"
+    finish = str(data.get("finish_reason") or "")
+    if finish == "rate_limit_reached" or "rate_limit" in finish.lower():
+        logger.warning(
+            "DeepSeek SSE error event (not empty stream): %s; last events: %s",
+            content,
+            recent_lines[-_SSE_RECENT_LINES:],
+        )
+        # 限流用专用异常，保持与 _deepseek_event_rate_limited 路径同一类型，
+        # 上层按类型而非消息文本判定轮换。
+        raise DeepSeekRateLimitError()
+    if finish in ("permission_denied", "forbidden"):
+        raise Exception(f"HTTP 403: {content}")
+    raise Exception(f"HTTP 502: {content}")
+
+
 async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, file_ids_=None, search_sink=None):
     # Backup: WAF cookies not required with Android headers. Kept as fallback:
     # cookie = await get_cookies()
@@ -2235,6 +2346,10 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
     think_open = False
     got_output = False
     recent_events = []
+    # c181d06：错误归类需要两条独立轨迹——parsed_events 供 _scan_recent_sse_errors
+    # 读取结构化 error 事件，recent_lines 供 _sse_context_limit_hint 做文本正则匹配。
+    # 二者不可互相替代：把 dict 交给正则会在 search() 处抛 TypeError。
+    recent_lines = []
     payload_count = 0
     saw_done = False
     resp = await post_with_failover(
@@ -2258,6 +2373,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                 if got_output:
                     return
                 continue
+            _remember_sse_line(recent_lines, payload)
             try:
                 data = json.loads(payload)
             except Exception as e:
@@ -2265,6 +2381,11 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                 continue
             recent_events.append(data)
             recent_events = recent_events[-5:]
+
+            # c181d06：上游 error 事件携带真实状态码（429/403/502），必须按码
+            # 上报；此前一律被归类为「上下文超限」，会误导排查方向。
+            if isinstance(data, dict) and data.get("type") == "error":
+                _raise_sse_error_event(data, recent_lines)
 
             # Search results arrive on their own event path and carry no
             # assistant prose. Collecting them here keeps the generator's
@@ -2301,12 +2422,17 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                 if think_open:
                     yield "\n</think>\n\n"
                 if not got_output:
+                    content_type = getattr(resp, "headers", {}).get("Content-Type", "unknown")
                     logger.warning(
-                        "DeepSeek finished without recognized output for chat %s; recent events=%s",
-                        chat_id,
+                        "DeepSeek finished without recognized output for chat %s; payloads=%d done=%s content_type=%s recent events=%s",
+                        chat_id, payload_count, saw_done, content_type,
                         json.dumps(recent_events, ensure_ascii=False)[:2000],
                     )
-                    raise Exception("DeepSeek finished without recognized output")
+                    _raise_empty_sse_response(
+                        recent_lines,
+                        recent_events,
+                        f" (payloads={payload_count} done={saw_done} content_type={content_type})",
+                    )
                 return
         if think_open:
             yield "\n</think>\n\n"
@@ -2317,9 +2443,10 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                 chat_id, payload_count, saw_done, content_type,
                 json.dumps(recent_events, ensure_ascii=False)[:2000],
             )
-            raise Exception(
-                "DeepSeek stream ended without recognized output "
-                f"(payloads={payload_count}, done={saw_done}, content_type={content_type})"
+            _raise_empty_sse_response(
+                recent_lines,
+                recent_events,
+                f" (payloads={payload_count} done={saw_done} content_type={content_type})",
             )
 
 
