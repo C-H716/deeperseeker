@@ -39,6 +39,7 @@ from functions import (
     cookie_file_path,
     add_token,
     count_tokens,
+    count_tokens_cached,
     create_new_chat,
     delete_token,
     delete_sessions_for_chat,
@@ -153,7 +154,9 @@ def _install_key_access_formatter():
 
 
 def count_tok(text):
-    return len(deepseek_tokenizer.ds_token.encode(text))
+    # 走内容缓存：同一轮请求里 messages 不变，_messages_text() 的结果会被统计
+    # 多次（上下文估算、usage 上报、成本计算），缓存让整次分词只发生一次。
+    return count_tokens_cached(text)
 
 
 TOKEN_CHECK_INTERVAL = int(os.getenv("DEEPSEEKER_TOKEN_CHECK_INTERVAL", "300"))
@@ -459,16 +462,23 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
     if not auth_token:
         return JSONResponse({"error": "No auth token. Add via dashboard."}, status_code=401)
 
-    estimated_context = estimate_conversation_tokens(messages)
+    # 廉价预筛：精确的 rollover 判定由 build_prompt 内的 needs_rollover() 用
+    # 真实 token 数完成，这里算出来的值只喂给下面那行日志。因此在字符数离阈值
+    # 还很远时跳过整段分词——30 轮工具调用循环里每轮能省下约 90ms。
+    # 预筛偏保守只会少打一行日志，不影响任何决策（字符数少于阈值时，token 数
+    # 不可能反超：BPE 词元至少覆盖一个字符）。
     rollover_limit = context_window_tokens()
-    if estimated_context >= int(rollover_limit * 0.8):
-        logger.info(
-            "Context check: estimated=%d limit=%d messages=%d (rollover=%s)",
-            estimated_context,
-            rollover_limit,
-            len(messages),
-            estimated_context > rollover_limit,
-        )
+    rollover_watch = int(rollover_limit * 0.8)
+    if len(_messages_text(messages)) >= rollover_watch:
+        estimated_context = estimate_conversation_tokens(messages)
+        if estimated_context >= rollover_watch:
+            logger.info(
+                "Context check: estimated=%d limit=%d messages=%d (rollover=%s)",
+                estimated_context,
+                rollover_limit,
+                len(messages),
+                estimated_context > rollover_limit,
+            )
 
     sig = await generate_signature(messages, model, scope)
     sess = find_session(sig)

@@ -219,6 +219,33 @@ def test_fix3_cross_family_closer():
     assert names(tools) == ["Bash"], tools
 
 
+def test_orphan_parameter_closer_is_not_prose():
+    """A bare parameter closer must be stripped, not streamed as chat text.
+
+    Regression: the model can emit a parameter closer whose matching opener was
+    already consumed. _ORPHAN_CLOSER_RE used to omit parameter/param, so the tag
+    leaked to the client as prose while the persisted history (cleaned by
+    parse_tools) stayed correct -- a page refresh hid the defect.
+    """
+    bar = "\uff5c"
+    noise = xml("[LT]/" + bar + bar + "DSML" + bar + bar + " parameter[GT]")
+    p = StreamToolParser()
+    text, tools = feed_all(p, noise, 3)
+    f_text, f_tools = flush_all(p)
+    assert tools == [] and f_tools == [], tools
+    assert (text + f_text).strip() == "", (text, f_text)
+
+
+def test_orphan_closer_split_across_chunks_never_leaks():
+    """Every prefix split of a bare parameter closer must stay buffered."""
+    bar = "\uff5c"
+    noise = xml("[LT]/" + bar + bar + "DSML" + bar + bar + " parameter[GT]")
+    for cut in range(1, len(noise)):
+        p = StreamToolParser()
+        text, _ = feed_all(p, noise[:cut], 2)
+        assert text == "", (cut, repr(noise[:cut]), repr(text))
+
+
 def test_flush_is_terminal_and_resets_state():
     p = StreamToolParser()
     feed_all(p, xml('[LT]tool_call name="Bash"[GT][LT]parameter name="command"[GT]ls[LT]/parameter[GT]'), 5)
@@ -307,6 +334,8 @@ TESTS = [
     test_fix3_decorated_closer_halfwidth,
     test_fix3_decorated_closer_fullwidth,
     test_fix3_cross_family_closer,
+    test_orphan_parameter_closer_is_not_prose,
+    test_orphan_closer_split_across_chunks_never_leaks,
     test_flush_is_terminal_and_resets_state,
     test_complete_blocks_unchanged,
     test_dsml_openers_parse_when_split_across_chunks,

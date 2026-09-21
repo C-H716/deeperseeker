@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import mimetypes
@@ -807,6 +808,37 @@ def count_tokens(text, model="deepseek-v4.1-flash"):
     return len(deepseek_tokenizer.ds_token.encode(text))
 
 
+# --- tokenizer 结果缓存 ------------------------------------------------------
+# ds_token.encode() 实测只有约 0.6 MB/s，是全链路最慢的纯 CPU 操作，而同一段
+# 文本在一次请求里会被统计多次（上下文估算、usage 上报、成本计算）。按内容摘要
+# 缓存可以把它收敛为一次分词。
+#
+# key 用 sha1 摘要而非原文：单条工具结果可达几十 KB，拿原文当 key 会在长会话里
+# 累积出可观的常驻内存；sha1 约 1 GB/s，比分词快三个数量级，开销可忽略。
+_TOKEN_CACHE = OrderedDict()
+_TOKEN_CACHE_MAX = int(os.getenv("DEEPSEEKER_TOKEN_CACHE_MAX", "4096"))
+
+
+def count_tokens_cached(text):
+    """带内容缓存的 count_tokens，返回值与 count_tokens 完全一致。
+
+    纯同步实现，不含 await 点，因此在事件循环里不会被打断；未命中时的开销与
+    直接调用 count_tokens 相同，命中时省下整次分词。
+    """
+    if not text:
+        return 0
+    key = hashlib.sha1(text.encode("utf-8", errors="replace")).digest()
+    hit = _TOKEN_CACHE.get(key)
+    if hit is not None:
+        _TOKEN_CACHE.move_to_end(key)
+        return hit
+    n = count_tokens(text)
+    _TOKEN_CACHE[key] = n
+    while len(_TOKEN_CACHE) > _TOKEN_CACHE_MAX:
+        _TOKEN_CACHE.popitem(last=False)
+    return n
+
+
 # --- Prompt-cache accounting ------------------------------------------------
 # The DeepSeek web endpoint returns no token metadata, so the usage this bridge
 # reports is computed locally and an upstream cache hit can never be read back.
@@ -1122,13 +1154,27 @@ _STREAM_ENTRY_RE = re.compile(
 
 # Orphan closers trailing a block already closed by the per-tag or family
 # fallback (e.g. "</｜｜DSML｜｜ calls>" after the inner invoke was flushed).
+# NOTE: parameter/param MUST be listed here. The model can emit a bare
+# closing parameter tag with no matching opener (e.g. when an invoke block was
+# already consumed), and anything this regex misses is dumped to the client as
+# prose. parse_tools() already strips parameter via its own regex (line ~1132),
+# which is why the persisted history is clean and a page refresh looks correct
+# while the live stream is polluted.
+# Do NOT add parameter to _TOOL_END_TAG_RE: that pattern closes an OPEN tool
+# block, and a parameter closer sits inside the block, so matching it would cut
+# the block short before </invoke> arrives.
 _ORPHAN_CLOSER_RE = re.compile(
-    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|function_call|invoke)\s*[｜\|]{0,2}>",
+    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|function_call|invoke|param(?:eter)?)\s*[｜\|]{0,2}>",
     re.IGNORECASE,
 )
 
 # Tag names _STREAM_ENTRY_RE can open on.
 _STREAM_ENTRY_TAGS = ("tool_calls", "tool_call", "function_call", "invoke", "calls")
+
+# 孤立闭合标签的候选标签名，比入口标签多出 param/parameter。模型可能发出
+# 没有配对开标签的 parameter 闭合标签，分片途中这种片段必须被 hold 住，
+# 否则会被当成正文漏给客户端（见 _ORPHAN_CLOSER_RE 的说明）。
+_STREAM_CLOSER_TAGS = _STREAM_ENTRY_TAGS + ("param", "parameter")
 
 def _skip_bars(text, pos):
     for _ in range(2):
@@ -1136,7 +1182,12 @@ def _skip_bars(text, pos):
             pos += 1
     return pos
 
-def _is_plausible_stream_entry_prefix(segment: str) -> bool:
+def _is_plausible_stream_entry_prefix(segment: str, tags=None) -> bool:
+    """segment 是否为某标签名的前缀（容忍 DSML 装饰、竖线、空格）。
+
+    tags 省略时按工具入口标签判断；判断闭合标签前缀时由
+    _is_plausible_stream_closer_prefix 传入 _STREAM_CLOSER_TAGS。
+    """
     if not segment.startswith("<") or ">" in segment:
         return False
     body = segment[1:]
@@ -1156,7 +1207,7 @@ def _is_plausible_stream_entry_prefix(segment: str) -> bool:
         return True
     remainder = body[pos:]
     remainder_lower = remainder.lower()
-    for tag in _STREAM_ENTRY_TAGS:
+    for tag in (tags or _STREAM_ENTRY_TAGS):
         if tag.startswith(remainder_lower):
             return True
         if remainder_lower.startswith(tag):
@@ -1166,7 +1217,9 @@ def _is_plausible_stream_entry_prefix(segment: str) -> bool:
     return False
 
 def _is_plausible_stream_closer_prefix(segment: str) -> bool:
-    return segment.startswith("</") and _is_plausible_stream_entry_prefix("<" + segment[2:])
+    if not segment.startswith("</"):
+        return False
+    return _is_plausible_stream_entry_prefix("<" + segment[2:], _STREAM_CLOSER_TAGS)
 
 
 class StreamToolParser:
@@ -1362,20 +1415,147 @@ async def find_pow_answer(challange_data):
     return await asyncio.to_thread(_find_pow_answer_blocking, challange_data)
 
 
-async def solve_create_pow(target_path, auth_token):
-    pow = await create_challange_pow(target_path, auth_token)
-    answer = await find_pow_answer(pow)
-    if answer is None:
-        raise Exception("PoW solve failed")
+# ==============================================================================
+# PoW 预取池
+#
+# solve_create_pow() 是每个上游请求前的必经关卡，由两段串行工作组成：一次到
+# create_pow_challenge 的 HTTP 往返，加一次 wasm 解算。两者都排在第一个字节
+# 发给上游之前，所以全额计入用户感知的首字延迟。
+#
+# 但 challenge 不依赖本轮的消息内容——它的约束只有 expire_at，以及签发给哪个
+# target_path / token。这意味着整段等待可以提前做掉：上一轮收尾时预取，下一轮
+# 到达时直接取用。
+#
+# 池按 (target_path, auth_token) 分桶。token 必须进 key：challenge 按 token 签发
+# 并被 token 校验，跨 token 复用会被上游拒绝；token 池还会在 mark_limited /
+# mark_active 之间轮换，复用等于随机 403。target_path 也必须进 key：
+# chat/completion 与 file/upload_file 是两套互相独立、不能顶替的挑战。
+#
+# 取用路径必须能降级：池里命中且未过期才用，否则原地走同步求解。任何预取失败
+# 都被吞掉——池只是加速器，坏掉时行为退化成今天的样子，而不是报错。
+# ==============================================================================
+
+_POW_POOL = {}
+_POW_POOL_MAX = int(os.getenv("DEEPSEEKER_POW_POOL_MAX", "64"))
+# 不掌握上游真实有效期时的保守兜底；拿到 expire_at 就用更早的那个。
+_POW_PREFETCH_TTL = float(os.getenv("DEEPSEEKER_POW_PREFETCH_TTL", "60"))
+_POW_PREFETCH_ENABLED = os.getenv("DEEPSEEKER_POW_PREFETCH", "1").strip().lower() not in ("0", "false", "no")
+_pow_prefetch_tasks = set()
+
+
+def _pow_expire_epoch(pow_data):
+    """把 challenge 的 expire_at 归一化成秒级 Unix 时间戳；识别不了返回 None。
+
+    expire_at 的单位没有文档保证，所以按量级判断：超过 1e11 视为毫秒。落在
+    合理区间之外的值（纳秒、损坏值）一律返回 None，交由调用方退回固定 TTL，
+    而不是拿一个错误的过期时间去做判断。
+    """
+    try:
+        value = float(pow_data.get("expire_at"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if value <= 0:
+        return None
+    if value > 1e11:
+        value /= 1000.0
+    if value < 1e9 or value > 4e9:
+        return None
+    return value
+
+
+def _build_pow_header(pow_data, answer, target_path):
+    """把 challenge 与解算结果打包成 x-ds-pow-response 需要的 base64 串。"""
     json_data = {
         "algorithm": "DeepSeekHashV1",
-        "challenge": pow["challenge"],
-        "salt": pow["salt"],
+        "challenge": pow_data["challenge"],
+        "salt": pow_data["salt"],
         "answer": answer,
-        "signature": pow["signature"],
+        "signature": pow_data["signature"],
         "target_path": target_path,
     }
     return base64.b64encode(json.dumps(json_data).encode()).decode()
+
+
+def _pow_pool_take(target_path, auth_token):
+    """取走一个未过期的预取结果；没有可用条目时返回 None。
+
+    条目取出即弹出：预取的 challenge 只服务一个请求。让并发请求都拿到同一个
+    challenge，只会把校验风险推给上游，不如让它们各自同步求解。
+    """
+    entry = _POW_POOL.pop((target_path, auth_token), None)
+    if entry is None:
+        return None
+    pow_b64, usable_until = entry
+    if usable_until is not None and time.time() >= usable_until:
+        logger.debug("丢弃已过期的预取 PoW：%s", target_path)
+        return None
+    return pow_b64
+
+
+def _pow_pool_store(target_path, auth_token, pow_b64, pow_data):
+    """把解好的 PoW 放进池里，附带一个保守的可用期。"""
+    if len(_POW_POOL) >= _POW_POOL_MAX:
+        # 池满说明有大量 token 在轮换；淘汰最旧的一条而不是无限增长。
+        _POW_POOL.pop(next(iter(_POW_POOL)), None)
+    # 固定 TTL 是不掌握真实有效期时的兜底；拿到 expire_at 就取更早的那个，并留
+    # 5 秒余量，避免正好卡在边界上被上游以「已过期」拒绝。
+    usable_until = time.time() + _POW_PREFETCH_TTL
+    expire_epoch = _pow_expire_epoch(pow_data)
+    if expire_epoch is not None:
+        usable_until = min(usable_until, expire_epoch - 5.0)
+    _POW_POOL[(target_path, auth_token)] = (pow_b64, usable_until)
+
+
+async def _prefetch_pow_once(target_path, auth_token):
+    """后台预取一个 PoW；任何失败都只记日志，绝不外抛。"""
+    try:
+        pow_data = await create_challange_pow(target_path, auth_token)
+        answer = await find_pow_answer(pow_data)
+        if answer is None:
+            logger.debug("预取 PoW 未解出结果：%s", target_path)
+            return
+        _pow_pool_store(target_path, auth_token, _build_pow_header(pow_data, answer, target_path), pow_data)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("预取 PoW 失败：%s", target_path, exc_info=True)
+
+
+def _schedule_pow_prefetch(target_path, auth_token):
+    """安排一次后台预取；同一个 (target_path, token) 不重复排队。"""
+    if not _POW_PREFETCH_ENABLED:
+        return
+    key = (target_path, auth_token)
+    if key in _POW_POOL:
+        return
+    for task in _pow_prefetch_tasks:
+        if not task.done() and getattr(task, "_pow_key", None) == key:
+            return
+    try:
+        task = asyncio.create_task(_prefetch_pow_once(target_path, auth_token))
+    except RuntimeError:
+        # 没有运行中的事件循环（同步测试环境），静默跳过。
+        return
+    # 持有强引用：create_task 的结果若无人引用，可能在完成前被 GC 回收。
+    task._pow_key = key
+    _pow_prefetch_tasks.add(task)
+    task.add_done_callback(_pow_prefetch_tasks.discard)
+
+
+async def solve_create_pow(target_path, auth_token):
+    cached = _pow_pool_take(target_path, auth_token)
+    if cached is not None:
+        _schedule_pow_prefetch(target_path, auth_token)
+        return cached
+
+    pow_data = await create_challange_pow(target_path, auth_token)
+    answer = await find_pow_answer(pow_data)
+    if answer is None:
+        raise Exception("PoW solve failed")
+    header = _build_pow_header(pow_data, answer, target_path)
+    # 同步求解说明池是空的，顺手为下一轮补上。
+    _schedule_pow_prefetch(target_path, auth_token)
+    return header
 
 
 async def create_new_chat(auth_token):
