@@ -298,6 +298,43 @@ def build_summary_request_prompt(messages):
     )
 
 
+TOOL_USE_INSTRUCTIONS = (
+    "TOOL USE INSTRUCTIONS:\n"
+    "You have access to tools. When you need to call a tool, output ONLY the tool call XML block and nothing else:\n"
+    "<tool_call>{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}</tool_call>\n"
+    "Never repeat past messages, history, or XML tags. Output exactly one tool call block when invoking a tool."
+)
+
+
+async def append_fresh_session_runtime(prompt, messages, tools_extract, language_policy):
+    """Inject the runtime contract for a fresh upstream chat.
+
+    Shared by the normal first-message path and post-rollover seeding so both
+    stay in sync; before this helper existed the rollover branch dropped the
+    system prompt, tool-use instructions and tool schemas entirely.
+
+    The language policy and context-boundary policy stay mandatory in every
+    branch: they carry the highest-priority language contract and must not be
+    replaced by an upstream system prompt that happens to be present.
+    """
+    system_prompt = await extract_system(messages)
+    if system_prompt:
+        system_prompt += "\n\n" + language_policy + "\n" + CONTEXT_BOUNDARY_POLICY
+        if tools_extract:
+            system_prompt += "\n\n" + TOOL_USE_INSTRUCTIONS
+        prompt += f"[SYSTEM]\n{system_prompt}\n\n"
+    elif tools_extract:
+        prompt += (
+            f"[SYSTEM]\n{language_policy}\n{CONTEXT_BOUNDARY_POLICY}\n\n"
+            f"{TOOL_USE_INSTRUCTIONS}\n\n"
+        )
+    else:
+        prompt += f"[SYSTEM]\n{language_policy}\n{CONTEXT_BOUNDARY_POLICY}\n\n"
+    if tools_extract:
+        prompt += _context_section("TOOLS", tools_extract, data=False)
+    return prompt
+
+
 def build_summary_seed_prompt(summary, current_user_message="", language=None, fact_memory=""):
     """Seed prompt for the fresh chat created after rollover."""
     language = language or (
@@ -701,19 +738,29 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
     if is_first_message and (rollover_summary or needs_rollover(messages)):
         # Accumulated context is nearing the observed limit: hand off to a
         # fresh chat seeded with a model-generated summary instead of blindly
-        # truncating the oldest history. The newest user message and the
-        # relevant tool results are preserved; attachments are described, not
-        # forwarded.
+        # truncating the oldest history. Restore the full runtime contract
+        # (system prompt, tool schemas, tool-use instructions) before the
+        # handoff summary and preserved conversation tail.
+        final_prompt = await append_fresh_session_runtime(
+            final_prompt, messages, tools_extract, language_policy
+        )
         if rollover_summary:
+            # The summary already carries the earlier conversation, so the fact
+            # ledger must not scan the full history again: re-forwarding old
+            # turns would defeat the point of rolling over. Keep only the
+            # newest user request as the deterministic anchor.
+            latest_user = next(
+                (m for m in reversed(messages) if m.get("role") == "user"), None
+            )
             final_prompt += build_summary_seed_prompt(
                 rollover_summary,
                 language=detect_prompt_language(messages),
-                fact_memory=build_fact_memory(messages),
+                fact_memory=build_fact_memory([latest_user]) if latest_user else "",
             )
         else:
-            # Keep control text before all replayed data, matching OpenCode's
-            # stable system-context prefix and reducing prompt drift.
-            final_prompt += f"[SYSTEM]\n{language_policy}\n{CONTEXT_BOUNDARY_POLICY}\n\n"
+            # The runtime contract (system prompt, language policy, tool schemas)
+            # is already injected by append_fresh_session_runtime above; only the
+            # deterministic fact memory is added here, before any replayed data.
             final_prompt += _context_section("DETERMINISTIC FACT MEMORY", build_fact_memory(messages))
         relevant_tool_results = await extract_tool_results(messages, latest_only=True)
         if relevant_tool_results:
@@ -801,6 +848,6 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
                 final_prompt += _context_section("USER", user_msg, data=False)
 
         if tools_extract:
-            final_prompt += tool_instructions + "\n"
+            final_prompt += TOOL_USE_INSTRUCTIONS + "\n"
 
     return final_prompt
