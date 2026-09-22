@@ -86,7 +86,8 @@ def init_db():
             status TEXT DEFAULT 'ACTIVE',
             last_checked_at TEXT,
             last_check_error TEXT,
-            account_id INTEGER
+            account_id INTEGER,
+            limited_until REAL
         );
         CREATE TABLE IF NOT EXISTS accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,6 +120,8 @@ def init_db():
         conn.execute("ALTER TABLE tokens ADD COLUMN last_check_error TEXT")
     if "account_id" not in token_columns:
         conn.execute("ALTER TABLE tokens ADD COLUMN account_id INTEGER")
+    if "limited_until" not in token_columns:
+        conn.execute("ALTER TABLE tokens ADD COLUMN limited_until REAL")
     conn.commit()
     conn.close()
     try:
@@ -561,28 +564,132 @@ def delete_token(token_id):
     conn.close()
 
 
+RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("DEEPSEEKER_RATE_LIMIT_COOLDOWN", "60"))
+
+# 各 token 当前在途的上游请求数，供 pick_token() 做负载均衡。
+# 仅由事件循环线程读写：token_acquire/token_release 与 pick_token() 之间不存在
+# await 边界，dict 的单项读写本身是原子的，因此无需额外加锁。
+_inflight = {}
+
+
+def token_acquire(token_id):
+    """登记一个在途上游请求（对应一次 handle_chat 的完整生命周期）。"""
+    if token_id is None:
+        return
+    _inflight[token_id] = _inflight.get(token_id, 0) + 1
+
+
+def token_release(token_id):
+    """注销一个在途上游请求；计数归零时删除键，避免字典随历史无限增长。"""
+    if token_id is None:
+        return
+    remaining = _inflight.get(token_id, 0) - 1
+    if remaining > 0:
+        _inflight[token_id] = remaining
+    else:
+        _inflight.pop(token_id, None)
+
+
+def inflight_snapshot():
+    """当前在途计数的快照（排障用，不参与分配决策）。"""
+    return dict(_inflight)
+
+
+class TokenLease:
+    """一次上游请求对某个 token 的在途占用凭证。
+
+    与 _OwnedChatLock 同构：release() 幂等，只注销自己登记的那一份计数，
+    因此可以在流式响应里把所有权转移给生成器、也可以在重试递归前提前
+    释放。rebind() 支持 token 轮换：旧账号被限流而请求改由新账号承载时，
+    把占用从旧 token 转移过去，避免旧计数泄漏。
+    """
+
+    __slots__ = ("_token_id",)
+
+    def __init__(self, token_id=None):
+        self._token_id = None
+        if token_id is not None:
+            token_acquire(token_id)
+            self._token_id = token_id
+
+    def rebind(self, token_id):
+        if token_id == self._token_id:
+            return
+        self.release()
+        if token_id is not None:
+            token_acquire(token_id)
+            self._token_id = token_id
+
+    def release(self):
+        if self._token_id is None:
+            return
+        token_release(self._token_id)
+        self._token_id = None
+
+    @property
+    def token_id(self):
+        return self._token_id
+
+
 def pick_token():
+    """选出当前最空闲的可用 token。
+
+    改为「最少在途优先」而非无状态随机：账号数少而并发新会话多时，
+    ORDER BY RANDOM() 的方差会让某个账号同时吸收多个请求、先撞上游的
+    按账号限流，而其它账号仍然空闲。在途数并列时仍随机挑选，保证同等
+    空闲的账号之间继续均摊。
+
+    limited_until 冷却过滤：刚返回 429 的账号在冷却窗口内不进入候选集；
+    冷却一旦到期即重新参与分配，不再只依赖间隔长得多（默认 300s）的定时
+    健康检查来恢复。永久性故障状态（INVALID / CHECK_ERROR）始终排除，
+    只有限流这一种可自愈的状态享受冷却到期即恢复。
+
+    候选集为空时保持原有兜底语义（不限状态取 id 最小者），因为调用方
+    （handle_chat、文件上传）已有各自的限流与轮换处理。
+    """
     conn = get_db()
-    row = conn.execute("SELECT id FROM tokens WHERE status = 'ACTIVE' ORDER BY RANDOM() LIMIT 1").fetchone()
-    if row:
+    try:
+        now = time.time()
+        rows = conn.execute("SELECT id, status, limited_until FROM tokens").fetchall()
+        candidates = [
+            r[0] for r in rows
+            if (r[1] == "ACTIVE" and (not r[2] or r[2] <= now))
+            or (r[1] == "RATE_LIMITED" and r[2] and r[2] <= now)
+        ]
+        if not candidates:
+            row = conn.execute("SELECT id FROM tokens ORDER BY id LIMIT 1").fetchone()
+            return row[0] if row else None
+        if len(candidates) == 1:
+            return candidates[0]
+        least = min(_inflight.get(tid, 0) for tid in candidates)
+        return random.choice([tid for tid in candidates if _inflight.get(tid, 0) == least])
+    finally:
         conn.close()
-        return row[0]
-    row = conn.execute("SELECT id FROM tokens ORDER BY id LIMIT 1").fetchone()
-    conn.close()
-    return row[0] if row else None
 
 
 def mark_limited(token_id):
+    """将 token 标记为限流并进入冷却期。
+
+    limited_until 让 pick_token() 在冷却窗口内绕开该账号；冷却到期后该账号
+    重新进入候选集（见 pick_token），无需等待定时健康检查。健康检查探活
+    成功仍会把状态正式恢复为 ACTIVE（见 update_token_check）。
+    """
     logger.warning("Token #%d marked RATE_LIMITED", token_id)
     conn = get_db()
-    conn.execute("UPDATE tokens SET status = ? WHERE id = ?", ("RATE_LIMITED", token_id))
+    conn.execute(
+        "UPDATE tokens SET status = ?, limited_until = ? WHERE id = ?",
+        ("RATE_LIMITED", time.time() + RATE_LIMIT_COOLDOWN_SEC, token_id),
+    )
     conn.commit()
     conn.close()
 
 
 def mark_active(token_id):
     conn = get_db()
-    conn.execute("UPDATE tokens SET status = ? WHERE id = ?", ("ACTIVE", token_id))
+    conn.execute(
+        "UPDATE tokens SET status = ?, limited_until = NULL WHERE id = ?",
+        ("ACTIVE", token_id),
+    )
     conn.commit()
     conn.close()
 
@@ -665,8 +772,10 @@ def update_token_check(token_id, status, error=None):
     """Persist the latest periodic/manual token check result."""
     conn = get_db()
     conn.execute(
-        "UPDATE tokens SET status = ?, last_checked_at = ?, last_check_error = ? WHERE id = ?",
-        (status, datetime.now(timezone.utc).isoformat(), error, token_id),
+        "UPDATE tokens SET status = ?, last_checked_at = ?, last_check_error = ?, "
+        "limited_until = CASE WHEN ? = 'ACTIVE' THEN NULL ELSE limited_until END "
+        "WHERE id = ?",
+        (status, datetime.now(timezone.utc).isoformat(), error, status, token_id),
     )
     conn.execute(
         "UPDATE accounts SET status = ?, last_error = ? WHERE id = "

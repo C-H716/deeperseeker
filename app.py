@@ -21,6 +21,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.background import BackgroundTask
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(BASE_DIR)
@@ -58,6 +59,7 @@ from functions import (
     peek_cached_input,
     record_cached_input,
     reset_cached_input,
+    TokenLease,
     check_token_status,
     delete_account,
     get_accounts,
@@ -551,6 +553,9 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                 new_tok = get_token(new_token_id)
                 if new_tok:
                     _set_key_name(new_tok.get("alias"))
+                    # 轮换后的请求由新账号承载，在途占用须登记到新 token 上；
+                    # 旧 token 的计数由触发轮换的那一帧自行释放。
+                    rot_lease = TokenLease(new_token_id)
                     # Stage 0.3: rotation re-creates the upstream chat; hold the
                     # new chat's lock across its send -> save section so a
                     # concurrent same-signature request cannot race the swap.
@@ -573,15 +578,20 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                     except Exception as e:
                         if rot_owner is not None:
                             rot_owner.release()
+                        # 上游请求未能建立，新 token 的在途占用须立即注销，
+                        # 否则该账号会永久显得繁忙，扭曲后续的负载均衡。
+                        rot_lease.release()
                         logger.exception("Token-rotation recovery failed (chat %s): %s", session_id, e)
                         if _retried:
                             return _api_error_response(e, is_anthropic)
                         return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
                     if stream:
                         gen = _release_chat_lock_stream(gen, rot_owner)
+                        # 与主路径一致：流式响应把在途占用的所有权交给生成器，
+                        # 由它在 finally 内释放（客户端中断同样触发）。
                         if is_anthropic:
-                            return StreamingResponse(stream_anthropic_response(gen, model, messages, new_token_id, new_session_id, sig, tools, req_model, 0, scope), media_type="text/event-stream")
-                        return StreamingResponse(stream_response(gen, model, messages, new_token_id, new_session_id, sig, tools, 0, scope), media_type="text/event-stream")
+                            return StreamingResponse(stream_anthropic_response(gen, model, messages, new_token_id, new_session_id, sig, tools, req_model, 0, scope, lease=rot_lease), media_type="text/event-stream", background=BackgroundTask(rot_lease.release))
+                        return StreamingResponse(stream_response(gen, model, messages, new_token_id, new_session_id, sig, tools, 0, scope, lease=rot_lease), media_type="text/event-stream", background=BackgroundTask(rot_lease.release))
                     else:
                         try:
                             resp_text = await collect_response(gen)
@@ -589,6 +599,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                             logger.exception("Upstream failed during token-rotation request: %s", e)
                             if rot_owner is not None:
                                 rot_owner.release()
+                            rot_lease.release()
                             if _retried:
                                 return _api_error_response(e, is_anthropic)
                             return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
@@ -610,6 +621,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         save_session(next_sig, new_token_id, new_session_id, next_parent(0))
                         if rot_owner is not None:
                             rot_owner.release()
+                        rot_lease.release()
                         in_tokens = count_tok(_messages_text(messages))
                         _remember_prompt_tokens(next_sig, in_tokens)
                         return format_response(resp_text, model, messages, tools, cached_tokens=_cached_prompt_tokens(sig, in_tokens), prompt_tokens=in_tokens)
@@ -670,7 +682,11 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
     # section; for streams, ownership transfers to the response generator via
     # _release_chat_lock_stream (the final save_session happens there).
     lock_owner = await _own_chat_lock(session_id)
+    # 登记该 token 的在途占用，供 pick_token() 的负载均衡读取。非流式在
+    # finally 释放；流式连同锁一起把所有权交给生成器。
+    lease = TokenLease(token_id)
     lock_transferred = False
+    lease_transferred = False
     try:
         file_ids = await extract_and_upload_files(messages, tok["token"], last_user_only=not is_first)
         # Rollover rebuilds the prompt from a summary instead of the accumulated
@@ -685,9 +701,12 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         if stream:
             gen = _release_chat_lock_stream(gen, lock_owner)
             lock_transferred = True
+            # 流式响应把 token 在途占用的所有权一并交给生成器，由它在 finally
+            # 内释放（客户端中断同样触发）；此处不得再自行释放。
+            lease_transferred = True
             if is_anthropic:
-                return StreamingResponse(stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model, parent_message_id, scope), media_type="text/event-stream")
-            return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id, scope), media_type="text/event-stream")
+                return StreamingResponse(stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model, parent_message_id, scope, lease=lease), media_type="text/event-stream", background=BackgroundTask(lease.release))
+            return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id, scope, lease=lease), media_type="text/event-stream", background=BackgroundTask(lease.release))
         else:
             resp_text = await collect_response(gen)
             mark_active(token_id)
@@ -730,10 +749,15 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         # a no-op, the retry re-acquires cleanly, and queued same-chat requests
         # are no longer starved for the entire retry either.
         lock_owner.release()
+        # 在途占用同样须在递归前交还：重试会重新选取 token，本帧登记的计数
+        # 若留着，旧账号会持续显得繁忙，干扰后续的负载均衡决策。
+        lease.release()
         return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
     finally:
         if not lock_transferred:
             lock_owner.release()
+        if not lease_transferred:
+            lease.release()
 
 
 async def collect_response(gen):
@@ -792,7 +816,7 @@ async def _hold_think_tags(gen):
         yield carry
 
 
-async def stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id=0, scope=""):
+async def stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id=0, scope="", lease=None):
     parser = StreamToolParser()
     full_text = ""
     is_thinking = False
@@ -887,9 +911,14 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 yield "data: [DONE]\n\n"
             except asyncio.CancelledError:
                 pass
+        # 释放该 token 的在途占用。必须置于 finally 内：客户端中断
+        # （CancelledError / GeneratorExit）时同样要注销，否则计数只增不减，
+        # 会让该账号在此后永久显得最忙，破坏负载均衡。
+        if lease is not None:
+            lease.release()
 
 
-async def stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model=None, parent_message_id=0, scope=""):
+async def stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model=None, parent_message_id=0, scope="", lease=None):
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     in_tokens = count_tok(_messages_text(messages))
     cached_tokens = _cached_prompt_tokens(sig, in_tokens)
@@ -1026,6 +1055,9 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
                         yield evt + "\n\n"
             except asyncio.CancelledError:
                 pass
+        # 同 stream_response：在 finally 内注销在途占用，客户端中断也生效。
+        if lease is not None:
+            lease.release()
 
 
 def format_response(text, model, messages, tools=None, cached_tokens=0, prompt_tokens=None):
@@ -1591,9 +1623,13 @@ async def openai_responses(request: Request):
 
     if stream:
         if isinstance(result, StreamingResponse):
+            # 外层重新包装了 body_iterator，内层 response 的 background 不会
+            # 自动继承；显式透传，否则 /v1/responses 流式路径下 lease 的兜底
+            # 释放丢失（客户端在首次迭代前断开时在途计数会泄漏）。
             return StreamingResponse(
                 stream_openai_responses(result.body_iterator, model, body.get("instructions")),
                 media_type="text/event-stream",
+                background=result.background,
             )
         return result
 
