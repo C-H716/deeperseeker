@@ -459,7 +459,7 @@ async def _preflight_stream(gen):
     return _replay_stream(gen, first)
 
 
-async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None, is_anthropic=False, req_model=None, scope="", _retried=False):
+async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None, is_anthropic=False, req_model=None, scope="", search_sink=None, _retried=False):
     auth_token = get_auth_token()
     if not auth_token:
         return JSONResponse({"error": "No auth token. Add via dashboard."}, status_code=401)
@@ -584,7 +584,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         logger.exception("Token-rotation recovery failed (chat %s): %s", session_id, e)
                         if _retried:
                             return _api_error_response(e, is_anthropic)
-                        return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
+                        return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, search_sink=search_sink, _retried=True)
                     if stream:
                         gen = _release_chat_lock_stream(gen, rot_owner)
                         # 与主路径一致：流式响应把在途占用的所有权交给生成器，
@@ -602,7 +602,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                             rot_lease.release()
                             if _retried:
                                 return _api_error_response(e, is_anthropic)
-                            return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
+                            return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, search_sink=search_sink, _retried=True)
                         mark_active(new_token_id)
 
                         parsed_tools, clean_text = parse_tools(resp_text)
@@ -696,7 +696,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             reset_cached_input(sig)
         prompt = await build_prompt(messages, tools or [], model, is_first, rollover_summary=rollover_summary)
 
-        gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids)
+        gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids, search_sink=search_sink)
         gen = await _preflight_stream(gen)
         if stream:
             gen = _release_chat_lock_stream(gen, lock_owner)
@@ -752,7 +752,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         # 在途占用同样须在递归前交还：重试会重新选取 token，本帧登记的计数
         # 若留着，旧账号会持续显得繁忙，干扰后续的负载均衡决策。
         lease.release()
-        return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
+        return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, search_sink=search_sink, _retried=True)
     finally:
         if not lock_transferred:
             lock_owner.release()
@@ -1107,16 +1107,68 @@ def format_response(text, model, messages, tools=None, cached_tokens=0, prompt_t
 format_openai_response = format_response
 
 
-def format_anthropic_response(result, model):
+def _anthropic_search_result_block(search_results):
+    """Build the Anthropic ``web_search_tool_result`` block from upstream results.
+
+    Anthropic clients (and the DSH web-search provider in particular) require the
+    sources to be machine-readable: the provider walks this block for citeable
+    items and rejects the whole response when it is absent. Upstream DeepSeek
+    events already carry ``url``/``title``/``snippet``/``published_at``, so the
+    block is assembled verbatim rather than reconstructed from the prose, whose
+    ``[citation:N]`` markers do not survive tokenization reliably.
+
+    Items without a URL are dropped: the schema requires one and an address-less
+    entry cannot be cited by a client.
+
+    @param search_results - raw result dicts collected from the upstream stream.
+    @returns the block, or ``None`` when no citeable item remains.
+    """
+    items = []
+    for r in search_results or []:
+        if not isinstance(r, dict) or not r.get("url"):
+            continue
+        item = {"type": "web_search_result", "url": r["url"]}
+        if r.get("title"):
+            item["title"] = r["title"]
+        published = r.get("published_at")
+        if isinstance(published, (int, float)) and published > 0:
+            item["page_age"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(published))
+        items.append(item)
+    if not items:
+        return None
+    return {"type": "web_search_tool_result", "content": items}
+
+
+def format_anthropic_response(result, model, search_results=None):
     choice = result["choices"][0]
     msg = choice["message"]
     ant_content = []
+
+    search_block = _anthropic_search_result_block(search_results)
+    if search_block:
+        ant_content.append(search_block)
 
     if msg.get("reasoning_content"):
         ant_content.append({"type": "thinking", "thinking": msg["reasoning_content"]})
 
     if msg.get("content"):
-        ant_content.append({"type": "text", "text": msg["content"]})
+        text_block = {"type": "text", "text": msg["content"]}
+        # The DSH provider reads each source's excerpt from a text block's
+        # citations, keyed by URL, not from the result block itself. Attaching
+        # them here is what makes the snippet survive into the normalized result.
+        citations = []
+        for r in search_results or []:
+            if not isinstance(r, dict) or not r.get("url") or not r.get("snippet"):
+                continue
+            citations.append({
+                "type": "web_search_result_location",
+                "url": r["url"],
+                "title": r.get("title"),
+                "cited_text": r["snippet"],
+            })
+        if citations:
+            text_block["citations"] = citations
+        ant_content.append(text_block)
 
     if msg.get("tool_calls"):
         for tc in msg["tool_calls"]:
@@ -1732,7 +1784,14 @@ async def anthropic_messages(request: Request):
     openai_msgs.extend(convert_anthropic_messages(messages))
 
     openai_tools = []
+    server_search = False
     for t in tools:
+        if t.get("type") in {"web_search_20250305", "web_search", "web_search_preview"}:
+            # 服务端搜索工具必须由上游联网检索执行，不能作为客户端 function
+            # tool 转发：转发只会换回一个 tool_use 声明块，调用方拿不到来源，
+            # 而 Anthropic 客户端要求服务端执行后的 web_search_tool_result。
+            server_search = True
+            continue
         if t.get("type") == "function":
             openai_tools.append({
                 "type": "function",
@@ -1759,13 +1818,17 @@ async def anthropic_messages(request: Request):
             openai_msgs.insert(0, {"role": "system", "content": f"You MUST return valid JSON adhering strictly to this JSON Schema:\n{json.dumps(json_schema)}"})
 
     req_model = body.get("model")
+    search_sink = []
     if stream:
-        return await handle_chat(openai_msgs, model, thinking, False, True, openai_tools or None, is_anthropic=True, req_model=req_model, scope=get_api_key(request))
+        # 流式路径下搜索结果与正文交错到达，content_block 索引在开流时即已固定，
+        # 无法在响应头发出后追加结果块；需要结构化来源的调用方应走非流式路径。
+        # 此处仍透传 server_search，确保上游确实执行联网检索。
+        return await handle_chat(openai_msgs, model, thinking, server_search, True, openai_tools or None, is_anthropic=True, req_model=req_model, scope=get_api_key(request), search_sink=search_sink)
 
-    result = await handle_chat(openai_msgs, model, thinking, False, False, openai_tools or None, is_anthropic=True, req_model=req_model, scope=get_api_key(request))
+    result = await handle_chat(openai_msgs, model, thinking, server_search, False, openai_tools or None, is_anthropic=True, req_model=req_model, scope=get_api_key(request), search_sink=search_sink)
     if not isinstance(result, dict) or "choices" not in result:
         return result
-    return format_anthropic_response(result, req_model)
+    return format_anthropic_response(result, req_model, search_results=search_sink)
 
 
 @app.get("/v1/models")

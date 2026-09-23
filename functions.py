@@ -1765,6 +1765,44 @@ def _deepseek_event_finished(data):
     )
 
 
+def _deepseek_event_search_results(data):
+    """Collect structured web-search results carried by a DeepSeek SSE event.
+
+    The upstream publishes one event per search round at the JSON path
+    ``response/fragments/<id>/results``; its ``v`` array holds objects with
+    ``url``/``title``/``snippet``/``cite_index``/``published_at``. Batched
+    envelopes nest the identical payload, so the walker recurses through the
+    container keys used by the other event parsers in this module. Items lack a
+    URL are dropped here: the Anthropic result schema requires one, and a
+    downstream consumer cannot cite an address-less entry.
+    """
+    found = []
+
+    def visit(node):
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+            return
+        if not isinstance(node, dict):
+            return
+
+        path = node.get("p")
+        value = node.get("v")
+        if isinstance(path, str) and path.endswith("/results") and isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict) and item.get("url"):
+                    found.append(item)
+            return
+
+        for key in ("v", "data", "value"):
+            child = node.get(key)
+            if isinstance(child, (dict, list)):
+                visit(child)
+
+    visit(data)
+    return found
+
+
 def _deepseek_event_rate_limited(data):
     """Detect rate-limit errors encoded in a successful SSE response."""
     rate_markers = (
@@ -1872,7 +1910,7 @@ async def _iter_deepseek_sse_payloads(content):
         yield payload
 
 
-async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, file_ids_=None):
+async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, file_ids_=None, search_sink=None):
     # Backup: WAF cookies not required with Android headers. Kept as fallback:
     # cookie = await get_cookies()
     if parent_message_id == 0:
@@ -1925,6 +1963,14 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                 continue
             recent_events.append(data)
             recent_events = recent_events[-5:]
+
+            # Search results arrive on their own event path and carry no
+            # assistant prose. Collecting them here keeps the generator's
+            # yielded text limited to RESPONSE/THINK fragments, so callers that
+            # need the sources receive them through search_sink instead of
+            # parsing them back out of the visible answer.
+            if search_sink is not None:
+                search_sink.extend(_deepseek_event_search_results(data))
 
             if _deepseek_event_rate_limited(data):
                 logger.warning(
