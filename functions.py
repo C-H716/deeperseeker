@@ -283,10 +283,287 @@ def _redact_login_response(value):
     return value
 
 
+# The fingerprint SDK envelope submitted by the web client decodes to a JSON
+# object carrying appId/organization/ep/data and runs to several thousand
+# characters. The floor below only has to separate that shape from the storage
+# keys it is easily confused with (smidV2 is a short timestamp+hex token, and
+# deepseek-device-id:chat is a UUID), so it is deliberately far under the real
+# length rather than an exact match on a value the SDK may re-version.
+_DEVICE_ID_MIN_LENGTH = 200
+_DEVICE_ID_B64_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}\Z")
+
+
+def _decode_device_id_envelope(candidate):
+    """Return the JSON envelope carried by a device ID, or None when absent.
+
+    The fingerprint SDK prefixes the base64 payload with a single tag
+    character, so the encoded body is not aligned to the start of the string.
+    Both the whole value and the value past that tag are attempted; only a
+    body that decodes to an object carrying ``appId`` is accepted.
+    """
+    for offset in (0, 1):
+        body = candidate[offset:]
+        if not body or len(body) % 4 != 0:
+            continue
+        try:
+            decoded = base64.b64decode(body, validate=True)
+        except Exception:
+            continue
+        try:
+            parsed = json.loads(decoded.decode("utf-8"))
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and "appId" in parsed:
+            return parsed
+    return None
+
+
+def _looks_like_device_id(value):
+    """Report whether a value has the structure the login endpoint expects.
+
+    The risk check correlates the submitted identifier with the fingerprint
+    SDK's envelope, so a value of the wrong shape leaves the request rejected
+    exactly as a missing one would. Storage keys under similar names are
+    rejected here to keep them from being cached and then reused indefinitely.
+    """
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    if len(candidate) < _DEVICE_ID_MIN_LENGTH:
+        return False
+    if not _DEVICE_ID_B64_RE.match(candidate):
+        return False
+    return _decode_device_id_envelope(candidate) is not None
+
+
 def _generate_web_device_id():
-    """Generate the browser-style device ID accepted by the web login endpoint."""
-    alphabet = string.ascii_letters + string.digits + "+/"
-    return "B" + "".join(secrets.choice(alphabet) for _ in range(86)) + "=="
+    """Generate a structurally valid placeholder device ID for the endpoint.
+
+    This keeps the request well formed when no real identifier can be obtained,
+    but it is not a fingerprint: the risk check rejects it, and callers must
+    treat rejection as the expected outcome rather than a transient failure.
+    """
+    envelope = json.dumps(
+        {
+            "appId": "default",
+            "organization": "",
+            "ep": "",
+            # Padded so the placeholder also satisfies _looks_like_device_id;
+            # the endpoint parses this field before the risk check runs.
+            "data": "0" * 400,
+        },
+        separators=(",", ":"),
+    )
+    return base64.b64encode(envelope.encode("utf-8")).decode("ascii")
+
+
+def device_id_file_path():
+    """Resolve where the harvested DeepSeek device ID is stored.
+
+    Mirrors cookie_file_path(): an explicit override wins, otherwise the file
+    is placed next to the database so it lands inside the persistent Docker
+    volume and survives container recreation.
+    """
+    p = os.getenv("DEEPSEEKER_DEVICE_ID_PATH")
+    if p:
+        return p
+    d = os.path.dirname(os.path.abspath(_db))
+    if d and os.path.abspath(d) != os.path.abspath(os.getcwd()):
+        return os.path.join(d, "deepseek_device_id")
+    return "deepseek_device_id"
+
+
+def _read_persisted_device_id():
+    """Return the stored device ID, or None when absent, unreadable or malformed.
+
+    A malformed value is treated as absent rather than returned: an earlier run
+    may have cached a storage key with a similar name, and reusing it would keep
+    every subsequent login failing the risk check with no path to recovery short
+    of deleting the file by hand.
+    """
+    try:
+        with open(device_id_file_path()) as f:
+            value = f.read().strip()
+    except Exception:
+        return None
+    if not _looks_like_device_id(value):
+        if value:
+            logger.warning(
+                "Discarding persisted DeepSeek device ID at %s: it does not have "
+                "the shape the login endpoint expects",
+                device_id_file_path(),
+            )
+        return None
+    return value
+
+
+def _persist_device_id(value):
+    """Store a harvested device ID so later logins reuse the same identity.
+
+    Identity reuse matters: the risk engine correlates logins by device, so a
+    new random ID per login looks like an unfamiliar device each time. Values
+    failing the structural check are refused here so a bad harvest cannot
+    poison every later login.
+    """
+    if not _looks_like_device_id(value):
+        logger.warning("Refusing to persist a malformed DeepSeek device ID")
+        return
+    target = device_id_file_path()
+    try:
+        target_dir = os.path.dirname(os.path.abspath(target))
+        os.makedirs(target_dir, exist_ok=True)
+        tmp_path = target + ".tmp"
+        with open(tmp_path, "w") as f:
+            f.write(value)
+        os.replace(tmp_path, target)
+        logger.info("DeepSeek device ID persisted to %s", target)
+    except Exception as e:
+        logger.warning("Could not persist DeepSeek device ID to %s: %s", target, e)
+
+
+# Runs in the page context. Only the SDK accessors are consulted: storage keys
+# with similar names (smidV2, deepseek-device-id:chat) hold a different kind of
+# identifier, and returning one would submit a value the risk check rejects.
+_DEVICE_ID_PROBE_JS = """
+async () => {
+  const sdk = window.SMSdk || window.smSdk || window.SMSDK;
+  if (!sdk) return "";
+  for (const name of ["getDeviceId", "getDeviceIdSync", "getDeviceIdAsync"]) {
+    try {
+      const fn = sdk[name];
+      if (typeof fn !== "function") continue;
+      const value = await fn.call(sdk);
+      if (typeof value === "string" && value) return value;
+    } catch (e) {}
+  }
+  return "";
+}
+"""
+
+
+def device_id_harvest_timeout():
+    """Return the harvest budget, falling back when the setting is unusable.
+
+    Resolved per call rather than at import: the variable is documented in
+    .env.example, and a non-numeric value there must not abort module import
+    and take the whole service down over an unrelated feature.
+    """
+    raw = os.getenv("DEEPSEEKER_DEVICE_ID_TIMEOUT", "60")
+    try:
+        return max(1.0, float(raw))
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring invalid DEEPSEEKER_DEVICE_ID_TIMEOUT=%r; using 60 seconds", raw
+        )
+        return 60.0
+
+# Serializes harvesting so concurrent logins cannot launch several browsers.
+_device_id_lock = asyncio.Lock()
+
+
+async def _fetch_real_device_id():
+    """Harvest the device ID the browser fingerprint SDK reports for this host.
+
+    A random string does not satisfy the login risk check: the endpoint expects
+    the identifier produced by the fingerprint SDK the web client loads. This
+    opens the sign-in page in headless Chromium, waits for the SDK to publish
+    its ID, and returns it.
+    """
+    if async_playwright is None:
+        raise CookieGenerationError("playwright is not installed")
+    launch_kwargs = {"headless": True}
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        launch_kwargs["args"] = ["--no-sandbox", "--disable-dev-shm-usage"]
+    harvested = None
+    last_error = None
+    timeout = device_id_harvest_timeout()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(**launch_kwargs)
+        try:
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                locale="zh-CN",
+                viewport={"width": 1280, "height": 720},
+            )
+            page = await context.new_page()
+            await page.goto(
+                "https://chat.deepseek.com/sign_in",
+                wait_until="domcontentloaded",
+                timeout=45000,
+            )
+            # The SDK loads asynchronously; a short settle wait avoids polling
+            # before its script has even been requested.
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    value = await page.evaluate(_DEVICE_ID_PROBE_JS)
+                except Exception as e:
+                    # Record rather than swallow: a renamed SDK global and a
+                    # failed navigation both surface here, and the timeout
+                    # message alone cannot distinguish them.
+                    last_error = e
+                    value = ""
+                if _looks_like_device_id(value):
+                    harvested = value.strip()
+                    break
+                await asyncio.sleep(1)
+        finally:
+            await browser.close()
+    if not harvested:
+        detail = f"; last page error: {last_error}" if last_error else ""
+        raise CookieGenerationError(
+            "the fingerprint SDK did not publish a device ID within "
+            f"{timeout:.0f}s{detail}"
+        )
+    return harvested
+
+
+async def _resolve_login_device_id(explicit_device_id=None):
+    """Resolve the device ID submitted to the login endpoint.
+
+    Precedence: explicit argument > DEEPSEEKER_DEVICE_ID > persisted file >
+    freshly harvested ID > random placeholder. The random placeholder keeps the
+    request well-formed but is known to be rejected by the risk check, so it is
+    used only after every real source fails.
+    """
+    if explicit_device_id and str(explicit_device_id).strip():
+        return str(explicit_device_id).strip()
+    env_device_id = os.getenv("DEEPSEEKER_DEVICE_ID", "").strip()
+    if env_device_id:
+        return env_device_id
+    persisted = _read_persisted_device_id()
+    if persisted:
+        return persisted
+    async with _device_id_lock:
+        # A concurrent caller may have harvested and cached it while we waited.
+        persisted = _read_persisted_device_id()
+        if persisted:
+            return persisted
+        try:
+            harvested = await asyncio.wait_for(
+                _fetch_real_device_id(), timeout=device_id_harvest_timeout() + 90
+            )
+        except Exception as e:
+            logger.warning("Could not harvest a browser device ID: %s", e)
+            harvested = None
+        # Persist while still holding the lock: releasing it first would let a
+        # concurrent caller read an empty file and launch a second browser,
+        # defeating the double-check above.
+        if harvested and _looks_like_device_id(harvested):
+            _persist_device_id(harvested)
+            return harvested
+    logger.warning(
+        "No device ID available; falling back to a placeholder that the risk "
+        "check will most likely reject"
+    )
+    return _generate_web_device_id()
 
 
 async def login_deepseek_account(email, password, device_id=None):
@@ -302,10 +579,9 @@ async def login_deepseek_account(email, password, device_id=None):
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
     }
     normalized_email = str(email).strip().replace("\\@", "@")
-    # Web login device IDs are base64-encoded 64-byte values (88 characters).
-    normalized_device_id = str(device_id).strip() if device_id else (
-        os.getenv("DEEPSEEKER_DEVICE_ID", "").strip() or _generate_web_device_id()
-    )
+    # The risk check validates the fingerprint SDK's device ID, so a real value
+    # is harvested and cached rather than generated per request.
+    normalized_device_id = await _resolve_login_device_id(device_id)
     payload = {
         "email": normalized_email,
         "mobile": "",

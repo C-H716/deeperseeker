@@ -1,6 +1,8 @@
 aws_cookies_deepseek.json
 __pycache__/
 deeperseeker.db
+# harvested DeepSeek device ID (per-host, must never be committed)
+deepseek_device_id
 *.db.bak
 .venv/
 .omo/

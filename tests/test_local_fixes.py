@@ -10,8 +10,35 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import API_KEY, SINGLE_MODEL, convert_anthropic_messages, resolve_model
-from functions import _extract_login_token, _generate_web_device_id, _redact_login_response, login_deepseek_account, parse_tools
+from functions import _extract_login_token, _generate_web_device_id, _looks_like_device_id, _redact_login_response, login_deepseek_account, parse_tools
 from plugin_helper import build_prompt, detect_prompt_language, extract_system, generate_signature_sync
+
+
+def make_device_id(tag, prefix="D"):
+    """Build a device ID with the shape the login endpoint accepts.
+
+    The SDK emits one tag character followed by the base64 envelope carrying
+    appId/organization/ep/data, so the encoded body is not aligned to the start
+    of the string. Reproducing that offset here is what keeps the shape check
+    honest: a fixture aligned at position zero would pass even when every real
+    value is rejected. Short storage keys such as smidV2 are deliberately not
+    accepted and using one here would hide that.
+    """
+    import base64
+    import json
+
+    envelope = json.dumps(
+        {
+            "appId": "default",
+            "organization": "org-" + tag,
+            "ep": "",
+            # Padding keeps the sample above the minimum length the shape check
+            # enforces, mirroring the several-thousand-character real envelope.
+            "data": (tag + "-") * 40,
+        },
+        separators=(",", ":"),
+    )
+    return prefix + base64.b64encode(envelope.encode("utf-8")).decode("ascii")
 
 
 def test_api_key_never_empty():
@@ -159,13 +186,103 @@ def test_login_response_logging_redacts_credentials():
     assert response["user"]["email"] == "user@example.com"
 
 
-def test_web_device_ids_follow_random_browser_rule():
-    first_id = _generate_web_device_id()
-    second_id = _generate_web_device_id()
-    assert first_id != second_id
-    assert len(first_id) == len(second_id) == 89
-    assert first_id.startswith("B") and second_id.startswith("B")
-    assert first_id.endswith("==") and second_id.endswith("==")
+def test_web_device_id_placeholder_has_valid_shape():
+    value = _generate_web_device_id()
+    # The placeholder must satisfy the same structural check the harvested value
+    # does, otherwise a fallback login would send a body the endpoint cannot
+    # even parse rather than merely failing the risk check.
+    assert _looks_like_device_id(value)
+
+
+def test_looks_like_device_id_rejects_storage_keys():
+    # smidV2 and the chat device id are real values seen in the page, and both
+    # are the wrong shape; accepting either would poison the cached identity.
+    assert not _looks_like_device_id("20260924174316a3434af30b45a1c30e7185a6bf64102700b474319fba2bc70")
+    assert not _looks_like_device_id("c322e3ee-9229-4d74-b81c-290640d6b6c8")
+    assert not _looks_like_device_id("")
+    assert not _looks_like_device_id(None)
+    # Valid base64 that is not the SDK envelope is also rejected.
+    import base64
+
+    assert not _looks_like_device_id(base64.b64encode(b"x" * 400).decode("ascii"))
+    # The tag character the SDK emits shifts the base64 body by one position;
+    # a check that only accepts a body aligned at zero rejects every real value.
+    assert _looks_like_device_id(make_device_id("probe", prefix="D"))
+    assert _looks_like_device_id(make_device_id("probe", prefix="B"))
+    # A body already aligned at zero needs no tag character and is accepted too;
+    # this is the shape the generated placeholder uses.
+    assert _looks_like_device_id(make_device_id("probe", prefix=""))
+
+
+def test_device_id_persists_and_reloads():
+    import os
+    import tempfile
+    import functions
+
+    value = make_device_id("persist")
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = os.environ.get("DEEPSEEKER_DEVICE_ID_PATH")
+        os.environ["DEEPSEEKER_DEVICE_ID_PATH"] = os.path.join(tmp, "device_id")
+        try:
+            assert functions._read_persisted_device_id() is None
+            functions._persist_device_id(value)
+            assert functions._read_persisted_device_id() == value
+            # A malformed file is treated as absent so a bad cache cannot make
+            # every later login fail with no way back.
+            with open(os.path.join(tmp, "device_id"), "w") as f:
+                f.write("20260924174316a3434af30b45a1c30e7185a6bf64102700b474319fba2bc70")
+            assert functions._read_persisted_device_id() is None
+        finally:
+            if saved is None:
+                os.environ.pop("DEEPSEEKER_DEVICE_ID_PATH", None)
+            else:
+                os.environ["DEEPSEEKER_DEVICE_ID_PATH"] = saved
+
+
+def test_login_device_id_precedence_prefers_env_then_file():
+    import os
+    import tempfile
+    import functions
+
+    calls = []
+
+    async def fake_fetch():
+        calls.append(1)
+        return make_device_id("browser")
+
+    browser_value = make_device_id("browser")
+    file_value = make_device_id("file")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = {
+            key: os.environ.get(key)
+            for key in ("DEEPSEEKER_DEVICE_ID", "DEEPSEEKER_DEVICE_ID_PATH")
+        }
+        original_fetch = functions._fetch_real_device_id
+        functions._fetch_real_device_id = fake_fetch
+        os.environ["DEEPSEEKER_DEVICE_ID_PATH"] = os.path.join(tmp, "device_id")
+        try:
+            os.environ["DEEPSEEKER_DEVICE_ID"] = "env-value"
+            assert asyncio.run(functions._resolve_login_device_id()) == "env-value"
+            assert asyncio.run(functions._resolve_login_device_id("explicit")) == "explicit"
+            assert calls == []
+
+            os.environ.pop("DEEPSEEKER_DEVICE_ID", None)
+            functions._persist_device_id(file_value)
+            assert asyncio.run(functions._resolve_login_device_id()) == file_value
+            assert calls == []
+
+            os.remove(os.path.join(tmp, "device_id"))
+            assert asyncio.run(functions._resolve_login_device_id()) == browser_value
+            assert calls == [1]
+            assert functions._read_persisted_device_id() == browser_value
+        finally:
+            functions._fetch_real_device_id = original_fetch
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 def test_account_login_uses_browser_contract():
@@ -190,16 +307,56 @@ def test_account_login_uses_browser_contract():
         return FakeResponse()
 
     original_post = functions.post_with_failover
+    saved_env = os.environ.get("DEEPSEEKER_DEVICE_ID")
     functions.post_with_failover = fake_post
+    # Pin the device ID so the test never launches a browser and never depends
+    # on whatever the host happens to have cached.
+    os.environ["DEEPSEEKER_DEVICE_ID"] = "test-device-id"
     try:
         token = asyncio.run(login_deepseek_account(r"user\@example.com", "password"))
     finally:
         functions.post_with_failover = original_post
+        if saved_env is None:
+            os.environ.pop("DEEPSEEKER_DEVICE_ID", None)
+        else:
+            os.environ["DEEPSEEKER_DEVICE_ID"] = saved_env
 
     assert token == "abc"
     assert captured["payload"]["email"] == "user@example.com"
-    assert len(captured["payload"]["device_id"]) >= 88
+    assert captured["payload"]["device_id"] == "test-device-id"
     assert captured["headers"]["user-agent"].startswith("Mozilla/5.0")
+
+
+def test_device_id_falls_back_when_harvest_fails():
+    import os
+    import tempfile
+    import functions
+
+    async def failing_fetch():
+        raise functions.CookieGenerationError("no browser available")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = {
+            key: os.environ.get(key)
+            for key in ("DEEPSEEKER_DEVICE_ID", "DEEPSEEKER_DEVICE_ID_PATH")
+        }
+        original_fetch = functions._fetch_real_device_id
+        functions._fetch_real_device_id = failing_fetch
+        os.environ["DEEPSEEKER_DEVICE_ID_PATH"] = os.path.join(tmp, "device_id")
+        os.environ.pop("DEEPSEEKER_DEVICE_ID", None)
+        try:
+            value = asyncio.run(functions._resolve_login_device_id())
+            # A well-formed placeholder keeps the request shape valid; it is not
+            # cached, so a later login can still harvest a real ID.
+            assert _looks_like_device_id(value)
+            assert not os.path.exists(os.path.join(tmp, "device_id"))
+        finally:
+            functions._fetch_real_device_id = original_fetch
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 def main():

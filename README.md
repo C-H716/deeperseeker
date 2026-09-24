@@ -82,6 +82,9 @@ cp .env.example .env
 | `DEEPSEEKER_PER_TOOL_RESULT_TOKENS` | Per-result tool-output cap (so one giant output can't eat the budget) | `2000` |
 | `DEEPSEEKER_PROMPT_LANGUAGE` | Reasoning/answer language; `auto` follows the latest user turn, `zh-CN` forces Simplified Chinese | `auto` |
 | `DEEPSEEKER_TOKEN_CHECK_INTERVAL` | Token pool health-check interval in seconds | `300` |
+| `DEEPSEEKER_DEVICE_ID` | Explicit device ID for account login; skips browser harvesting | unset |
+| `DEEPSEEKER_DEVICE_ID_PATH` | Where the harvested device ID is cached | next to the database |
+| `DEEPSEEKER_DEVICE_ID_TIMEOUT` | Seconds to wait for the fingerprint SDK to publish a device ID | `60` |
 
 ## Auth Token Setup
 
@@ -90,6 +93,8 @@ cp .env.example .env
 3. Paste raw token string into Dashboard (`/dashboard`). Close incognito window.
 
 The Chinese dashboard also supports adding an account directly with its DeepSeek email and password. The bridge calls `/api/v0/users/login`, stores only the returned bearer token, and does not persist the submitted password.
+
+The login endpoint validates the device ID produced by the web client's fingerprint SDK, so a random value is rejected with `biz_code=11 / RISK_DEVICE_DETECTED`. Before the first login the bridge therefore opens the sign-in page in headless Chromium, reads the SDK's device ID, and caches it next to the database. Later logins reuse the cached ID, which keeps one stable device identity for the whole deployment. Set `DEEPSEEKER_DEVICE_ID` to bypass harvesting with a value you copied from a real browser session. The dashboard stays usable either way: a rejected login only reports the error, and the cached ID survives container recreation as long as the data volume is kept.
 
 ## API Endpoints & Usage
 

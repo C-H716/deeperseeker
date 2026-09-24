@@ -9,6 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Headless Chromium is required at runtime: the DeepSeek login risk check only
+# accepts the device ID published by the web client's fingerprint SDK.
+RUN playwright install --with-deps chromium
+
 COPY . .
 
 RUN mkdir -p /app/data && \
