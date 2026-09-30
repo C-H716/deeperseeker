@@ -194,9 +194,9 @@ def test_chat_prefers_file_owner_token_on_first_turn(db, monkeypatch):
     async def fake_pick(*a, **k):
         return 1  # 调度器本会选中 token 1……
 
-    async def direct_db(fn, *a):
+    async def direct_db(fn, *a, **kw):
         """本地 _db 走线程池，无法 await 测试用的 async 桩；这里直通并补 await。"""
-        result = fn(*a)
+        result = fn(*a, **kw)
         if inspect.isawaitable(result):
             result = await result
         return result

@@ -3,6 +3,7 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
 import secrets
 import time
@@ -290,7 +291,7 @@ async def _token_check_loop():
             logger.exception("Scheduled token health-check failed")
 
 
-async def _db(fn, *args):
+async def _db(fn, *args, **kwargs):
     """Run a blocking SQLite store helper off the event loop (B5, Stage 1 audit).
 
     Every sessions/tokens read + write used to run inline: under concurrent
@@ -299,7 +300,7 @@ async def _db(fn, *args):
     request (B5). to_thread keeps the store helpers sync (they are shared by
     CLI paths and tests) while the loop never blocks on disk I/O. The
     aiosqlite migration belongs to the store split (Stage 6)."""
-    return await asyncio.to_thread(fn, *args)
+    return await asyncio.to_thread(fn, *args, **kwargs)
 
 
 @asynccontextmanager
@@ -665,6 +666,12 @@ def _replay_stream(gen, first):
     return _wrapped()
 
 
+# B10（Stage 1 审计）：通用上游故障（空 SSE、瞬时 5xx、被污染的会话）的有界重试
+# 预算——最多 MAX_UPSTREAM_ATTEMPTS 次尝试，每次优先换一个刚失败过的 token，
+# 尝试之间加入抖动退避。预算耗尽时按 502 类返回上游错误（已脱敏、已截断）。
+MAX_UPSTREAM_ATTEMPTS = max(1, int(os.getenv("DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS", "3")))
+
+
 async def _preflight_stream(gen):
     """Consume the first chunk eagerly so upstream errors surface before streaming starts."""
     try:
@@ -685,7 +692,8 @@ async def handle_chat(
     req_model=None,
     scope="",
     search_sink=None,
-    _retried=False,
+    _attempt=0,
+    _exclude_token=None,
 ):
     auth_token = await _db(get_auth_token)
     if not auth_token:
@@ -856,7 +864,7 @@ async def handle_chat(
                             session_id,
                             e,
                         )
-                        if _retried:
+                        if _attempt + 1 >= MAX_UPSTREAM_ATTEMPTS:
                             return _api_error_response(e, is_anthropic)
                         return await handle_chat(
                             messages,
@@ -869,7 +877,7 @@ async def handle_chat(
                             req_model,
                             scope,
                             search_sink=search_sink,
-                            _retried=True,
+                            _attempt=_attempt + 1,
                         )
                     if stream:
                         gen = _release_chat_lock_stream(gen, rot_owner)
@@ -919,7 +927,7 @@ async def handle_chat(
                             if rot_owner is not None:
                                 rot_owner.release()
                             rot_lease.release()
-                            if _retried:
+                            if _attempt + 1 >= MAX_UPSTREAM_ATTEMPTS:
                                 return _api_error_response(e, is_anthropic)
                             return await handle_chat(
                                 messages,
@@ -932,7 +940,7 @@ async def handle_chat(
                                 req_model,
                                 scope,
                                 search_sink=search_sink,
-                                _retried=True,
+                                _attempt=_attempt + 1,
                             )
                         await _db(mark_active, new_token_id)
 
@@ -996,7 +1004,12 @@ async def handle_chat(
         async with create_lock:
             sess = await _db(find_session, sig)
             if not sess:
-                token_id = await _db(pick_token)
+                # B10：重试预算把刚失败的 token id 传下来，pick_token() 在还有
+                # 其它可用账号时会避开它。
+                token_id = await _db(
+                    pick_token,
+                    exclude=({_exclude_token} if _exclude_token is not None else None),
+                )
                 if not token_id:
                     return JSONResponse(
                         {"error": "No tokens available"}, status_code=503
@@ -1293,7 +1306,7 @@ async def handle_chat(
                 parent_message_id,
                 e,
             )
-            if _retried:
+            if _attempt + 1 >= MAX_UPSTREAM_ATTEMPTS:
                 return _api_error_response(e, is_anthropic)
             # 标记限流后递归重试：下一帧读取到 RATE_LIMITED 状态，由入口处的
             # 轮换段挑选新账号重建会话。锁与在途占用须先交还，否则重试会等待
@@ -1311,7 +1324,8 @@ async def handle_chat(
                 req_model,
                 scope,
                 search_sink=search_sink,
-                _retried=True,
+                _attempt=_attempt + 1,
+                _exclude_token=token_id,
             )
 
         logger.exception(
@@ -1321,7 +1335,8 @@ async def handle_chat(
             e,
         )
         await _db(delete_sessions_for_chat, token_id, session_id)
-        if _retried:
+        if _attempt + 1 >= MAX_UPSTREAM_ATTEMPTS:
+            # B10：预算耗尽——直接抛出（已脱敏、已截断的）上游错误，不再无限重试。
             return _api_error_response(e, is_anthropic)
         # PR #26 review fix (Blocker 2 — retry self-deadlock): the recursive
         # call can resolve to the SAME chat (the retry re-derives the session
@@ -1336,6 +1351,10 @@ async def handle_chat(
         # 在途占用同样须在递归前交还：重试会重新选取 token，本帧登记的计数
         # 若留着，旧账号会持续显得繁忙，干扰后续的负载均衡决策。
         lease.release()
+        # B10：先做带抖动的退避，再换一个 token 重试——旧的单次重试会再次进入
+        # pick_token() 的抽取，可能又落到同一个被污染的 token/会话上，正是 #33
+        # 症状持续的原因。
+        await asyncio.sleep(random.uniform(0.25, 0.75) * (1.5**_attempt))
         return await handle_chat(
             messages,
             model,
@@ -1347,7 +1366,8 @@ async def handle_chat(
             req_model,
             scope,
             search_sink=search_sink,
-            _retried=True,
+            _attempt=_attempt + 1,
+            _exclude_token=token_id,
         )
     finally:
         if not lock_transferred:
