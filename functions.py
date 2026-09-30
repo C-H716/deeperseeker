@@ -111,6 +111,11 @@ def init_db():
             token_id INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS files (
+            file_id TEXT PRIMARY KEY,
+            token_id INTEGER,
+            created_at REAL
+        );
     """)
     # Keep existing Docker volumes compatible with the token health metadata.
     token_columns = {
@@ -1366,6 +1371,42 @@ def delete_sessions_for_chat(token_id, session_id):
     )
     conn.commit()
     conn.close()
+
+
+# ==============================================================================
+# B4（Stage 1 审计）—— 文件归属注册表
+#
+# /v1/files 上传此前随机挑选 token，而上游的文件按账号隔离，因此后续
+# /v1/chat/completions 引用该 file_id 时可能落到另一个账号并收到上游的
+# “file not found”——OpenAI 风格的「上传后引用」流程（Claude Code / Cline
+# 的文件流程）因此在设计上就是坏的。现在上传会钉在当时的 token 上；聊天
+# 处理器首轮优先使用文件属主 token，后续轮次则把异主引用改挂到本会话自己
+# 的 token 上。
+# ==============================================================================
+
+
+def record_file(file_id, token_id):
+    """把上游 file_id 钉在拥有它的 token（账号）上。
+
+    先到者胜：INSERT OR IGNORE 保证最初的映射不会被后来的上传改写。
+    """
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO files (file_id, token_id, created_at) VALUES (?, ?, ?)",
+        (file_id, token_id, time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_file_token(file_id):
+    """返回拥有该 file_id 的 token id；未登记（历史遗留）时返回 None。"""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT token_id FROM files WHERE file_id = ?", (file_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
 
 
 # DeepSeek now serves a single model (v4.1flash) as the website default. The

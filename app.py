@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -92,6 +93,7 @@ from functions import (
     get_accounts,
     get_auth_token,
     get_file_content,
+    get_file_token,
     get_token,
     get_tokens,
     init_db,
@@ -103,6 +105,7 @@ from functions import (
     peek_cached_input,
     pick_token,
     record_cached_input,
+    record_file,
     reset_cached_input,
     save_account_login,
     save_session,
@@ -556,6 +559,102 @@ def _api_error_response(e, is_anthropic=False):
     return JSONResponse(payload, status_code=code)
 
 
+def _referenced_file_ids(messages):
+    """扫描会话引用的 file_id（经 /v1/files 上传，或 Anthropic 的 file source）。
+
+    纯扫描、无 I/O，供「优先使用文件属主 token」与「识别异主引用」两处使用（B4）。
+    """
+    ids = []
+    for m in messages:
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        for part in c:
+            if not isinstance(part, dict):
+                continue
+            if (
+                part.get("type") == "file"
+                and isinstance(part.get("file"), dict)
+                and part["file"].get("file_id")
+            ):
+                ids.append(part["file"]["file_id"])
+            elif (
+                part.get("type") in ("document", "image")
+                and isinstance(part.get("source"), dict)
+                and part["source"].get("type") == "file"
+                and part["source"].get("file_id")
+            ):
+                ids.append(part["source"]["file_id"])
+    return ids
+
+
+async def _copy_file_to_token(file_id, fetch_token, target_token):
+    """以 fetch_token 取回文件字节，再上传到 target_token 所属账号（B4 改挂）。
+
+    成功返回新的 file_id，失败返回 None。
+    """
+    mime = None
+    chunks = []
+    size = 0
+    try:
+        gen = get_file_content(fetch_token, file_id)
+        mime = await gen.__anext__()  # 首个 yield 是 mime type
+        async for chunk in gen:
+            size += len(chunk)
+            if size > 25 * 1024 * 1024:
+                logger.warning(
+                    "File ownership: re-home of %s aborted (over 25 MB)", file_id
+                )
+                return None
+            chunks.append(chunk)
+    except StopAsyncIteration:
+        return None
+    except Exception:
+        logger.exception("File ownership: fetch of %s failed during re-home", file_id)
+        return None
+    ext = (mimetypes.guess_extension(mime) if mime else None) or ".bin"
+    filename = f"rehomed_{file_id}{ext}"
+    async for upload_status, data in upload_file(
+        b"".join(chunks), filename, mime or "application/octet-stream", target_token
+    ):
+        if upload_status == "success":
+            return data["file_id"]
+    return None
+
+
+async def _rehome_foreign_files(file_ids, token_id, tok):
+    """返回 token_id 所属账号可用的 file_id 列表（B4）。
+
+    上传会钉在当时的 token 上，而上游文件按账号隔离，因此异主引用在聊天时会
+    被上游 404。这里把异主 id 复制到本会话的 token 上（用属主取回、用本会话
+    token 上传）。未知（历史遗留、未登记）的 id 原样透传——对它们没有比旧行为
+    更好的处理方式。
+    """
+    out = []
+    for fid in file_ids:
+        owner = await _db(get_file_token, fid)
+        if owner is None or owner == token_id:
+            out.append(fid)
+            continue
+        owner_tok = await _db(get_token, owner)
+        fetch_token = owner_tok["token"] if owner_tok else tok["token"]
+        new_id = await _copy_file_to_token(fid, fetch_token, tok["token"])
+        if new_id:
+            await _db(record_file, new_id, token_id)
+            logger.info(
+                "File ownership: re-uploaded file %s (token #%s) onto token #%s as %s",
+                fid,
+                owner,
+                token_id,
+                new_id,
+            )
+            out.append(new_id)
+        else:
+            # 尽力而为：保留原引用，而不是直接丢掉。
+            out.append(fid)
+    return out
+
+
 def _replay_stream(gen, first):
     async def _wrapped():
         if first is not None:
@@ -617,6 +716,9 @@ async def handle_chat(
     # A concurrent request may already have migrated this exact signature.
     # Reuse its handoff summary when sending the first turn on the new chat.
     rollover_summary = ROLLOVER_HANDOFFS.get(sig)
+    # B4：本会话引用的 file_id（由新建会话的分支填充），供后续轮次判断是否需要
+    # 把异主引用改挂到本会话的 token 上。
+    ref_ids = []
 
     if sess:
         token_id = sess["token_id"]
@@ -729,6 +831,10 @@ async def handle_chat(
                         file_ids = await extract_and_upload_files(
                             messages, new_tok["token"]
                         )
+                        # B4：轮换后的账号承载这些上传，须登记归属，否则后续轮次
+                        # 引用时无从判断属主。
+                        for fid in file_ids:
+                            await _db(record_file, fid, new_token_id)
                         gen = send_message(
                             new_session_id,
                             new_tok["token"],
@@ -895,6 +1001,24 @@ async def handle_chat(
                     return JSONResponse(
                         {"error": "No tokens available"}, status_code=503
                     )
+                # B4：上游文件按账号隔离。若本会话首轮引用的文件只有唯一已知
+                # 属主，就让聊天跑在该 token 上——调度器若选中别的账号，上游会
+                # 直接回 “file not found”。
+                ref_ids = _referenced_file_ids(messages)
+                if ref_ids:
+                    owners = {await _db(get_file_token, fid) for fid in ref_ids}
+                    owners.discard(None)
+                    if len(owners) == 1:
+                        owner_id = owners.pop()
+                        if owner_id != token_id:
+                            owner_tok = await _db(get_token, owner_id)
+                            if owner_tok and owner_tok["status"] == "ACTIVE":
+                                logger.info(
+                                    "File ownership: chat references file(s) pinned "
+                                    "to token #%s; using it",
+                                    owner_id,
+                                )
+                                token_id = owner_id
                 tok = await _db(get_token, token_id)
                 if not tok:
                     return JSONResponse({"error": "Token not found"}, status_code=503)
@@ -1035,6 +1159,15 @@ async def handle_chat(
         file_ids = await extract_and_upload_files(
             messages, tok["token"], last_user_only=not is_first
         )
+        # B4：钉在别的账号上的引用在本会话会被上游 404，须复制到本会话的
+        # token 上。本次新上传的（以及改挂产生的副本）登记归属；已有属主的
+        # 引用保持其原属主不变（先到者胜）。
+        if file_ids:
+            ref_set = set(ref_ids)
+            file_ids = await _rehome_foreign_files(file_ids, token_id, tok)
+            for fid in file_ids:
+                if fid not in ref_set:
+                    await _db(record_file, fid, token_id)
         # Rollover rebuilds the prompt from a summary instead of the accumulated
         # history, so the previous turn's prompt is no longer a prefix of this
         # one and any remembered cache size would overstate the real hit.
@@ -1850,6 +1983,8 @@ async def files_upload(request: Request):
             return JSONResponse({"error": "Upload failed"}, status_code=500)
     finally:
         lease.release()
+    # B4：把上传钉在完成它的 token 上，后续聊天才能优先使用（或改挂到）该账号。
+    await _db(record_file, file_info["file_id"], tok_id)
 
     if request.url.path.startswith("/v1/files/upload"):
         return {
