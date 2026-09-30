@@ -677,10 +677,16 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         return JSONResponse({"error": "Token expired"}, status_code=503)
     _set_key_name(tok.get("alias"))
 
-    is_first = parent_message_id == 0
-    # Stage 0.3: hold this chat's lock across the whole send -> save critical
-    # section; for streams, ownership transfers to the response generator via
-    # _release_chat_lock_stream (the final save_session happens there).
+    # B1（Stage 1 审计）：累积上下文的滚动此前在获取 per-chat 锁之前执行，仅
+    # 首次创建受 sig 锁保护——同签名的两个并发请求可能都判定需要 rollover、都
+    # 删除会话行、并各自创建新的上游 chat（后写入的 save_session() 获胜，落败
+    # 的那个 chat 泄漏，parent id 也随之分叉）。现在整个 rollover 判定都在当前
+    # chat 的锁内完成，且在持有锁后重新读取已存会话状态：本帧等待期间，同签名
+    # 的并发请求可能已经完成滚动（或推进了 parent_message_id）。
+    #
+    # 本 fork 已在「会话已存在」分支内用 old chat 锁串行化滚动（见 handle_chat
+    # 入口处的会话迁移段），因此这里只保留 B1 的二次校验职责：取得 session_id
+    # 的锁后重读映射，仅在映射未变且 parent_message_id 非零时才执行滚动。
     lock_owner = await _own_chat_lock(session_id)
     # 登记该 token 的在途占用，供 pick_token() 的负载均衡读取。非流式在
     # finally 释放；流式连同锁一起把所有权交给生成器。
@@ -688,6 +694,57 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
     lock_transferred = False
     lease_transferred = False
     try:
+        fresh = find_session(sig)
+        if fresh:
+            if fresh["session_id"] != session_id:
+                # The chat moved under us (a concurrent request already rolled
+                # it over). Follow it and hold the NEW chat's lock instead.
+                lock_owner.release()
+                token_id = fresh["token_id"]
+                session_id = fresh["session_id"]
+                parent_message_id = fresh["parent_message_id"]
+                tok = get_token(token_id)
+                if not tok:
+                    return JSONResponse({"error": "Token expired"}, status_code=503)
+                _set_key_name(tok.get("alias"))
+                lock_owner = await _own_chat_lock(session_id)
+            else:
+                # Same chat: adopt the stored parent so a request that was
+                # queued behind a completed turn never re-sends a stale
+                # parent_message_id (which would fork the upstream exchange).
+                parent_message_id = fresh["parent_message_id"]
+
+        if parent_message_id != 0 and needs_rollover(messages):
+            logger.info(
+                "Context rollover: accumulated context over limit; purging session mappings for chat %s",
+                session_id,
+            )
+            delete_sessions_for_chat(token_id, session_id)
+            scratch_chat = await create_new_chat(tok["token"])
+            summary_gen = send_message(
+                scratch_chat, tok["token"], build_summary_request_prompt(messages), 0, False, False, []
+            )
+            rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
+            session_id = await create_new_chat(tok["token"])
+            save_session(sig, token_id, session_id, 0)
+            parent_message_id = 0
+            # The rollover itself was serialized under the OLD chat's lock;
+            # the send -> save section below must hold the FRESH chat's lock.
+            # Queued same-signature requests re-derive the new mapping from
+            # the DB via the re-read above, so nobody double-rolls-over.
+            lock_owner.release()
+            lock_owner = await _own_chat_lock(session_id)
+            # A request that read the fresh mapping in the window between our
+            # save and our acquisition may have already appended to this
+            # chat; adopt the stored parent so we never fork it.
+            fresh = find_session(sig)
+            if fresh and fresh["session_id"] == session_id:
+                parent_message_id = fresh["parent_message_id"]
+
+        is_first = parent_message_id == 0
+        # Stage 0.3: the lock is held across the whole send -> save critical
+        # section; for streams, ownership transfers to the response generator
+        # via _release_chat_lock_stream (the final save_session happens there).
         file_ids = await extract_and_upload_files(messages, tok["token"], last_user_only=not is_first)
         # Rollover rebuilds the prompt from a summary instead of the accumulated
         # history, so the previous turn's prompt is no longer a prefix of this
