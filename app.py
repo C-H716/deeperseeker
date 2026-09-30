@@ -1271,9 +1271,6 @@ def format_response(text, model, messages, tools=None, cached_tokens=0, prompt_t
     }
 
 
-format_openai_response = format_response
-
-
 def _anthropic_search_result_block(search_results):
     """Build the Anthropic ``web_search_tool_result`` block from upstream results.
 
