@@ -11,10 +11,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 
-COPY pyproject.toml uv.lock requirements.txt ./
+COPY pyproject.toml uv.lock requirements.txt requirements-waf-backup.txt ./
 
 
-RUN uv pip install --system --no-cache -r requirements.txt
+# The waf-backup lock is a self-contained superset (base deps + playwright);
+# the plain lock intentionally drops playwright, but the login risk check here
+# still needs headless Chromium, so install the superset explicitly.
+RUN uv pip install --system --no-cache -r requirements-waf-backup.txt
 
 # Headless Chromium is required at runtime: the DeepSeek login risk check only
 # accepts the device ID published by the web client's fingerprint SDK.
