@@ -14,7 +14,6 @@ deepseek_device_id
 .pytest_cache/
 *.egg-info/
 .dsh-drop/
-
 # local debug artifacts
 _tps_denom.mjs
 _tps_denom_out.txt
@@ -23,11 +22,11 @@ _copy.zstd
 DISM
 sfc
 ...
-
 # local database
 *.db
-
 # B9: generated API key and SQLite WAL/SHM sidecars
 api_key.txt
 deeperseeker.db-wal
 deeperseeker.db-shm
+.python-version
+.ruff_cache
