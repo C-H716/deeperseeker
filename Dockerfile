@@ -14,9 +14,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml uv.lock requirements.txt requirements-waf-backup.txt ./
 
 
-# The waf-backup lock is a self-contained superset (base deps + playwright);
-# the plain lock intentionally drops playwright, but the login risk check here
-# still needs headless Chromium, so install the superset explicitly.
+# Upstream switched this step to `uv sync`, which installs only the default
+# dependency group. The local login risk check still needs headless Chromium,
+# so install the self-contained waf-backup superset (base deps + playwright)
+# instead of the plain lock, then fetch the matching browser build.
 RUN uv pip install --system --no-cache -r requirements-waf-backup.txt
 
 # Headless Chromium is required at runtime: the DeepSeek login risk check only
@@ -40,4 +41,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD curl 
 
 # If reverting to backup Playwright cookie generation, run under xvfb:
 # CMD ["sh", "-c", "xvfb-run -a -s '-screen 0 1280x720x24' python3 app.py"]
+# might also need requirements-waf-backup edition
 CMD ["python3", "app.py"]
