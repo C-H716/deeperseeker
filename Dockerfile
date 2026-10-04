@@ -1,19 +1,27 @@
-FROM python:3.12-slim
+FROM python:3.13-slim
+
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 WORKDIR /app
+
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+COPY pyproject.toml uv.lock requirements.txt ./
+
+
+RUN uv pip install --system --no-cache -r requirements.txt
 
 # Headless Chromium is required at runtime: the DeepSeek login risk check only
 # accepts the device ID published by the web client's fingerprint SDK.
 RUN playwright install --with-deps chromium
 
 COPY . .
+
 
 RUN mkdir -p /app/data && \
     ln -sf /app/data/deeperseeker.db /app/deeperseeker.db && \

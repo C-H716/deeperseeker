@@ -1,0 +1,32 @@
+[project]
+name = "deeperseeker"
+version = "6.0"
+description = "DeepSeek website reverse-proxy server with FastAPI, supporting OpenAI & Anthropic API standards."
+readme = "README.md"
+authors = [
+    { name = "AmanCode22", email = "amanady125@gmail.com" }
+]
+requires-python = ">=3.13"
+
+
+dynamic = ["dependencies", "optional-dependencies"]
+
+[project.scripts]
+deeperseeker = "app:main"
+
+[tool.hatch.metadata.hooks.requirements_txt]
+files = ["requirements.txt"]
+
+[tool.hatch.metadata.hooks.requirements_txt.optional-dependencies]
+dev = ["requirements-dev.txt"]
+
+[tool.hatch.metadata.hooks.requirements_txt.options]
+pip_strict = false
+
+
+[tool.hatch.build.targets.wheel]
+packages = ["app.py", "functions.py", "middleware.py", "plugin_helper.py"]
+
+[build-system]
+requires = ["hatchling", "hatch-requirements-txt"]
+build-backend = "hatchling.build"
