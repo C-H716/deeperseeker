@@ -46,6 +46,7 @@ exclude = [
     ".ruff_cache",
     "deeperseeker_env",
     "deeperseeker-stages",
+    ".github",
     "wasm",
 ]
 # The container ships CPython 3.13, but the checked-in dev/runtime interpreter

@@ -2,7 +2,7 @@
 I am busy with exams so new PR and Issues might be slow to resolve or merge (but i would merge them or resolve the issue as I get time in between) so expect some inconvenience.
 
 # DeeperSeeker
-
+[![CI Pipeline](https://github.com/AmanCode22/deeperseeker/actions/workflows/tests.yaml/badge.svg)](https://github.com/AmanCode22/deeperseeker/actions/workflows/tests.yaml)
 DeepSeek website reverse-proxy server with FastAPI, supporting OpenAI & Anthropic API standards.
 
 If you want to use deeperseeker with claude desktop app see [Claude Desktop Setup Guide](CLAUDE_DESKTOP_SETUP.md)
