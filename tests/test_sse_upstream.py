@@ -1,4 +1,5 @@
 """Regression tests for DeepSeek upstream SSE parsing (issue #33)."""
+
 import asyncio
 import os
 import sys
@@ -155,15 +156,15 @@ def test_batch_append_after_quasi_finished():
     body = (
         f"data: {json.dumps(batch, separators=(',', ':'))}\n"
         'data: {"p":"response/status","v":"FINISHED"}\n'
-    ).encode("utf-8")
+    ).encode()
     assert asyncio.run(_collect_send_message(body)) == "from-batch"
 
 
 def test_rate_limit_error_raises_http_429():
     body = (
-        'data: {"type":"error","content":"Messages too frequent. Try again later.",'
-        '"finish_reason":"rate_limit_reached"}\n'
-    ).encode("utf-8")
+        b'data: {"type":"error","content":"Messages too frequent. Try again later.",'
+        b'"finish_reason":"rate_limit_reached"}\n'
+    )
     err = asyncio.run(_expect_send_error(body))
     assert "HTTP 429:" in str(err)
     # 本地契约（见 tests/test_rate_limit_failover.py）要求 429 使用固定文案
@@ -186,7 +187,11 @@ def test_handle_chat_retries_empty_sse_on_parent_zero():
     async def scenario():
         app_module._chat_locks.clear()
         sig = "sig-empty-parent0"
-        session = {"token_id": "t1", "session_id": "chat-empty-1", "parent_message_id": 0}
+        session = {
+            "token_id": "t1",
+            "session_id": "chat-empty-1",
+            "parent_message_id": 0,
+        }
 
         async def fake_sig(messages, model, scope=""):
             return sig
@@ -197,7 +202,16 @@ def test_handle_chat_retries_empty_sse_on_parent_zero():
         def fake_get_token(tid):
             return {"token": "tok", "status": "ACTIVE"}
 
-        def fake_send(chat_id, auth_token, message, parent, thinking=False, search=False, file_ids_=None, search_sink=None):
+        def fake_send(
+            chat_id,
+            auth_token,
+            message,
+            parent,
+            thinking=False,
+            search=False,
+            file_ids_=None,
+            search_sink=None,
+        ):
             calls["send"] += 1
             if calls["send"] == 1:
 
@@ -234,13 +248,18 @@ def test_handle_chat_retries_empty_sse_on_parent_zero():
             ("delete_sessions_for_chat", lambda *a: None),
             ("save_session", lambda *a: None),
             ("parse_tools", lambda t: ([], t)),
-            ("format_response", lambda text, model, messages, tools=None, **kwargs: text),
+            (
+                "format_response",
+                lambda text, model, messages, tools=None, **kwargs: text,
+            ),
         ]
         saved = [(name, getattr(app_module, name)) for name, _ in patches]
         for name, fn in patches:
             setattr(app_module, name, fn)
         try:
-            return await app_module.handle_chat([{"role": "user", "content": "hi"}], "test-model")
+            return await app_module.handle_chat(
+                [{"role": "user", "content": "hi"}], "test-model"
+            )
         finally:
             for name, fn in saved:
                 setattr(app_module, name, fn)
@@ -271,7 +290,16 @@ def test_handle_chat_rotates_to_another_token_on_429():
     def fake_get_token(tid):
         return {"token": f"tok-{tid}", "status": "ACTIVE", "alias": f"t{tid}"}
 
-    def fake_send(chat_id, auth_token, message, parent, thinking=False, search=False, file_ids_=None, search_sink=None):
+    def fake_send(
+        chat_id,
+        auth_token,
+        message,
+        parent,
+        thinking=False,
+        search=False,
+        file_ids_=None,
+        search_sink=None,
+    ):
         calls["send"] += 1
         if calls["send"] == 1:
 
@@ -322,7 +350,9 @@ def test_handle_chat_rotates_to_another_token_on_429():
         for name, fn in patches:
             setattr(app_module, name, fn)
         try:
-            return await app_module.handle_chat([{"role": "user", "content": "hi"}], "test-model")
+            return await app_module.handle_chat(
+                [{"role": "user", "content": "hi"}], "test-model"
+            )
         finally:
             for name, fn in saved:
                 setattr(app_module, name, fn)

@@ -8,25 +8,30 @@ import time
 import unicodedata
 import uuid
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from urllib.parse import quote, urlparse
 
-import deepseek_tokenizer
 import uvicorn
 from dotenv import load_dotenv
-from uvicorn.logging import AccessFormatter
-from fastapi import FastAPI, Request, Depends, HTTPException, status
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
+from fastapi.security import HTTPBasic
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.background import BackgroundTask
+from uvicorn.logging import AccessFormatter
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(BASE_DIR)
 
 load_dotenv()
+
 
 def _resolve_api_key():
     """B9 (Stage 1 audit): never ship an open relay.
@@ -73,40 +78,40 @@ security = HTTPBasic()
 
 from functions import (
     CookieGenerationError,
-    cookie_file_path,
+    StreamToolParser,
+    TokenLease,
     add_token,
-    count_tokens,
+    check_token_status,
+    cookie_file_path,
     count_tokens_cached,
     create_new_chat,
-    delete_token,
+    delete_account,
     delete_sessions_for_chat,
+    delete_token,
     find_session,
+    get_accounts,
     get_auth_token,
+    get_file_content,
     get_token,
     get_tokens,
     init_db,
-    mark_limited,
+    login_deepseek_account,
     mark_active,
+    mark_limited,
     next_parent,
     parse_tools,
-    pick_token,
-    save_session,
-    send_message,
     peek_cached_input,
+    pick_token,
     record_cached_input,
     reset_cached_input,
-    TokenLease,
-    check_token_status,
-    delete_account,
-    get_accounts,
-    login_deepseek_account,
     save_account_login,
-    StreamToolParser,
+    save_session,
+    send_message,
     upload_file,
-    get_file_content,
 )
-from middleware import RecovererMiddleware, RealIPMiddleware, RequestIDMiddleware
+from middleware import RealIPMiddleware, RecovererMiddleware, RequestIDMiddleware
 from plugin_helper import (
+    MAX_SUMMARY_TOKENS,
     build_prompt,
     build_summary_request_prompt,
     context_window_tokens,
@@ -117,9 +122,7 @@ from plugin_helper import (
     max_output_tokens,
     needs_rollover,
     strip_summary_tags,
-    MAX_SUMMARY_TOKENS,
 )
-
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -174,8 +177,19 @@ _ALIAS_MAX_LEN = 64
 # Strip characters that forge log lines, drive the cursor, or render invisibly.
 _ALIAS_STRIP_CATS = frozenset({"Cc", "Cf", "Zl", "Zp"})
 _ALIAS_INVISIBLE = frozenset(
-    [0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180B, 0x180C, 0x180D,
-     0x2800, 0x3164, 0xFFA0]
+    [
+        0x034F,
+        0x115F,
+        0x1160,
+        0x17B4,
+        0x17B5,
+        0x180B,
+        0x180C,
+        0x180D,
+        0x2800,
+        0x3164,
+        0xFFA0,
+    ]
     + list(range(0xFE00, 0xFE10))
     + list(range(0xE0100, 0xE01F0))
 )
@@ -190,7 +204,8 @@ def _sanitize_alias(name):
     if not name:
         return None
     cleaned = "".join(
-        ch for ch in str(name)
+        ch
+        for ch in str(name)
         if ord(ch) not in _ALIAS_INVISIBLE
         and ord(ch) not in _ALIAS_NONCHARACTERS
         and unicodedata.category(ch) not in _ALIAS_STRIP_CATS
@@ -215,7 +230,9 @@ class KeyAccessFormatter(AccessFormatter):
 def _install_key_access_formatter():
     for handler in logging.getLogger("uvicorn.access").handlers:
         formatter = handler.formatter
-        if not isinstance(formatter, AccessFormatter) or isinstance(formatter, KeyAccessFormatter):
+        if not isinstance(formatter, AccessFormatter) or isinstance(
+            formatter, KeyAccessFormatter
+        ):
             continue
         handler.setFormatter(
             KeyAccessFormatter(
@@ -289,7 +306,9 @@ async def lifespan(app: FastAPI):
     # 占用事件循环，统一经 _db() 转入线程池执行。
     await _db(init_db)
     _install_key_access_formatter()
-    _token_check_task = asyncio.create_task(_token_check_loop(), name="token-health-check")
+    _token_check_task = asyncio.create_task(
+        _token_check_loop(), name="token-health-check"
+    )
     yield
     if _token_check_task:
         _token_check_task.cancel()
@@ -412,7 +431,9 @@ def _take_lock(label, registry, key, max_entries):
         logger.warning(
             "%s lock registry over cap: %d entries (cap %d) — every existing lock is "
             "held; depth tracks in-flight requests, not chat history",
-            label, len(registry), max_entries,
+            label,
+            len(registry),
+            max_entries,
         )
     return lock
 
@@ -448,10 +469,9 @@ class _OwnedChatLock:
         if not self._owned:
             return
         self._owned = False
-        try:
+        # defensive: releasing an already-released lock must never kill a request
+        with suppress(RuntimeError):
             self.lock.release()
-        except RuntimeError:
-            pass  # defensive: releasing an already-released lock must never kill a request
 
     @property
     def owned(self):
@@ -475,12 +495,14 @@ def _release_chat_lock_stream(gen, owner):
     releasing any earlier would reopen the parent_message_id race the lock
     exists to prevent. `owner` is a _OwnedChatLock token: its release() drops
     ONLY this holder's acquisition, never a stranger's (PR #26 review, Medium)."""
+
     async def _wrapped():
         try:
             async for chunk in gen:
                 yield chunk
         finally:
             owner.release()
+
     return _wrapped()
 
 
@@ -524,7 +546,10 @@ def _api_error_response(e, is_anthropic=False):
     if code < 400 or code > 599:
         code = 502
     if is_anthropic:
-        payload = {"type": "error", "error": {"type": "api_error", "message": str(e)[:500]}}
+        payload = {
+            "type": "error",
+            "error": {"type": "api_error", "message": str(e)[:500]},
+        }
     else:
         err_type = "rate_limit_error" if code == 429 else "api_error"
         payload = {"error": {"message": str(e)[:500], "type": err_type, "code": code}}
@@ -537,6 +562,7 @@ def _replay_stream(gen, first):
             yield first
         async for chunk in gen:
             yield chunk
+
     return _wrapped()
 
 
@@ -549,10 +575,24 @@ async def _preflight_stream(gen):
     return _replay_stream(gen, first)
 
 
-async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None, is_anthropic=False, req_model=None, scope="", search_sink=None, _retried=False):
+async def handle_chat(
+    messages,
+    model,
+    thinking=False,
+    search=False,
+    stream=False,
+    tools=None,
+    is_anthropic=False,
+    req_model=None,
+    scope="",
+    search_sink=None,
+    _retried=False,
+):
     auth_token = await _db(get_auth_token)
     if not auth_token:
-        return JSONResponse({"error": "No auth token. Add via dashboard."}, status_code=401)
+        return JSONResponse(
+            {"error": "No auth token. Add via dashboard."}, status_code=401
+        )
 
     # 廉价预筛：精确的 rollover 判定由 build_prompt 内的 needs_rollover() 用
     # 真实 token 数完成，这里算出来的值只喂给下面那行日志。因此在字符数离阈值
@@ -579,7 +619,6 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
     rollover_summary = ROLLOVER_HANDOFFS.get(sig)
 
     if sess:
-
         token_id = sess["token_id"]
         session_id = sess["session_id"]
         parent_message_id = sess["parent_message_id"]
@@ -587,7 +626,12 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         # Proactively migrate a live chat before the upstream memory ceiling is
         # hit. Previously rollover only ran on new-chat/token-rotation paths,
         # so long-lived sessions could fail first and lose their parent chain.
-        if tok and tok.get("status") != "RATE_LIMITED" and parent_message_id != 0 and needs_rollover(messages):
+        if (
+            tok
+            and tok.get("status") != "RATE_LIMITED"
+            and parent_message_id != 0
+            and needs_rollover(messages)
+        ):
             old_session_id = session_id
             old_lock = await _own_chat_lock(old_session_id)
             try:
@@ -610,14 +654,18 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         False,
                         [],
                     )
-                    rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
+                    rollover_summary = strip_summary_tags(
+                        await collect_response(summary_gen)
+                    )[: MAX_SUMMARY_TOKENS * 4]
                     new_session_id = await create_new_chat(tok["token"])
                     # Replace old mappings only after summary and fresh chat
                     # creation both succeed.
                     await _db(delete_sessions_for_chat, token_id, old_session_id)
                     session_id = new_session_id
                     parent_message_id = 0
-                    await _db(save_session, sig, token_id, session_id, parent_message_id)
+                    await _db(
+                        save_session, sig, token_id, session_id, parent_message_id
+                    )
                     ROLLOVER_HANDOFFS[sig] = rollover_summary
                     ROLLOVER_HANDOFFS.move_to_end(sig)
                     while len(ROLLOVER_HANDOFFS) > ROLLOVER_HANDOFFS_MAX:
@@ -634,7 +682,9 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                 # handle an actual upstream failure.
                 rollover_summary = None
                 session_id = old_session_id
-                logger.exception("Live context rollover failed; keeping chat %s", old_session_id)
+                logger.exception(
+                    "Live context rollover failed; keeping chat %s", old_session_id
+                )
             finally:
                 old_lock.release()
         if not tok or tok["status"] == "RATE_LIMITED":
@@ -657,13 +707,37 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         if needs_rollover(messages):
                             scratch_chat = await create_new_chat(new_tok["token"])
                             summary_gen = send_message(
-                                scratch_chat, new_tok["token"], build_summary_request_prompt(messages), 0, False, False, []
+                                scratch_chat,
+                                new_tok["token"],
+                                build_summary_request_prompt(messages),
+                                0,
+                                False,
+                                False,
+                                [],
                             )
-                            rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
-                        prompt = await build_prompt(messages, tools or [], model, is_first_message=True, rollover_summary=rollover_summary)
+                            rollover_summary = strip_summary_tags(
+                                await collect_response(summary_gen)
+                            )[: MAX_SUMMARY_TOKENS * 4]
+                        prompt = await build_prompt(
+                            messages,
+                            tools or [],
+                            model,
+                            is_first_message=True,
+                            rollover_summary=rollover_summary,
+                        )
 
-                        file_ids = await extract_and_upload_files(messages, new_tok["token"])
-                        gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, file_ids)
+                        file_ids = await extract_and_upload_files(
+                            messages, new_tok["token"]
+                        )
+                        gen = send_message(
+                            new_session_id,
+                            new_tok["token"],
+                            prompt,
+                            0,
+                            thinking,
+                            search,
+                            file_ids,
+                        )
                         gen = await _preflight_stream(gen)
                     except Exception as e:
                         if rot_owner is not None:
@@ -671,33 +745,101 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         # 上游请求未能建立，新 token 的在途占用须立即注销，
                         # 否则该账号会永久显得繁忙，扭曲后续的负载均衡。
                         rot_lease.release()
-                        logger.exception("Token-rotation recovery failed (chat %s): %s", session_id, e)
+                        logger.exception(
+                            "Token-rotation recovery failed (chat %s): %s",
+                            session_id,
+                            e,
+                        )
                         if _retried:
                             return _api_error_response(e, is_anthropic)
-                        return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, search_sink=search_sink, _retried=True)
+                        return await handle_chat(
+                            messages,
+                            model,
+                            thinking,
+                            search,
+                            stream,
+                            tools,
+                            is_anthropic,
+                            req_model,
+                            scope,
+                            search_sink=search_sink,
+                            _retried=True,
+                        )
                     if stream:
                         gen = _release_chat_lock_stream(gen, rot_owner)
                         # 与主路径一致：流式响应把在途占用的所有权交给生成器，
                         # 由它在 finally 内释放（客户端中断同样触发）。
                         if is_anthropic:
-                            return StreamingResponse(stream_anthropic_response(gen, model, messages, new_token_id, new_session_id, sig, tools, req_model, 0, scope, lease=rot_lease), media_type="text/event-stream", background=BackgroundTask(rot_lease.release))
-                        return StreamingResponse(stream_response(gen, model, messages, new_token_id, new_session_id, sig, tools, 0, scope, lease=rot_lease), media_type="text/event-stream", background=BackgroundTask(rot_lease.release))
+                            return StreamingResponse(
+                                stream_anthropic_response(
+                                    gen,
+                                    model,
+                                    messages,
+                                    new_token_id,
+                                    new_session_id,
+                                    sig,
+                                    tools,
+                                    req_model,
+                                    0,
+                                    scope,
+                                    lease=rot_lease,
+                                ),
+                                media_type="text/event-stream",
+                                background=BackgroundTask(rot_lease.release),
+                            )
+                        return StreamingResponse(
+                            stream_response(
+                                gen,
+                                model,
+                                messages,
+                                new_token_id,
+                                new_session_id,
+                                sig,
+                                tools,
+                                0,
+                                scope,
+                                lease=rot_lease,
+                            ),
+                            media_type="text/event-stream",
+                            background=BackgroundTask(rot_lease.release),
+                        )
                     else:
                         try:
                             resp_text = await collect_response(gen)
                         except Exception as e:
-                            logger.exception("Upstream failed during token-rotation request: %s", e)
+                            logger.exception(
+                                "Upstream failed during token-rotation request: %s", e
+                            )
                             if rot_owner is not None:
                                 rot_owner.release()
                             rot_lease.release()
                             if _retried:
                                 return _api_error_response(e, is_anthropic)
-                            return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, search_sink=search_sink, _retried=True)
+                            return await handle_chat(
+                                messages,
+                                model,
+                                thinking,
+                                search,
+                                stream,
+                                tools,
+                                is_anthropic,
+                                req_model,
+                                scope,
+                                search_sink=search_sink,
+                                _retried=True,
+                            )
                         await _db(mark_active, new_token_id)
 
                         parsed_tools, clean_text = parse_tools(resp_text)
-                        clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
-                        clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+                        clean_text = re.sub(
+                            r"<think>.*?</think>", "", clean_text, flags=re.DOTALL
+                        ).strip()
+                        clean_text = re.sub(
+                            r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>",
+                            "",
+                            clean_text,
+                            flags=re.IGNORECASE,
+                        ).strip()
                         next_messages = messages.copy()
                         ast_msg = {"role": "assistant"}
                         if parsed_tools:
@@ -707,24 +849,52 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         next_messages.append(ast_msg)
                         next_sig = await generate_signature(next_messages, model, scope)
 
-                        await _db(save_session, sig, new_token_id, new_session_id, next_parent(0))
-                        await _db(save_session, next_sig, new_token_id, new_session_id, next_parent(0))
+                        await _db(
+                            save_session,
+                            sig,
+                            new_token_id,
+                            new_session_id,
+                            next_parent(0),
+                        )
+                        await _db(
+                            save_session,
+                            next_sig,
+                            new_token_id,
+                            new_session_id,
+                            next_parent(0),
+                        )
                         if rot_owner is not None:
                             rot_owner.release()
                         rot_lease.release()
                         in_tokens = count_tok(_messages_text(messages))
                         _remember_prompt_tokens(next_sig, in_tokens)
-                        return format_response(resp_text, model, messages, tools, cached_tokens=_cached_prompt_tokens(sig, in_tokens), prompt_tokens=in_tokens)
-            return JSONResponse({"error": {"message": "No active tokens available (all rate limited). Try again later.", "type": "rate_limit_error"}}, status_code=429)
+                        return format_response(
+                            resp_text,
+                            model,
+                            messages,
+                            tools,
+                            cached_tokens=_cached_prompt_tokens(sig, in_tokens),
+                            prompt_tokens=in_tokens,
+                        )
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": "No active tokens available (all rate limited). Try again later.",
+                        "type": "rate_limit_error",
+                    }
+                },
+                status_code=429,
+            )
     else:
-
         create_lock = _take_lock("sig", _sig_locks, sig, SIG_LOCKS_MAX)
         async with create_lock:
             sess = await _db(find_session, sig)
             if not sess:
                 token_id = await _db(pick_token)
                 if not token_id:
-                    return JSONResponse({"error": "No tokens available"}, status_code=503)
+                    return JSONResponse(
+                        {"error": "No tokens available"}, status_code=503
+                    )
                 tok = await _db(get_token, token_id)
                 if not tok:
                     return JSONResponse({"error": "Token not found"}, status_code=503)
@@ -740,13 +910,22 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                 if needs_rollover(messages):
                     scratch_chat = await create_new_chat(tok["token"])
                     summary_gen = send_message(
-                        scratch_chat, tok["token"], build_summary_request_prompt(messages), 0, False, False, []
+                        scratch_chat,
+                        tok["token"],
+                        build_summary_request_prompt(messages),
+                        0,
+                        False,
+                        False,
+                        [],
                     )
                     summary = strip_summary_tags(await collect_response(summary_gen))
-                    rollover_summary = summary[: MAX_SUMMARY_TOKENS * 4]  # ~4 chars/token cap
+                    rollover_summary = summary[
+                        : MAX_SUMMARY_TOKENS * 4
+                    ]  # ~4 chars/token cap
                     logger.info(
                         "Context rollover: handoff summary of ~%d tokens prepared in scratch chat %s",
-                        count_tok(rollover_summary), scratch_chat,
+                        count_tok(rollover_summary),
+                        scratch_chat,
                     )
 
                 session_id = await create_new_chat(tok["token"])
@@ -822,9 +1001,17 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             await _db(delete_sessions_for_chat, token_id, session_id)
             scratch_chat = await create_new_chat(tok["token"])
             summary_gen = send_message(
-                scratch_chat, tok["token"], build_summary_request_prompt(messages), 0, False, False, []
+                scratch_chat,
+                tok["token"],
+                build_summary_request_prompt(messages),
+                0,
+                False,
+                False,
+                [],
             )
-            rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
+            rollover_summary = strip_summary_tags(await collect_response(summary_gen))[
+                : MAX_SUMMARY_TOKENS * 4
+            ]
             session_id = await create_new_chat(tok["token"])
             await _db(save_session, sig, token_id, session_id, 0)
             parent_message_id = 0
@@ -845,15 +1032,28 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         # Stage 0.3: the lock is held across the whole send -> save critical
         # section; for streams, ownership transfers to the response generator
         # via _release_chat_lock_stream (the final save_session happens there).
-        file_ids = await extract_and_upload_files(messages, tok["token"], last_user_only=not is_first)
+        file_ids = await extract_and_upload_files(
+            messages, tok["token"], last_user_only=not is_first
+        )
         # Rollover rebuilds the prompt from a summary instead of the accumulated
         # history, so the previous turn's prompt is no longer a prefix of this
         # one and any remembered cache size would overstate the real hit.
         if rollover_summary:
             reset_cached_input(sig)
-        prompt = await build_prompt(messages, tools or [], model, is_first, rollover_summary=rollover_summary)
+        prompt = await build_prompt(
+            messages, tools or [], model, is_first, rollover_summary=rollover_summary
+        )
 
-        gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids, search_sink=search_sink)
+        gen = send_message(
+            session_id,
+            tok["token"],
+            prompt,
+            parent_message_id,
+            thinking,
+            search,
+            file_ids,
+            search_sink=search_sink,
+        )
         gen = await _preflight_stream(gen)
         if stream:
             gen = _release_chat_lock_stream(gen, lock_owner)
@@ -862,15 +1062,53 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             # 内释放（客户端中断同样触发）；此处不得再自行释放。
             lease_transferred = True
             if is_anthropic:
-                return StreamingResponse(stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model, parent_message_id, scope, lease=lease), media_type="text/event-stream", background=BackgroundTask(lease.release))
-            return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id, scope, lease=lease), media_type="text/event-stream", background=BackgroundTask(lease.release))
+                return StreamingResponse(
+                    stream_anthropic_response(
+                        gen,
+                        model,
+                        messages,
+                        token_id,
+                        session_id,
+                        sig,
+                        tools,
+                        req_model,
+                        parent_message_id,
+                        scope,
+                        lease=lease,
+                    ),
+                    media_type="text/event-stream",
+                    background=BackgroundTask(lease.release),
+                )
+            return StreamingResponse(
+                stream_response(
+                    gen,
+                    model,
+                    messages,
+                    token_id,
+                    session_id,
+                    sig,
+                    tools,
+                    parent_message_id,
+                    scope,
+                    lease=lease,
+                ),
+                media_type="text/event-stream",
+                background=BackgroundTask(lease.release),
+            )
         else:
             resp_text = await collect_response(gen)
             await _db(mark_active, token_id)
 
             parsed_tools, clean_text = parse_tools(resp_text)
-            clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
-            clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+            clean_text = re.sub(
+                r"<think>.*?</think>", "", clean_text, flags=re.DOTALL
+            ).strip()
+            clean_text = re.sub(
+                r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>",
+                "",
+                clean_text,
+                flags=re.IGNORECASE,
+            ).strip()
             next_messages = messages.copy()
             ast_msg = {"role": "assistant"}
             if parsed_tools:
@@ -880,11 +1118,26 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             next_messages.append(ast_msg)
             next_sig = await generate_signature(next_messages, model, scope)
 
-            await _db(save_session, sig, token_id, session_id, next_parent(parent_message_id))
-            await _db(save_session, next_sig, token_id, session_id, next_parent(parent_message_id))
+            await _db(
+                save_session, sig, token_id, session_id, next_parent(parent_message_id)
+            )
+            await _db(
+                save_session,
+                next_sig,
+                token_id,
+                session_id,
+                next_parent(parent_message_id),
+            )
             in_tokens = count_tok(_messages_text(messages))
             _remember_prompt_tokens(next_sig, in_tokens)
-            return format_response(resp_text, model, messages, tools, cached_tokens=_cached_prompt_tokens(sig, in_tokens), prompt_tokens=in_tokens)
+            return format_response(
+                resp_text,
+                model,
+                messages,
+                tools,
+                cached_tokens=_cached_prompt_tokens(sig, in_tokens),
+                prompt_tokens=in_tokens,
+            )
     except asyncio.CancelledError:
         # B2（Stage 1 审计）：客户端在请求中途断开时，本次交换从未在上游完成，
         # 已保存的 parent_message_id 会使下一轮从错误的分支继续，从而分叉会话。
@@ -928,7 +1181,12 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                 _retried=True,
             )
 
-        logger.exception("Chat request failed (session %s, parent %s): %s", session_id, parent_message_id, e)
+        logger.exception(
+            "Chat request failed (session %s, parent %s): %s",
+            session_id,
+            parent_message_id,
+            e,
+        )
         await _db(delete_sessions_for_chat, token_id, session_id)
         if _retried:
             return _api_error_response(e, is_anthropic)
@@ -977,7 +1235,13 @@ def _messages_text(messages):
     for m in messages:
         c = m.get("content", "")
         if isinstance(c, list):
-            parts.append(" ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text"))
+            parts.append(
+                " ".join(
+                    p.get("text", "")
+                    for p in c
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            )
         else:
             parts.append(str(c))
     return "\n".join(parts)
@@ -1021,7 +1285,18 @@ async def _hold_think_tags(gen):
         yield carry
 
 
-async def stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id=0, scope="", lease=None):
+async def stream_response(
+    gen,
+    model,
+    messages,
+    token_id,
+    session_id,
+    sig,
+    tools,
+    parent_message_id=0,
+    scope="",
+    lease=None,
+):
     parser = StreamToolParser()
     full_text = ""
     is_thinking = False
@@ -1071,7 +1346,9 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
         try:
             await _db(delete_sessions_for_chat, token_id, session_id)
         except Exception:
-            logger.exception("stream_response: failed to purge session rows after client abort")
+            logger.exception(
+                "stream_response: failed to purge session rows after client abort"
+            )
         raise
     except Exception as e:
         failed = True
@@ -1085,14 +1362,19 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
         else:
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.exception("stream_response failed")
-        try:
+        with suppress(Exception):
             yield f"data: {json.dumps({'error': {'message': str(e)[:300]}})}\n\n"
-        except Exception:
-            pass
     finally:
         parsed_tools, clean_text = parse_tools(full_text)
-        clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
-        clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+        clean_text = re.sub(
+            r"<think>.*?</think>", "", clean_text, flags=re.DOTALL
+        ).strip()
+        clean_text = re.sub(
+            r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>",
+            "",
+            clean_text,
+            flags=re.IGNORECASE,
+        ).strip()
 
         if not failed:
             next_messages = messages.copy()
@@ -1103,8 +1385,16 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 ast_msg["content"] = clean_text
             next_messages.append(ast_msg)
             next_sig = generate_signature_sync(next_messages, model, scope)
-            await _db(save_session, sig, token_id, session_id, next_parent(parent_message_id))
-            await _db(save_session, next_sig, token_id, session_id, next_parent(parent_message_id))
+            await _db(
+                save_session, sig, token_id, session_id, next_parent(parent_message_id)
+            )
+            await _db(
+                save_session,
+                next_sig,
+                token_id,
+                session_id,
+                next_parent(parent_message_id),
+            )
 
         if not aborted and not failed:
             try:
@@ -1115,8 +1405,15 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
 
                 if parsed_tools:
                     for i, tc in enumerate(parsed_tools):
-                        delta_tc = {"index": i, "id": tc["id"], "type": "function",
-                                    "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}
+                        delta_tc = {
+                            "index": i,
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["function"]["name"],
+                                "arguments": tc["function"]["arguments"],
+                            },
+                        }
                         yield f"data: {json.dumps({'choices': [{'delta': {'tool_calls': [delta_tc]}}]})}\n\n"
                     yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'tool_calls'}]})}\n\n"
                 else:
@@ -1142,7 +1439,19 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
             lease.release()
 
 
-async def stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model=None, parent_message_id=0, scope="", lease=None):
+async def stream_anthropic_response(
+    gen,
+    model,
+    messages,
+    token_id,
+    session_id,
+    sig,
+    tools,
+    req_model=None,
+    parent_message_id=0,
+    scope="",
+    lease=None,
+):
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     in_tokens = count_tok(_messages_text(messages))
     cached_tokens = _cached_prompt_tokens(sig, in_tokens)
@@ -1211,7 +1520,9 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
         try:
             await _db(delete_sessions_for_chat, token_id, session_id)
         except Exception:
-            logger.exception("stream_anthropic_response: failed to purge session rows after client abort")
+            logger.exception(
+                "stream_anthropic_response: failed to purge session rows after client abort"
+            )
         raise
     except Exception as e:
         failed = True
@@ -1225,14 +1536,19 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
         else:
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.exception("stream_anthropic_response failed")
-        try:
+        with suppress(Exception):
             yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)[:300]}})}\n\n"
-        except Exception:
-            pass
     finally:
         parsed_tools, clean_text = parse_tools(full_text)
-        clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
-        clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+        clean_text = re.sub(
+            r"<think>.*?</think>", "", clean_text, flags=re.DOTALL
+        ).strip()
+        clean_text = re.sub(
+            r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>",
+            "",
+            clean_text,
+            flags=re.IGNORECASE,
+        ).strip()
         # B7: usage on the cleaned completion, not raw full_text. Computed
         # AFTER the strips above (mirrors stream_response): this path used to
         # count tokens before them, so /v1/messages streams billed the whole
@@ -1249,14 +1565,24 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
                 ast_msg["content"] = clean_text
             next_messages.append(ast_msg)
             next_sig = generate_signature_sync(next_messages, model, scope)
-            await _db(save_session, sig, token_id, session_id, next_parent(parent_message_id))
-            await _db(save_session, next_sig, token_id, session_id, next_parent(parent_message_id))
+            await _db(
+                save_session, sig, token_id, session_id, next_parent(parent_message_id)
+            )
+            await _db(
+                save_session,
+                next_sig,
+                token_id,
+                session_id,
+                next_parent(parent_message_id),
+            )
             _remember_prompt_tokens(next_sig, in_tokens)
 
         def _tb(text):
-            return (f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index_local[0], 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                    f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index_local[0], 'delta': {'type': 'text_delta', 'text': text}})}\n\n"
-                    f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index_local[0]})}\n\n")
+            return (
+                f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index_local[0], 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index_local[0], 'delta': {'type': 'text_delta', 'text': text}})}\n\n"
+                f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index_local[0]})}\n\n"
+            )
 
         block_index_local = [block_index]
         tail_events = ""
@@ -1277,7 +1603,11 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
 
         if parsed_tools:
             for tc in parsed_tools:
-                tool_input = json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"]
+                tool_input = (
+                    json.loads(tc["function"]["arguments"])
+                    if isinstance(tc["function"]["arguments"], str)
+                    else tc["function"]["arguments"]
+                )
                 json_str = json.dumps(tool_input)
                 tail_events += f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index_local[0], 'content_block': {'type': 'tool_use', 'id': tc['id'], 'name': tc['function']['name'], 'input': {}}})}\n\n"
                 tail_events += f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index_local[0], 'delta': {'type': 'input_json_delta', 'partial_json': json_str}})}\n\n"
@@ -1286,7 +1616,9 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
             tail_events += f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'tool_use', 'stop_sequence': None}, 'usage': {'output_tokens': out_tokens}})}\n\n"
         else:
             tail_events += f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': out_tokens}})}\n\n"
-        tail_events += f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+        tail_events += (
+            f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+        )
 
         if not aborted and not failed:
             try:
@@ -1317,8 +1649,11 @@ def _completion_usage_text(clean_text, parsed_tools):
     return "\n".join(parts)
 
 
-def format_response(text, model, messages, tools=None, cached_tokens=0, prompt_tokens=None):
+def format_response(
+    text, model, messages, tools=None, cached_tokens=0, prompt_tokens=None
+):
     from functions import DEEPSEEK_TARIFFS
+
     parsed_tools, clean_text = parse_tools(text)
 
     reasoning = None
@@ -1326,16 +1661,27 @@ def format_response(text, model, messages, tools=None, cached_tokens=0, prompt_t
     if match:
         reasoning = match.group(1).strip()
     clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
-    clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+    clean_text = re.sub(
+        r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>",
+        "",
+        clean_text,
+        flags=re.IGNORECASE,
+    ).strip()
 
-    in_tokens = prompt_tokens if prompt_tokens is not None else count_tok(_messages_text(messages))
+    in_tokens = (
+        prompt_tokens
+        if prompt_tokens is not None
+        else count_tok(_messages_text(messages))
+    )
     # B7: bill the CLEANED completion (see _completion_usage_text), not the
     # raw upstream text whose thinking + markup share the client never asked
     # to pay for.
     usage_text = _completion_usage_text(clean_text, parsed_tools)
     out_tokens = count_tok(usage_text) if usage_text else 0
     tariff = DEEPSEEK_TARIFFS["deepseek-v4.1-flash"]
-    cost = (in_tokens / 1_000_000 * tariff["cache_miss_input"]) + (out_tokens / 1_000_000 * tariff["output_generation"])
+    cost = (in_tokens / 1_000_000 * tariff["cache_miss_input"]) + (
+        out_tokens / 1_000_000 * tariff["output_generation"]
+    )
 
     msg_dict = {
         "role": "assistant",
@@ -1350,11 +1696,13 @@ def format_response(text, model, messages, tools=None, cached_tokens=0, prompt_t
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{
-            "index": 0,
-            "message": msg_dict,
-            "finish_reason": "tool_calls" if parsed_tools else "stop",
-        }],
+        "choices": [
+            {
+                "index": 0,
+                "message": msg_dict,
+                "finish_reason": "tool_calls" if parsed_tools else "stop",
+            }
+        ],
         "usage": {
             "prompt_tokens": in_tokens,
             "completion_tokens": out_tokens,
@@ -1390,7 +1738,9 @@ def _anthropic_search_result_block(search_results):
             item["title"] = r["title"]
         published = r.get("published_at")
         if isinstance(published, (int, float)) and published > 0:
-            item["page_age"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(published))
+            item["page_age"] = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(published)
+            )
         items.append(item)
     if not items:
         return None
@@ -1418,12 +1768,14 @@ def format_anthropic_response(result, model, search_results=None):
         for r in search_results or []:
             if not isinstance(r, dict) or not r.get("url") or not r.get("snippet"):
                 continue
-            citations.append({
-                "type": "web_search_result_location",
-                "url": r["url"],
-                "title": r.get("title"),
-                "cited_text": r["snippet"],
-            })
+            citations.append(
+                {
+                    "type": "web_search_result_location",
+                    "url": r["url"],
+                    "title": r.get("title"),
+                    "cited_text": r["snippet"],
+                }
+            )
         if citations:
             text_block["citations"] = citations
         ant_content.append(text_block)
@@ -1432,12 +1784,14 @@ def format_anthropic_response(result, model, search_results=None):
         for tc in msg["tool_calls"]:
             args = tc["function"]["arguments"]
             tool_input = json.loads(args) if isinstance(args, str) else args
-            ant_content.append({
-                "type": "tool_use",
-                "id": tc["id"],
-                "name": tc["function"]["name"],
-                "input": tool_input,
-            })
+            ant_content.append(
+                {
+                    "type": "tool_use",
+                    "id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "input": tool_input,
+                }
+            )
     usage = result.get("usage", {})
     msg_id = result["id"]
     if not msg_id.startswith("msg_"):
@@ -1453,10 +1807,11 @@ def format_anthropic_response(result, model, search_results=None):
         "usage": {
             "input_tokens": usage.get("prompt_tokens", 0),
             "output_tokens": usage.get("completion_tokens", 0),
-            "cache_read_input_tokens": usage.get("prompt_tokens_details", {}).get("cached_tokens", 0),
+            "cache_read_input_tokens": usage.get("prompt_tokens_details", {}).get(
+                "cached_tokens", 0
+            ),
         },
     }
-
 
 
 @app.post("/v1/files")
@@ -1481,8 +1836,10 @@ async def files_upload(request: Request):
     filename = getattr(file_obj, "filename", "file.bin")
     content_type = getattr(file_obj, "content_type", "application/octet-stream")
     file_info = None
-    async for status, data in upload_file(file_bytes, filename, content_type, tok["token"]):
-        if status == "success":
+    async for upload_status, data in upload_file(
+        file_bytes, filename, content_type, tok["token"]
+    ):
+        if upload_status == "success":
             file_info = data
             break
     if not file_info:
@@ -1525,17 +1882,30 @@ async def files_content(file_id: str, request: Request):
         return JSONResponse({"error": "File not found"}, status_code=404)
     except Exception:
         return JSONResponse({"error": "File fetch failed"}, status_code=502)
+
     async def stream_chunks():
         async for chunk in gen:
             yield chunk
-    return StreamingResponse(stream_chunks(), media_type=mime or "application/octet-stream")
+
+    return StreamingResponse(
+        stream_chunks(), media_type=mime or "application/octet-stream"
+    )
 
 
 def is_thinking_enabled(body, request=None):
     effort = body.get("effort")
     if effort is not None:
         e_str = str(effort).strip().lower()
-        if e_str in ["medium", "high", "max", "ultra", "extreme", "enabled", "adaptive", "on"]:
+        if e_str in [
+            "medium",
+            "high",
+            "max",
+            "ultra",
+            "extreme",
+            "enabled",
+            "adaptive",
+            "on",
+        ]:
             return True
         if e_str in ["low", "none", "off", "disable", "disabled", "false"]:
             return False
@@ -1545,7 +1915,16 @@ def is_thinking_enabled(body, request=None):
         out_effort = out_cfg.get("effort") or out_cfg.get("reasoning_effort")
         if out_effort is not None:
             e_str = str(out_effort).strip().lower()
-            if e_str in ["medium", "high", "max", "ultra", "extreme", "enabled", "adaptive", "on"]:
+            if e_str in [
+                "medium",
+                "high",
+                "max",
+                "ultra",
+                "extreme",
+                "enabled",
+                "adaptive",
+                "on",
+            ]:
                 return True
             if e_str in ["low", "none", "off", "disable", "disabled", "false"]:
                 return False
@@ -1560,16 +1939,39 @@ def is_thinking_enabled(body, request=None):
         budget = thinking_val.get("budget_tokens", 0)
         if isinstance(budget, (int, float)) and budget > 0:
             return True
-        t_effort = thinking_val.get("effort") or thinking_val.get("reasoning_effort") or thinking_val.get("level")
+        t_effort = (
+            thinking_val.get("effort")
+            or thinking_val.get("reasoning_effort")
+            or thinking_val.get("level")
+        )
         if t_effort is not None:
             e_str = str(t_effort).strip().lower()
-            if e_str in ["medium", "high", "max", "ultra", "extreme", "enabled", "adaptive", "on"]:
+            if e_str in [
+                "medium",
+                "high",
+                "max",
+                "ultra",
+                "extreme",
+                "enabled",
+                "adaptive",
+                "on",
+            ]:
                 return True
             if e_str in ["low", "none", "off", "disable", "disabled", "false"]:
                 return False
     elif isinstance(thinking_val, str):
         t_str = thinking_val.strip().lower()
-        if t_str in ["medium", "high", "max", "ultra", "extreme", "true", "enabled", "adaptive", "on"]:
+        if t_str in [
+            "medium",
+            "high",
+            "max",
+            "ultra",
+            "extreme",
+            "true",
+            "enabled",
+            "adaptive",
+            "on",
+        ]:
             return True
         if t_str in ["low", "none", "off", "disable", "disabled", "false"]:
             return False
@@ -1585,10 +1987,24 @@ def is_thinking_enabled(body, request=None):
             return False
 
     if request:
-        req_effort = request.headers.get("anthropic-thinking") or request.headers.get("x-anthropic-thinking") or request.headers.get("effort") or request.headers.get("x-effort")
+        req_effort = (
+            request.headers.get("anthropic-thinking")
+            or request.headers.get("x-anthropic-thinking")
+            or request.headers.get("effort")
+            or request.headers.get("x-effort")
+        )
         if req_effort:
             e_str = str(req_effort).strip().lower()
-            if e_str in ["medium", "high", "max", "ultra", "extreme", "enabled", "adaptive", "on"]:
+            if e_str in [
+                "medium",
+                "high",
+                "max",
+                "ultra",
+                "extreme",
+                "enabled",
+                "adaptive",
+                "on",
+            ]:
                 return True
     return False
 
@@ -1614,7 +2030,9 @@ async def chat_completions(request: Request):
     search = body.get("search", False)
     stream = body.get("stream", False)
     tools = body.get("tools", None)
-    return await handle_chat(messages, model, thinking, search, stream, tools, scope=get_api_key(request))
+    return await handle_chat(
+        messages, model, thinking, search, stream, tools, scope=get_api_key(request)
+    )
 
 
 def _responses_content_to_chat(content):
@@ -1636,11 +2054,22 @@ def _responses_content_to_chat(content):
             converted.append({"type": "text", "text": part.get("text", "")})
         elif part_type == "input_image":
             if part.get("image_url"):
-                converted.append({"type": "image_url", "image_url": {"url": part["image_url"]}})
+                converted.append(
+                    {"type": "image_url", "image_url": {"url": part["image_url"]}}
+                )
             elif part.get("file_id"):
-                converted.append({"type": "image", "source": {"type": "file", "file_id": part["file_id"]}})
+                converted.append(
+                    {
+                        "type": "image",
+                        "source": {"type": "file", "file_id": part["file_id"]},
+                    }
+                )
         elif part_type == "input_file":
-            file_data = {key: part[key] for key in ("file_id", "file_data", "filename") if part.get(key) is not None}
+            file_data = {
+                key: part[key]
+                for key in ("file_id", "file_data", "filename")
+                if part.get(key) is not None
+            }
             if file_data:
                 converted.append({"type": "file", "file": file_data})
         elif part_type == "refusal" and part.get("refusal"):
@@ -1679,28 +2108,39 @@ def convert_responses_input(body):
             continue
 
         if item_type == "function_call":
-            call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+            call_id = (
+                item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+            )
             arguments = item.get("arguments", "{}")
             if not isinstance(arguments, str):
                 arguments = json.dumps(arguments)
             if item.get("name"):
-                messages.append({
-                    "role": "assistant",
-                    "tool_calls": [{
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": item["name"], "arguments": arguments},
-                    }],
-                })
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": item["name"],
+                                    "arguments": arguments,
+                                },
+                            }
+                        ],
+                    }
+                )
         elif item_type == "function_call_output":
             output = item.get("output", "")
             if isinstance(output, (dict, list)):
                 output = json.dumps(output, ensure_ascii=False)
-            messages.append({
-                "role": "tool",
-                "tool_call_id": item.get("call_id") or item.get("id", ""),
-                "content": str(output),
-            })
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id") or item.get("id", ""),
+                    "content": str(output),
+                }
+            )
     return messages
 
 
@@ -1710,23 +2150,33 @@ def _responses_payload(result, model, instructions=None):
     response_id = result["id"].replace("chatcmpl-", "resp_", 1)
     output = []
     if message.get("content"):
-        output.append({
-            "type": "message",
-            "id": f"msg_{uuid.uuid4().hex}",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": message["content"], "annotations": []}],
-        })
+        output.append(
+            {
+                "type": "message",
+                "id": f"msg_{uuid.uuid4().hex}",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": message["content"],
+                        "annotations": [],
+                    }
+                ],
+            }
+        )
     for tool_call in message.get("tool_calls") or []:
         function = tool_call.get("function", {})
-        output.append({
-            "type": "function_call",
-            "id": f"fc_{uuid.uuid4().hex}",
-            "call_id": tool_call.get("id") or f"call_{uuid.uuid4().hex[:12]}",
-            "name": function.get("name", ""),
-            "arguments": function.get("arguments", "{}"),
-            "status": "completed",
-        })
+        output.append(
+            {
+                "type": "function_call",
+                "id": f"fc_{uuid.uuid4().hex}",
+                "call_id": tool_call.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                "name": function.get("name", ""),
+                "arguments": function.get("arguments", "{}"),
+                "status": "completed",
+            }
+        )
 
     usage = result.get("usage", {})
     input_tokens = usage.get("prompt_tokens", 0)
@@ -1746,7 +2196,11 @@ def _responses_payload(result, model, instructions=None):
         "previous_response_id": None,
         "usage": {
             "input_tokens": input_tokens,
-            "input_tokens_details": {"cached_tokens": usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)},
+            "input_tokens_details": {
+                "cached_tokens": usage.get("prompt_tokens_details", {}).get(
+                    "cached_tokens", 0
+                )
+            },
             "output_tokens": output_tokens,
             "output_tokens_details": {"reasoning_tokens": 0},
             "total_tokens": usage.get("total_tokens", input_tokens + output_tokens),
@@ -1780,8 +2234,12 @@ async def stream_openai_responses(chat_body_iterator, model, instructions=None):
     response_id = f"resp_{uuid.uuid4().hex}"
     message_id = f"msg_{uuid.uuid4().hex}"
     response = _responses_stream_state(response_id, model, instructions, "in_progress")
-    yield _responses_sse("response.created", {"type": "response.created", "response": response})
-    yield _responses_sse("response.in_progress", {"type": "response.in_progress", "response": response})
+    yield _responses_sse(
+        "response.created", {"type": "response.created", "response": response}
+    )
+    yield _responses_sse(
+        "response.in_progress", {"type": "response.in_progress", "response": response}
+    )
 
     buffer = ""
     text_started = False
@@ -1794,7 +2252,11 @@ async def stream_openai_responses(chat_body_iterator, model, instructions=None):
         buffer += raw_chunk
         while "\n\n" in buffer:
             block, buffer = buffer.split("\n\n", 1)
-            data_lines = [line[5:].lstrip() for line in block.splitlines() if line.startswith("data:")]
+            data_lines = [
+                line[5:].lstrip()
+                for line in block.splitlines()
+                if line.startswith("data:")
+            ]
             if not data_lines:
                 continue
             raw_data = "\n".join(data_lines)
@@ -1803,14 +2265,21 @@ async def stream_openai_responses(chat_body_iterator, model, instructions=None):
             try:
                 event = json.loads(raw_data)
             except Exception as e:
-                logger.warning("Could not translate internal Responses stream event: %s", e)
+                logger.warning(
+                    "Could not translate internal Responses stream event: %s", e
+                )
                 continue
             if event.get("error"):
                 error = event["error"]
-                yield _responses_sse("error", {
-                    "type": "error",
-                    "message": error.get("message", "Upstream stream failed") if isinstance(error, dict) else str(error),
-                })
+                yield _responses_sse(
+                    "error",
+                    {
+                        "type": "error",
+                        "message": error.get("message", "Upstream stream failed")
+                        if isinstance(error, dict)
+                        else str(error),
+                    },
+                )
                 return
 
             for choice in event.get("choices", []):
@@ -1819,34 +2288,57 @@ async def stream_openai_responses(chat_body_iterator, model, instructions=None):
                 if text_delta:
                     if not text_started:
                         text_started = True
-                        yield _responses_sse("response.output_item.added", {
-                            "type": "response.output_item.added",
-                            "output_index": 0,
-                            "item": {"id": message_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []},
-                        })
-                        yield _responses_sse("response.content_part.added", {
-                            "type": "response.content_part.added",
+                        yield _responses_sse(
+                            "response.output_item.added",
+                            {
+                                "type": "response.output_item.added",
+                                "output_index": 0,
+                                "item": {
+                                    "id": message_id,
+                                    "type": "message",
+                                    "status": "in_progress",
+                                    "role": "assistant",
+                                    "content": [],
+                                },
+                            },
+                        )
+                        yield _responses_sse(
+                            "response.content_part.added",
+                            {
+                                "type": "response.content_part.added",
+                                "item_id": message_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "part": {
+                                    "type": "output_text",
+                                    "text": "",
+                                    "annotations": [],
+                                },
+                            },
+                        )
+                    full_text += text_delta
+                    yield _responses_sse(
+                        "response.output_text.delta",
+                        {
+                            "type": "response.output_text.delta",
                             "item_id": message_id,
                             "output_index": 0,
                             "content_index": 0,
-                            "part": {"type": "output_text", "text": "", "annotations": []},
-                        })
-                    full_text += text_delta
-                    yield _responses_sse("response.output_text.delta", {
-                        "type": "response.output_text.delta",
-                        "item_id": message_id,
-                        "output_index": 0,
-                        "content_index": 0,
-                        "delta": text_delta,
-                    })
+                            "delta": text_delta,
+                        },
+                    )
 
                 for tool_delta in delta.get("tool_calls", []):
                     index = tool_delta.get("index", len(tool_calls))
-                    current = tool_calls.setdefault(index, {
-                        "id": tool_delta.get("id") or f"call_{uuid.uuid4().hex[:12]}",
-                        "name": "",
-                        "arguments": "",
-                    })
+                    current = tool_calls.setdefault(
+                        index,
+                        {
+                            "id": tool_delta.get("id")
+                            or f"call_{uuid.uuid4().hex[:12]}",
+                            "name": "",
+                            "arguments": "",
+                        },
+                    )
                     function = tool_delta.get("function", {})
                     current["name"] += function.get("name", "")
                     current["arguments"] += function.get("arguments", "")
@@ -1861,23 +2353,34 @@ async def stream_openai_responses(chat_body_iterator, model, instructions=None):
             "content": [{"type": "output_text", "text": full_text, "annotations": []}],
         }
         output.append(message_item)
-        yield _responses_sse("response.output_text.done", {
-            "type": "response.output_text.done",
-            "item_id": message_id,
-            "output_index": 0,
-            "content_index": 0,
-            "text": full_text,
-        })
-        yield _responses_sse("response.content_part.done", {
-            "type": "response.content_part.done",
-            "item_id": message_id,
-            "output_index": 0,
-            "content_index": 0,
-            "part": message_item["content"][0],
-        })
-        yield _responses_sse("response.output_item.done", {
-            "type": "response.output_item.done", "output_index": 0, "item": message_item,
-        })
+        yield _responses_sse(
+            "response.output_text.done",
+            {
+                "type": "response.output_text.done",
+                "item_id": message_id,
+                "output_index": 0,
+                "content_index": 0,
+                "text": full_text,
+            },
+        )
+        yield _responses_sse(
+            "response.content_part.done",
+            {
+                "type": "response.content_part.done",
+                "item_id": message_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": message_item["content"][0],
+            },
+        )
+        yield _responses_sse(
+            "response.output_item.done",
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": message_item,
+            },
+        )
 
     for _, tool_call in sorted(tool_calls.items()):
         output_index = len(output)
@@ -1890,22 +2393,39 @@ async def stream_openai_responses(chat_body_iterator, model, instructions=None):
             "status": "completed",
         }
         output.append(item)
-        yield _responses_sse("response.output_item.added", {
-            "type": "response.output_item.added", "output_index": output_index, "item": {**item, "status": "in_progress"},
-        })
-        yield _responses_sse("response.function_call_arguments.done", {
-            "type": "response.function_call_arguments.done",
-            "item_id": item["id"],
-            "output_index": output_index,
-            "arguments": item["arguments"],
-        })
-        yield _responses_sse("response.output_item.done", {
-            "type": "response.output_item.done", "output_index": output_index, "item": item,
-        })
+        yield _responses_sse(
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {**item, "status": "in_progress"},
+            },
+        )
+        yield _responses_sse(
+            "response.function_call_arguments.done",
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": item["id"],
+                "output_index": output_index,
+                "arguments": item["arguments"],
+            },
+        )
+        yield _responses_sse(
+            "response.output_item.done",
+            {
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": item,
+            },
+        )
 
-    completed = _responses_stream_state(response_id, model, instructions, "completed", output)
+    completed = _responses_stream_state(
+        response_id, model, instructions, "completed", output
+    )
     completed["completed_at"] = int(time.time())
-    yield _responses_sse("response.completed", {"type": "response.completed", "response": completed})
+    yield _responses_sse(
+        "response.completed", {"type": "response.completed", "response": completed}
+    )
 
 
 @app.post("/v1/responses")
@@ -1917,19 +2437,27 @@ async def openai_responses(request: Request):
     messages = convert_responses_input(body)
     if not messages or not any(m.get("role") in {"user", "tool"} for m in messages):
         return JSONResponse(
-            {"error": {"message": "Responses request contains no usable input", "type": "invalid_request_error"}},
+            {
+                "error": {
+                    "message": "Responses request contains no usable input",
+                    "type": "invalid_request_error",
+                }
+            },
             status_code=400,
         )
 
     thinking = is_thinking_enabled(body, request)
     search = body.get("search", False) or any(
-        isinstance(tool, dict) and tool.get("type") in {"web_search", "web_search_preview"}
+        isinstance(tool, dict)
+        and tool.get("type") in {"web_search", "web_search_preview"}
         for tool in body.get("tools", [])
     )
     stream = body.get("stream", False)
     tools = body.get("tools", None)
 
-    result = await handle_chat(messages, model, thinking, search, stream, tools, scope=get_api_key(request))
+    result = await handle_chat(
+        messages, model, thinking, search, stream, tools, scope=get_api_key(request)
+    )
 
     if stream:
         if isinstance(result, StreamingResponse):
@@ -1937,7 +2465,9 @@ async def openai_responses(request: Request):
             # 自动继承；显式透传，否则 /v1/responses 流式路径下 lease 的兜底
             # 释放丢失（客户端在首次迭代前断开时在途计数会泄漏）。
             return StreamingResponse(
-                stream_openai_responses(result.body_iterator, model, body.get("instructions")),
+                stream_openai_responses(
+                    result.body_iterator, model, body.get("instructions")
+                ),
                 media_type="text/event-stream",
                 background=result.background,
             )
@@ -1971,26 +2501,39 @@ def convert_anthropic_messages(messages):
                 elif c.get("type") == "image":
                     image_parts.append(c)
                 elif c.get("type") == "tool_use":
-                    tool_calls.append({
-                        "id": c.get("id") or ("call_" + uuid.uuid4().hex[:8]),
-                        "type": "function",
-                        "function": {
-                            "name": c.get("name", ""),
-                            "arguments": json.dumps(c.get("input", {})),
-                        },
-                    })
+                    tool_calls.append(
+                        {
+                            "id": c.get("id") or ("call_" + uuid.uuid4().hex[:8]),
+                            "type": "function",
+                            "function": {
+                                "name": c.get("name", ""),
+                                "arguments": json.dumps(c.get("input", {})),
+                            },
+                        }
+                    )
                 elif c.get("type") == "tool_result":
                     res_content = c.get("content", "")
                     if isinstance(res_content, list):
                         for item in res_content:
                             if isinstance(item, dict) and item.get("type") == "image":
                                 image_parts.append(item)
-                        res_content = " ".join(item.get("text", "") for item in res_content if isinstance(item, dict) and item.get("type") == "text")
+                        res_content = " ".join(
+                            item.get("text", "")
+                            for item in res_content
+                            if isinstance(item, dict) and item.get("type") == "text"
+                        )
                     elif not isinstance(res_content, str):
                         res_content = str(res_content)
-                    tool_results.append({"tool_call_id": c.get("tool_use_id", ""), "content": res_content})
+                    tool_results.append(
+                        {
+                            "tool_call_id": c.get("tool_use_id", ""),
+                            "content": res_content,
+                        }
+                    )
             if image_parts:
-                content = [{"type": "text", "text": s} for s in parts if s] + image_parts
+                content = [
+                    {"type": "text", "text": s} for s in parts if s
+                ] + image_parts
             else:
                 content = "\n".join(p for p in parts if p)
         if m.get("role") == "system":
@@ -1998,7 +2541,9 @@ def convert_anthropic_messages(messages):
                 openai_msgs.append({"role": "system", "content": content})
             continue
         if m.get("role") == "assistant":
-            if isinstance(content, str) and (not content.strip() or content.strip() == "(no content)"):
+            if isinstance(content, str) and (
+                not content.strip() or content.strip() == "(no content)"
+            ):
                 content = None
             msg = {"role": "assistant", "content": content}
             if tool_calls:
@@ -2008,8 +2553,16 @@ def convert_anthropic_messages(messages):
             openai_msgs.append(msg)
             continue
         for tr in tool_results:
-            openai_msgs.append({"role": "tool", "tool_call_id": tr["tool_call_id"], "content": tr["content"]})
-        has_content = bool(content) if not isinstance(content, list) else len(content) > 0
+            openai_msgs.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tr["tool_call_id"],
+                    "content": tr["content"],
+                }
+            )
+        has_content = (
+            bool(content) if not isinstance(content, list) else len(content) > 0
+        )
         if has_content or not tool_results:
             openai_msgs.append({"role": m.get("role", "user"), "content": content})
     return openai_msgs
@@ -2033,7 +2586,11 @@ async def anthropic_messages(request: Request):
     openai_msgs = []
     if system:
         if isinstance(system, list):
-            system_str = " ".join(c.get("text", "") for c in system if isinstance(c, dict) and c.get("type") == "text")
+            system_str = " ".join(
+                c.get("text", "")
+                for c in system
+                if isinstance(c, dict) and c.get("type") == "text"
+            )
         else:
             system_str = str(system)
         if system_str:
@@ -2051,29 +2608,42 @@ async def anthropic_messages(request: Request):
             server_search = True
             continue
         if t.get("type") == "function":
-            openai_tools.append({
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t.get("description", "NO DESCRIPTION"),
-                    "parameters": t.get("input_schema", {}),
-                },
-            })
+            openai_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t["name"],
+                        "description": t.get("description", "NO DESCRIPTION"),
+                        "parameters": t.get("input_schema", {}),
+                    },
+                }
+            )
         elif "name" in t:
-            openai_tools.append({
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t.get("description", ""),
-                    "parameters": t.get("input_schema", t.get("parameters", {})),
-                },
-            })
+            openai_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t["name"],
+                        "description": t.get("description", ""),
+                        "parameters": t.get("input_schema", t.get("parameters", {})),
+                    },
+                }
+            )
 
     output_config = body.get("output_config")
-    if isinstance(output_config, dict) and output_config.get("format", {}).get("type") == "json_schema":
+    if (
+        isinstance(output_config, dict)
+        and output_config.get("format", {}).get("type") == "json_schema"
+    ):
         json_schema = output_config["format"].get("schema")
         if json_schema:
-            openai_msgs.insert(0, {"role": "system", "content": f"You MUST return valid JSON adhering strictly to this JSON Schema:\n{json.dumps(json_schema)}"})
+            openai_msgs.insert(
+                0,
+                {
+                    "role": "system",
+                    "content": f"You MUST return valid JSON adhering strictly to this JSON Schema:\n{json.dumps(json_schema)}",
+                },
+            )
 
     req_model = body.get("model")
     search_sink = []
@@ -2081,9 +2651,31 @@ async def anthropic_messages(request: Request):
         # 流式路径下搜索结果与正文交错到达，content_block 索引在开流时即已固定，
         # 无法在响应头发出后追加结果块；需要结构化来源的调用方应走非流式路径。
         # 此处仍透传 server_search，确保上游确实执行联网检索。
-        return await handle_chat(openai_msgs, model, thinking, server_search, True, openai_tools or None, is_anthropic=True, req_model=req_model, scope=get_api_key(request), search_sink=search_sink)
+        return await handle_chat(
+            openai_msgs,
+            model,
+            thinking,
+            server_search,
+            True,
+            openai_tools or None,
+            is_anthropic=True,
+            req_model=req_model,
+            scope=get_api_key(request),
+            search_sink=search_sink,
+        )
 
-    result = await handle_chat(openai_msgs, model, thinking, server_search, False, openai_tools or None, is_anthropic=True, req_model=req_model, scope=get_api_key(request), search_sink=search_sink)
+    result = await handle_chat(
+        openai_msgs,
+        model,
+        thinking,
+        server_search,
+        False,
+        openai_tools or None,
+        is_anthropic=True,
+        req_model=req_model,
+        scope=get_api_key(request),
+        search_sink=search_sink,
+    )
     if not isinstance(result, dict) or "choices" not in result:
         return result
     return format_anthropic_response(result, req_model, search_results=search_sink)
@@ -2125,20 +2717,20 @@ async def list_models(request: Request):
                     "supported": True,
                     "types": {
                         "enabled": {"supported": True},
-                        "adaptive": {"supported": True}
-                    }
+                        "adaptive": {"supported": True},
+                    },
                 },
                 "effort": {
                     "supported": True,
                     "low": {"supported": True},
-                    "medium": {"supported": True}
+                    "medium": {"supported": True},
                 },
                 "context_management": {
                     "clear_thinking_20251015": {"supported": True},
                     "compact_20260112": {"supported": True},
-                    "supported": True
-                }
-            }
+                    "supported": True,
+                },
+            },
         }
     ]
 
@@ -2159,7 +2751,7 @@ async def list_models(request: Request):
         "data": all_models,
         "has_more": False,
         "first_id": all_models[0]["id"],
-        "last_id": all_models[-1]["id"]
+        "last_id": all_models[-1]["id"],
     }
 
 
@@ -2174,8 +2766,14 @@ async def login_submit(request: Request):
     username = form.get("username", "")
     password = form.get("password", "")
     if time.time() < _login_fails["locked_until"]:
-        return templates.TemplateResponse(request, "login.html", {"error": "登录尝试次数过多，请 5 分钟后再试。"})
-    if secrets.compare_digest(username.encode("utf-8"), ADMIN_USER.encode("utf-8")) and secrets.compare_digest(password.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8")):
+        return templates.TemplateResponse(
+            request, "login.html", {"error": "登录尝试次数过多，请 5 分钟后再试。"}
+        )
+    if secrets.compare_digest(
+        username.encode("utf-8"), ADMIN_USER.encode("utf-8")
+    ) and secrets.compare_digest(
+        password.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8")
+    ):
         _login_fails["count"] = 0
         sid = str(uuid.uuid4())
         SESSIONS[sid] = time.time()
@@ -2186,7 +2784,9 @@ async def login_submit(request: Request):
     if _login_fails["count"] >= 5:
         _login_fails["locked_until"] = time.time() + 300
         _login_fails["count"] = 0
-    return templates.TemplateResponse(request, "login.html", {"error": "用户名或密码错误。"})
+    return templates.TemplateResponse(
+        request, "login.html", {"error": "用户名或密码错误。"}
+    )
 
 
 @app.get("/logout")
@@ -2248,14 +2848,22 @@ async def accounts_add(request: Request):
     password = str(form.get("password", ""))
     alias = str(form.get("alias", "")).strip() or None
     if not email or not password:
-        return RedirectResponse("/dashboard?account_error=" + quote("邮箱和密码不能为空"), status_code=303)
+        return RedirectResponse(
+            "/dashboard?account_error=" + quote("邮箱和密码不能为空"), status_code=303
+        )
     try:
         auth_token = await login_deepseek_account(email, password)
         save_account_login(email, alias, auth_token)
-        return RedirectResponse("/dashboard?account_message=" + quote("账号登录成功，已加入 Token 号池"), status_code=303)
+        return RedirectResponse(
+            "/dashboard?account_message=" + quote("账号登录成功，已加入 Token 号池"),
+            status_code=303,
+        )
     except Exception as e:
         logger.warning("DeepSeek account login failed for %s: %s", email, str(e)[:300])
-        return RedirectResponse("/dashboard?account_error=" + quote("登录失败：" + str(e)[:180]), status_code=303)
+        return RedirectResponse(
+            "/dashboard?account_error=" + quote("登录失败：" + str(e)[:180]),
+            status_code=303,
+        )
 
 
 @app.post("/accounts/{account_id}/delete")
@@ -2265,7 +2873,9 @@ async def accounts_delete(account_id: int, request: Request):
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     delete_account(account_id)
-    return RedirectResponse("/dashboard?account_message=" + quote("账号及其 Token 已删除"), status_code=303)
+    return RedirectResponse(
+        "/dashboard?account_message=" + quote("账号及其 Token 已删除"), status_code=303
+    )
 
 
 @app.post("/tokens/check")
@@ -2283,7 +2893,9 @@ async def tokens_check(request: Request, token_id: int | None = None):
             _token_check_state["last_results"] = results
             _token_check_state["last_run_at"] = time.time()
     # The page reloads to show updated rows; never echo raw bearer tokens in JSON.
-    return JSONResponse({"results": results, "checked_at": _token_check_state["last_run_at"]})
+    return JSONResponse(
+        {"results": results, "checked_at": _token_check_state["last_run_at"]}
+    )
 
 
 @app.post("/tokens/{token_id}/delete")
@@ -2320,6 +2932,7 @@ async def health(request: Request):
         data["active_tokens"] = active
         data["cookies_valid"] = cookies_valid
     return JSONResponse(data, status_code=200 if ok else 503)
+
 
 def main():
     """Entry point for the console script."""

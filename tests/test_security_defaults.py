@@ -6,7 +6,7 @@ Explicit keys are honored unchanged.
 
 Run:  python tests/test_security_defaults.py   (pytest-compatible)
 """
-import builtins
+
 import os
 import sys
 import tempfile
@@ -37,7 +37,9 @@ def test_empty_key_generates_and_persists():
         with open(key_file) as f:
             assert f.read().strip() == key1
         if os.name == "posix":
-            assert not (os.stat(key_file).st_mode & 0o077), "key file must not be group/world accessible"
+            assert not (os.stat(key_file).st_mode & 0o077), (
+                "key file must not be group/world accessible"
+            )
         # a second boot reuses the persisted key instead of rotating it
         key2, generated2 = app_module._resolve_api_key()
     assert key2 == key1, "the persisted key must survive restarts"

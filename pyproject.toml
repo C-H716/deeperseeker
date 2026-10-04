@@ -45,8 +45,11 @@ exclude = [
     "deeperseeker-stages",
     "wasm",
 ]
+# The container ships CPython 3.13, but the checked-in dev/runtime interpreter
+# here is 3.10. Targeting the older version keeps ruff's version-gated rewrites
+# (datetime.UTC, TimeoutError alias, ...) valid on both interpreters.
 line-length = 88
-target-version = "py313"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
