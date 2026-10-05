@@ -8,6 +8,7 @@
 同时固定 TokenLease 的计数语义：release() 幂等、rebind() 转移占用且不重复
 登记——计数只增不减会让某账号永久显得最忙，破坏负载均衡。
 """
+
 import os
 import sys
 import time
@@ -42,7 +43,9 @@ def pool(tmp_path, monkeypatch):
 def _expire_cooldown(token_id):
     """把冷却截止时间改到过去，模拟冷却窗口已过。"""
     conn = functions.get_db()
-    conn.execute("UPDATE tokens SET limited_until = ? WHERE id = ?", (time.time() - 1, token_id))
+    conn.execute(
+        "UPDATE tokens SET limited_until = ? WHERE id = ?", (time.time() - 1, token_id)
+    )
     conn.commit()
     conn.close()
 
@@ -98,13 +101,15 @@ def test_sole_limited_token_is_still_fallback(pool):
 
 def test_mark_active_clears_cooldown(pool):
     a = add_token("token-a", alias="a")
-    b = add_token("token-b", alias="b")
+    add_token("token-b", alias="b")
     mark_limited(a)
 
     mark_active(a)
 
     conn = functions.get_db()
-    row = conn.execute("SELECT status, limited_until FROM tokens WHERE id = ?", (a,)).fetchone()
+    row = conn.execute(
+        "SELECT status, limited_until FROM tokens WHERE id = ?", (a,)
+    ).fetchone()
     conn.close()
     assert row[0] == "ACTIVE"
     assert row[1] is None
@@ -118,7 +123,9 @@ def test_mark_limited_records_future_cooldown(pool):
     mark_limited(a)
 
     conn = functions.get_db()
-    row = conn.execute("SELECT status, limited_until FROM tokens WHERE id = ?", (a,)).fetchone()
+    row = conn.execute(
+        "SELECT status, limited_until FROM tokens WHERE id = ?", (a,)
+    ).fetchone()
     conn.close()
     assert row[0] == "RATE_LIMITED"
     assert row[1] >= before + functions.RATE_LIMIT_COOLDOWN_SEC - 1
