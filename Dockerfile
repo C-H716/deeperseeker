@@ -11,7 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 
-COPY pyproject.toml uv.lock requirements.txt requirements-waf-backup.txt ./
+# requirements.txt is not copied: the install step below uses the self-contained
+# waf-backup lock, which already pins every base dependency.
+COPY pyproject.toml uv.lock requirements-waf-backup.txt ./
 
 
 # Upstream switched this step to `uv sync`, which installs only the default
@@ -42,4 +44,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD curl 
 # If reverting to backup Playwright cookie generation, run under xvfb:
 # CMD ["sh", "-c", "xvfb-run -a -s '-screen 0 1280x720x24' python3 app.py"]
 # might also need requirements-waf-backup edition
+# Upstream runs `uv sync`, which also installs this project and creates the
+# `deeperseeker` console script. This image installs dependencies only (from the
+# waf-backup lock), so invoke the entrypoint module directly instead.
 CMD ["python3", "app.py"]
