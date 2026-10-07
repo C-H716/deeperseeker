@@ -30,55 +30,15 @@ from starlette.background import BackgroundTask
 from uvicorn.logging import AccessFormatter
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-os.chdir(BASE_DIR)
+# B12：导入期的全局 os.chdir(BASE_DIR) 已移除——所有相对路径改为显式锚定
+# BASE_DIR。进程级 CWD 的副作用对内嵌、多 worker、测试与打包都是有害的。
 
-load_dotenv()
-
-
-def _resolve_api_key():
-    """B9 (Stage 1 audit): never ship an open relay.
-
-    The API key used to fall back to the publicly documented 'dseeker'
-    silently, and the dashboard to admin/admin — an exposed host plus these
-    defaults manufactured an open relay (the failure class that killed
-    ds2api). Now: an unset key is GENERATED (dsk- + 24 urlsafe chars),
-    printed once on boot and persisted next to the database so restarts keep
-    the same key. An explicit DEEPSEEKER_API_KEY is honored unchanged.
-
-    Returns (api_key, was_generated)."""
-    key = os.getenv("DEEPSEEKER_API_KEY", "").strip()
-    if key:
-        return key, False
-    key_file = os.path.join(
-        os.path.dirname(os.path.abspath(os.getenv("DB_PATH", "deeperseeker.db"))),
-        "api_key.txt",
-    )
-    try:
-        with open(key_file) as f:
-            saved = f.read().strip()
-        if saved:
-            return saved, True
-    except OSError:
-        pass
-    generated = "dsk-" + secrets.token_urlsafe(24)
-    try:
-        os.makedirs(os.path.dirname(key_file) or ".", exist_ok=True)
-        with open(key_file, "w") as f:
-            f.write(generated + "\n")
-        os.chmod(key_file, 0o600)
-    except OSError:
-        pass  # best-effort persistence; the key is printed below regardless
-    return generated, True
-
-
-API_KEY, _api_key_generated = _resolve_api_key()
-ADMIN_USER = os.getenv("DEEPSEEKER_ADMIN_USER", "admin")
-ADMIN_PASSWORD = os.getenv("DEEPSEEKER_ADMIN_PASSWORD", "admin")
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 security = HTTPBasic()
 
 
-from functions import (
+from functions import (  # noqa: E402
     CookieGenerationError,
     StreamToolParser,
     TokenLease,
@@ -87,6 +47,7 @@ from functions import (
     cookie_file_path,
     count_tokens_cached,
     create_new_chat,
+    data_dir,
     delete_account,
     delete_sessions_for_chat,
     delete_token,
@@ -113,6 +74,45 @@ from functions import (
     send_message,
     upload_file,
 )
+
+
+def _resolve_api_key():
+    """B9 (Stage 1 audit): never ship an open relay.
+
+    The API key used to fall back to the publicly documented 'dseeker'
+    silently, and the dashboard to admin/admin — an exposed host plus these
+    defaults manufactured an open relay (the failure class that killed
+    ds2api). Now: an unset key is GENERATED (dsk- + 24 urlsafe chars),
+    printed once on boot and persisted next to the database so restarts keep
+    the same key. An explicit DEEPSEEKER_API_KEY is honored unchanged.
+
+    Returns (api_key, was_generated)."""
+    key = os.getenv("DEEPSEEKER_API_KEY", "").strip()
+    if key:
+        return key, False
+    key_file = os.path.join(data_dir(), "api_key.txt")
+    try:
+        with open(key_file) as f:
+            saved = f.read().strip()
+        if saved:
+            return saved, True
+    except OSError:
+        pass
+    generated = "dsk-" + secrets.token_urlsafe(24)
+    try:
+        os.makedirs(os.path.dirname(key_file) or ".", exist_ok=True)
+        with open(key_file, "w") as f:
+            f.write(generated + "\n")
+        os.chmod(key_file, 0o600)
+    except OSError:
+        pass  # best-effort persistence; the key is printed below regardless
+    return generated, True
+
+
+API_KEY, _api_key_generated = _resolve_api_key()
+ADMIN_USER = os.getenv("DEEPSEEKER_ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.getenv("DEEPSEEKER_ADMIN_PASSWORD", "admin")
+
 from middleware import RealIPMiddleware, RecovererMiddleware, RequestIDMiddleware
 from plugin_helper import (
     MAX_SUMMARY_TOKENS,
@@ -326,8 +326,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="DeeperSeeker", lifespan=lifespan)
-templates = Jinja2Templates(directory="templates")
-app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+app.mount(
+    "/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static"
+)
 
 
 @app.middleware("http")
@@ -354,6 +356,9 @@ app.add_middleware(RecovererMiddleware)
 
 SESSIONS = {}
 SESSION_TTL = 7 * 24 * 3600
+# B12：SESSIONS（以及下方的 _login_fails）是进程内后台管理状态——重启即重置，
+# 且不跨 worker 共享。本服务按设计为单 worker（uvicorn workers=1）；共享存储
+# 属于 Stage 6 的 store 拆分。过期条目改在登录时顺带清理，而非驻留至重启。
 # Short-lived handoff summaries bridge concurrent requests that observe the
 # same pre-rollover signature while the first request is migrating the chat.
 ROLLOVER_HANDOFFS = OrderedDict()
@@ -2927,11 +2932,21 @@ async def login_page(request: Request):
     return templates.TemplateResponse(request, "login.html", {"error": None})
 
 
+def _prune_admin_sessions():
+    """B12：过期的后台会话此前会驻留内存直到重启，此处改为登录时顺带清理，
+    使该字典只保留仍有效的会话。"""
+    now = time.time()
+    expired = [sid for sid, ts in SESSIONS.items() if now - ts > SESSION_TTL]
+    for sid in expired:
+        SESSIONS.pop(sid, None)
+
+
 @app.post("/login", response_class=HTMLResponse)
 async def login_submit(request: Request):
     form = await request.form()
     username = form.get("username", "")
     password = form.get("password", "")
+    _prune_admin_sessions()
     if time.time() < _login_fails["locked_until"]:
         return templates.TemplateResponse(
             request, "login.html", {"error": "登录尝试次数过多，请 5 分钟后再试。"}

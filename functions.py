@@ -25,9 +25,23 @@ except ImportError:
 
 logger = logging.getLogger("deeperseeker.functions")
 
-wasm_path = "wasm/deepseek_pow_solver.wasm"
+# B12：所有运行时相对路径锚定到包目录。此前 app.py 在导入时执行全局
+# os.chdir(BASE_DIR)，把进程级状态改成了「依赖导入顺序」——内嵌、多 worker、
+# 测试与打包都会因此行为漂移。
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+wasm_path = os.path.join(BASE_DIR, "wasm", "deepseek_pow_solver.wasm")
 _session = None
-_db = os.getenv("DB_PATH", "deeperseeker.db")
+_db = os.getenv("DB_PATH") or os.path.join(BASE_DIR, "deeperseeker.db")
+
+
+def data_dir():
+    """返回存放 SQLite 数据库的目录。
+
+    与数据库同级的运行时文件（如自动生成的 API key）也放在这里。
+    显式设置 DB_PATH 时以它为准；缺省锚定包目录，不依赖进程 CWD。
+    """
+    return os.path.dirname(os.path.abspath(_db))
 
 
 class DeepSeekRateLimitError(Exception):
@@ -41,14 +55,14 @@ def cookie_file_path():
     """Resolve where the DeepSeek cookie file lives.
 
     Order: DEEPSEEKER_COOKIE_PATH env > the target of a legacy Docker symlink
-    > next to the real DB file (which honors DB_PATH) > CWD. Writing goes to
-    the RESOLVED path so os.replace() can never destroy a symlink that bridges
-    the file into the persistent data volume.
+    > next to the real DB file (which honors DB_PATH) > the package directory.
+    Writing goes to the RESOLVED path so os.replace() can never destroy a
+    symlink that bridges the file into the persistent data volume.
     """
     p = os.getenv("DEEPSEEKER_COOKIE_PATH")
     if p:
         return p
-    p = "aws_cookies_deepseek.json"
+    p = os.path.join(BASE_DIR, "aws_cookies_deepseek.json")
     try:
         if os.path.islink(p):
             target = os.path.realpath(p)
@@ -421,7 +435,7 @@ def device_id_file_path():
     d = os.path.dirname(os.path.abspath(_db))
     if d and os.path.abspath(d) != os.path.abspath(os.getcwd()):
         return os.path.join(d, "deepseek_device_id")
-    return "deepseek_device_id"
+    return os.path.join(BASE_DIR, "deepseek_device_id")
 
 
 def _read_persisted_device_id():
