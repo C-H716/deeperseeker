@@ -14,14 +14,11 @@ deepseek_device_id
 .pytest_cache/
 *.egg-info/
 .dsh-drop/
+.dsh-vision-router/
 # local debug artifacts
 _tps_denom.mjs
 _tps_denom_out.txt
-_copy.zstd
 *.zstd
-DISM
-sfc
-...
 # local database
 *.db
 # B9: generated API key and SQLite WAL/SHM sidecars
