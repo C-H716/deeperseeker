@@ -124,6 +124,10 @@ def init_db():
         conn.execute("ALTER TABLE tokens ADD COLUMN account_id INTEGER")
     if "limited_until" not in token_columns:
         conn.execute("ALTER TABLE tokens ADD COLUMN limited_until REAL")
+    # 调度器并列时的「最久未用优先」需要记录 token 的上次选中时刻；
+    # 注意与 sessions.last_used（B13 的会话清理）分属两张表。
+    if "last_used" not in token_columns:
+        conn.execute("ALTER TABLE tokens ADD COLUMN last_used REAL")
     # B13: session pruning keys on real recency of USE, so older volumes need
     # the column; the ALTER is idempotent behind the pragma check.
     session_columns = {
@@ -937,6 +941,11 @@ def delete_token(token_id):
 
 RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("DEEPSEEKER_RATE_LIMIT_COOLDOWN", "60"))
 
+# 单 token 软并发上限：在途数达到上限的 token 仅在无其它可用账号时才被
+# 选中。账号数少而并发高时，纯「最少在途优先」仍会把多出来的请求压向
+# 同一账号，软上限把这部分请求导向其它尚未打满的账号。
+TOKEN_CONCURRENCY_CAP = int(os.getenv("DEEPSEEKER_TOKEN_CONCURRENCY", "8"))
+
 # 各 token 当前在途的上游请求数，供 pick_token() 做负载均衡。
 # 仅由事件循环线程读写：token_acquire/token_release 与 pick_token() 之间不存在
 # await 边界，dict 的单项读写本身是原子的，因此无需额外加锁。
@@ -1002,41 +1011,83 @@ class TokenLease:
         return self._token_id
 
 
-def pick_token():
+def pick_token(exclude=None):
     """选出当前最空闲的可用 token。
 
     改为「最少在途优先」而非无状态随机：账号数少而并发新会话多时，
     ORDER BY RANDOM() 的方差会让某个账号同时吸收多个请求、先撞上游的
-    按账号限流，而其它账号仍然空闲。在途数并列时仍随机挑选，保证同等
-    空闲的账号之间继续均摊。
+    按账号限流，而其它账号仍然空闲。并列时依次按「最久未用」与 id 升序
+    定序，保证同等空闲的账号之间继续均摊且结果确定。
 
     limited_until 冷却过滤：刚返回 429 的账号在冷却窗口内不进入候选集；
-    冷却一旦到期即重新参与分配，不再只依赖间隔长得多（默认 300s）的定时
-    健康检查来恢复。永久性故障状态（INVALID / CHECK_ERROR）始终排除，
-    只有限流这一种可自愈的状态享受冷却到期即恢复。
+    冷却一旦到期即重新参与分配，并在本次选中时把状态翻回 ACTIVE，不再
+    只依赖间隔长得多（默认 300s）的定时健康检查来恢复。永久性故障状态
+    （INVALID / CHECK_ERROR）始终排除，只有限流这一种可自愈的状态享受
+    冷却到期即恢复。
 
-    候选集为空时保持原有兜底语义（不限状态取 id 最小者），因为调用方
-    （handle_chat、文件上传）已有各自的限流与轮换处理。
+    在途数达到 TOKEN_CONCURRENCY_CAP 的账号排序靠后，仅在无其它可用账号
+    时才被选中——软上限不会饿死任何账号，但能抑制并发向单一账号堆积。
+
+    `exclude` 供重试轮换使用：列出刚失败过的 token id，只要还有其它可用
+    账号就不回落到它们，避免重试再次命中被污染的账号。
+
+    全部账号仍在冷却时返回最先恢复者（有界等待），而非 id 最小者；池中
+    无任何 token 时返回 None。
     """
     conn = get_db()
     try:
         now = time.time()
-        rows = conn.execute("SELECT id, status, limited_until FROM tokens").fetchall()
-        candidates = [
-            r[0]
-            for r in rows
-            if (r[1] == "ACTIVE" and (not r[2] or r[2] <= now))
-            or (r[1] == "RATE_LIMITED" and r[2] and r[2] <= now)
-        ]
-        if not candidates:
-            row = conn.execute("SELECT id FROM tokens ORDER BY id LIMIT 1").fetchone()
-            return row[0] if row else None
-        if len(candidates) == 1:
-            return candidates[0]
-        least = min(_inflight.get(tid, 0) for tid in candidates)
-        return random.choice(
-            [tid for tid in candidates if _inflight.get(tid, 0) == least]
-        )
+        rows = conn.execute(
+            "SELECT id, status, limited_until, last_used FROM tokens"
+        ).fetchall()
+        if not rows:
+            return None
+
+        excluded = set(exclude or ())
+        available = []  # (token_id, last_used)：冷却已过、可参与分配
+        recovered = []  # 冷却到期、本次翻回 ACTIVE 的 token
+        cooling = []  # (token_id, 恢复时刻)：仍在冷却，用于全冷却兜底
+        for tid, status, until, last_used in rows:
+            if status not in ("ACTIVE", "RATE_LIMITED"):
+                continue  # INVALID / CHECK_ERROR 属永久性故障，始终排除
+            if status == "RATE_LIMITED" and until and until > now:
+                cooling.append((tid, until))
+                continue
+            if status == "RATE_LIMITED":
+                recovered.append(tid)
+            available.append((tid, last_used or 0.0))
+
+        pickable = [e for e in available if e[0] not in excluded] or available
+        if pickable:
+            if recovered:
+                conn.executemany(
+                    "UPDATE tokens SET status = 'ACTIVE', limited_until = NULL "
+                    "WHERE id = ?",
+                    [(tid,) for tid in recovered],
+                )
+                logger.info(
+                    "Token pool: cooldown expired, auto-recovered token(s) %s",
+                    recovered,
+                )
+            chosen = min(
+                pickable,
+                key=lambda e: (
+                    1 if _inflight.get(e[0], 0) >= TOKEN_CONCURRENCY_CAP else 0,
+                    _inflight.get(e[0], 0),
+                    e[1],
+                    e[0],
+                ),
+            )[0]
+            # 刷新上次选中时刻，使「最久未用」在从未被限流的账号上同样成立。
+            conn.execute("UPDATE tokens SET last_used = ? WHERE id = ?", (now, chosen))
+            conn.commit()
+            return chosen
+
+        if cooling:
+            return min(cooling, key=lambda e: (e[1], e[0]))[0]
+
+        row = conn.execute("SELECT id FROM tokens ORDER BY id LIMIT 1").fetchone()
+        return row[0] if row else None
     finally:
         conn.close()
 
@@ -1059,10 +1110,15 @@ def mark_limited(token_id):
 
 
 def mark_active(token_id):
+    """恢复账号为 ACTIVE，清除冷却截止时间并刷新上次选中时刻。
+
+    last_used 在此同步刷新，使调度器的「最久未用」并列定序在限流恢复后
+    不会把该账号立刻当成最旧候选。
+    """
     conn = get_db()
     conn.execute(
-        "UPDATE tokens SET status = ?, limited_until = NULL WHERE id = ?",
-        ("ACTIVE", token_id),
+        "UPDATE tokens SET status = ?, limited_until = NULL, last_used = ? WHERE id = ?",
+        ("ACTIVE", time.time(), token_id),
     )
     conn.commit()
     conn.close()

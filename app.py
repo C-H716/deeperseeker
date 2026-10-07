@@ -1826,24 +1826,30 @@ async def files_upload(request: Request):
     if not tok:
         return JSONResponse({"error": "Token not found"}, status_code=503)
     _set_key_name(tok.get("alias"))
-    form = await request.form()
-    file_obj = form.get("file")
-    if not file_obj:
-        return JSONResponse({"error": "No file provided"}, status_code=400)
-    file_bytes = await file_obj.read(25 * 1024 * 1024 + 1)
-    if len(file_bytes) > 25 * 1024 * 1024:
-        return JSONResponse({"error": "File too large"}, status_code=413)
-    filename = getattr(file_obj, "filename", "file.bin")
-    content_type = getattr(file_obj, "content_type", "application/octet-stream")
-    file_info = None
-    async for upload_status, data in upload_file(
-        file_bytes, filename, content_type, tok["token"]
-    ):
-        if upload_status == "success":
-            file_info = data
-            break
-    if not file_info:
-        return JSONResponse({"error": "Upload failed"}, status_code=500)
+    # 上传同样占用该 token 的一个在途名额：pick_token() 的负载均衡读取
+    # 这份计数，漏登记会让大文件上传期间的账号看起来仍然空闲。
+    lease = TokenLease(tok_id)
+    try:
+        form = await request.form()
+        file_obj = form.get("file")
+        if not file_obj:
+            return JSONResponse({"error": "No file provided"}, status_code=400)
+        file_bytes = await file_obj.read(25 * 1024 * 1024 + 1)
+        if len(file_bytes) > 25 * 1024 * 1024:
+            return JSONResponse({"error": "File too large"}, status_code=413)
+        filename = getattr(file_obj, "filename", "file.bin")
+        content_type = getattr(file_obj, "content_type", "application/octet-stream")
+        file_info = None
+        async for upload_status, data in upload_file(
+            file_bytes, filename, content_type, tok["token"]
+        ):
+            if upload_status == "success":
+                file_info = data
+                break
+        if not file_info:
+            return JSONResponse({"error": "Upload failed"}, status_code=500)
+    finally:
+        lease.release()
 
     if request.url.path.startswith("/v1/files/upload"):
         return {
@@ -1875,13 +1881,19 @@ async def files_content(file_id: str, request: Request):
     if not tok:
         return JSONResponse({"error": "Token not found"}, status_code=503)
     _set_key_name(tok.get("alias"))
-    gen = get_file_content(tok["token"], file_id)
+    # 仅在取回响应头的握手阶段占用在途名额：mime 到手后上游响应已建立，
+    # 后续分片下载直接从该连接读取，不再计入调度器的负载视图。
+    lease = TokenLease(tok_id)
     try:
-        mime = await gen.__anext__()
-    except StopAsyncIteration:
-        return JSONResponse({"error": "File not found"}, status_code=404)
-    except Exception:
-        return JSONResponse({"error": "File fetch failed"}, status_code=502)
+        gen = get_file_content(tok["token"], file_id)
+        try:
+            mime = await gen.__anext__()
+        except StopAsyncIteration:
+            return JSONResponse({"error": "File not found"}, status_code=404)
+        except Exception:
+            return JSONResponse({"error": "File fetch failed"}, status_code=502)
+    finally:
+        lease.release()
 
     async def stream_chunks():
         async for chunk in gen:
