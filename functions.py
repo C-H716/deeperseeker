@@ -1515,6 +1515,23 @@ def reset_cached_input(sig):
     _CACHED_INPUT_HISTORY.pop(sig, None)
 
 
+# 工具调用的包装标签名。格式漂移时，DSML 提取分支无法匹配工具名，会把包装
+# 标签名或其片段（如 "_call"、"|calls"）当作工具名外传，上层据此抛出
+# unknown tool。此集合用于在工具名的唯一出口处拦截并丢弃。
+_WRAPPER_TAG_NAMES = frozenset(
+    {
+        "calls",
+        "call",
+        "toolcall",
+        "toolcalls",
+        "functioncall",
+        "invoke",
+        "parameter",
+        "param",
+    }
+)
+
+
 def normalize_tool_call(tool_data_or_name, args_if_name=None):
     if isinstance(tool_data_or_name, str):
         name = tool_data_or_name
@@ -1555,6 +1572,16 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
 
     if not name or not isinstance(name, str):
         return None
+
+    # 黑名单拦截：包装标签名不是真实工具调用，直接丢弃，由调用方继续查找
+    # invoke 的真实 name= 属性。判定前先剥离分隔符，与 _WRAPPER_TAG_NAMES
+    # 的存储形态保持一致，避免分隔符被剔除后漏判。
+    probe = re.sub(r"[<>|｜_\-\s]", "", name).lower()
+    if probe.startswith("dsml"):
+        probe = probe[4:]
+    if not probe or probe in _WRAPPER_TAG_NAMES:
+        return None
+
     if isinstance(args, (dict, list)):
         args_str = json.dumps(args)
     elif isinstance(args, str):
@@ -1701,11 +1728,11 @@ def parse_tools(text):
 
     if not tools and "DSML" in text:
         dsml_block_pattern = re.compile(
-            r"<[｜\|]{2}DSML[｜\|]{2}([A-Za-z0-9_]+)>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}\1>|$)",
+            r"<[｜\|]{0,2}DSML[｜\|]{0,2}\s*([A-Za-z0-9_]+)>(.*?)(?:</[｜\|]{0,2}DSML[｜\|]{0,2}\s*\1>|$)",
             re.DOTALL | re.IGNORECASE,
         )
         param_pattern_b = re.compile(
-            r"<[｜\|]{2}DSML[｜\|]{2}B([A-Za-z0-9_]+)[^>]*>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}B.*?>|$)",
+            r"<[｜\|]{0,2}DSML[｜\|]{0,2}\s*B([A-Za-z0-9_]+)[^>]*>(.*?)(?:</[｜\|]{0,2}DSML[｜\|]{0,2}\s*B.*?>|$)",
             re.DOTALL | re.IGNORECASE,
         )
         for m in dsml_block_pattern.finditer(text):
@@ -1726,7 +1753,7 @@ def parse_tools(text):
                 tools.append(norm)
         if not tools:
             tool_match = re.search(
-                r"[｜\|]{2}DSML[｜\|]{2}(Bash|Read|Write|Edit|Agent|TaskList|TaskCreate|WebSearch|[A-Za-z0-9_]+)",
+                r"[｜\|]{0,2}DSML[｜\|]{0,2}\s*(Bash|Read|Write|Edit|Agent|TaskList|TaskCreate|WebSearch|[A-Za-z0-9_]+)",
                 text,
                 re.IGNORECASE,
             )
@@ -1751,12 +1778,12 @@ def parse_tools(text):
                 )
                 if cmd_match:
                     clean_cmd = re.sub(
-                        r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", cmd_match.group(1)
+                        r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*[^>]*>", "", cmd_match.group(1)
                     ).strip("\x22\x27() ")
                     args["command"] = clean_cmd
                 if desc_match:
                     clean_desc = re.sub(
-                        r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", desc_match.group(1)
+                        r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*[^>]*>", "", desc_match.group(1)
                     ).strip("\x22\x27() ")
                     args["description"] = clean_desc
                 norm = normalize_tool_call(tool_name, args)
@@ -1764,13 +1791,13 @@ def parse_tools(text):
                     tools.append(norm)
         if tools:
             clean_text = re.sub(
-                r"<[｜\|]{2}DSML[｜\|]{2}[^>]*>.*?(?:</[｜\|]{2}DSML[｜\|]{2}[^>]*>|$)",
+                r"<[｜\|]{0,2}DSML[｜\|]{0,2}\s*[^>]*>.*?(?:</[｜\|]{0,2}DSML[｜\|]{0,2}\s*[^>]*>|$)",
                 "",
                 clean_text,
                 flags=re.DOTALL | re.IGNORECASE,
             ).strip()
             clean_text = re.sub(
-                r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", clean_text, flags=re.IGNORECASE
+                r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*[^>]*>", "", clean_text, flags=re.IGNORECASE
             ).strip()
 
     if not tools:
@@ -1800,7 +1827,7 @@ def parse_tools(text):
 
     if not tools:
         tag_regex = re.compile(
-            r"<(?:tool_call|function_call)(?:\s+(?:name|tool|function)=[\x27\x22]([^\x27\x22]+)[\x27\x22])?\s*>",
+            r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_call|function_call)(?:\s+(?:name|tool|function)=[\x27\x22]([^\x27\x22]+)[\x27\x22])?\s*>",
             re.IGNORECASE,
         )
         decoder = json.JSONDecoder()
@@ -1817,7 +1844,7 @@ def parse_tools(text):
                         data, _ = decoder.raw_decode(json_substr)
                     if not data:
                         cleaned_json = re.sub(
-                            r"</?(?:tool_call|function_call|tool_calls|invoke)[^>]*>.*",
+                            r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_call|function_call|tool_calls|invoke)[^>]*>.*",
                             "",
                             json_substr,
                             flags=re.DOTALL,
@@ -1871,7 +1898,7 @@ def parse_tools(text):
                             if norm:
                                 tools.append(norm)
             clean_text = re.sub(
-                r"<(?:tool_call|function_call)[^>]*>.*?(?:</(?:tool_call|function_call)>|$)",
+                r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_call|function_call)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_call|function_call)>|$)",
                 "",
                 text,
                 flags=re.DOTALL,
