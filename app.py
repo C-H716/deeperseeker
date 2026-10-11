@@ -1456,6 +1456,7 @@ async def stream_response(
     lease=None,
 ):
     parser = StreamToolParser()
+    reasoning_filter = ReasoningMarkupFilter()
     full_text = ""
     is_thinking = False
     aborted = False
@@ -1478,10 +1479,14 @@ async def stream_response(
                 think_part = parts[0]
                 chunk = parts[1].lstrip("\n") if len(parts) > 1 else ""
                 if think_part:
-                    yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': think_part}}]})}\n\n"
+                    cleaned = reasoning_filter.feed(think_part)
+                    if cleaned:
+                        yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': cleaned}}]})}\n\n"
 
             if is_thinking and chunk:
-                yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': chunk}}]})}\n\n"
+                cleaned = reasoning_filter.feed(chunk)
+                if cleaned:
+                    yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': cleaned}}]})}\n\n"
                 continue
 
             if end_thinking and not chunk:
@@ -1556,6 +1561,9 @@ async def stream_response(
 
         if not aborted and not failed:
             try:
+                tail_reasoning = reasoning_filter.flush()
+                if tail_reasoning:
+                    yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': tail_reasoning}}]})}\n\n"
                 if not parsed_tools:
                     for r in parser.flush():
                         if "text" in r:
@@ -1618,6 +1626,7 @@ async def stream_anthropic_response(
     yield start_evt
 
     parser = StreamToolParser()
+    reasoning_filter = ReasoningMarkupFilter()
     full_text = ""
     text_block_started = False
     block_index = 0
@@ -1645,12 +1654,16 @@ async def stream_anthropic_response(
                 think_part = parts[0]
                 chunk = parts[1].lstrip("\n") if len(parts) > 1 else ""
                 if think_part:
-                    delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'thinking_delta', 'thinking': think_part}})}\n\n"
-                    yield delta_evt
+                    cleaned = reasoning_filter.feed(think_part)
+                    if cleaned:
+                        delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'thinking_delta', 'thinking': cleaned}})}\n\n"
+                        yield delta_evt
 
             if is_thinking and chunk:
-                delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'thinking_delta', 'thinking': chunk}})}\n\n"
-                yield delta_evt
+                cleaned = reasoning_filter.feed(chunk)
+                if cleaned:
+                    delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'thinking_delta', 'thinking': cleaned}})}\n\n"
+                    yield delta_evt
                 continue
 
             if end_thinking:
@@ -1744,6 +1757,9 @@ async def stream_anthropic_response(
 
         block_index_local = [block_index]
         tail_events = ""
+        tail_reasoning = reasoning_filter.flush()
+        if tail_reasoning:
+            tail_events += f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index_local[0], 'delta': {'type': 'thinking_delta', 'thinking': tail_reasoning}})}\n\n"
         if is_thinking:
             tail_events += f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index_local[0]})}\n\n"
             block_index_local[0] += 1

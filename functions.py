@@ -2019,6 +2019,108 @@ _STREAM_ENTRY_TAGS = ("tool_calls", "tool_call", "function_call", "invoke", "cal
 # 否则会被当成正文漏给客户端（见 _ORPHAN_CLOSER_RE 的说明）。
 _STREAM_CLOSER_TAGS = _STREAM_ENTRY_TAGS + ("param", "parameter")
 
+# 推理(reasoning)通道的标记入口。比工具入口多出 param/parameter：模型在思考
+# 中直接书写参数标签时不会有外层 invoke 包裹，漏掉这两个名字会让参数标签
+# 原样透传（app.py 的 reasoning 分支只做净化，不产出工具调用）。
+_REASONING_MARKUP_RE = re.compile(
+    r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*"
+    r"(tool_calls?|calls|function_call|invoke|param(?:eter)?)\b[^>]*>",
+    re.IGNORECASE,
+)
+
+
+# 未闭合块的缓冲上限。闭标签始终不到时按此上限丢弃并复位，避免异常流让
+# 缓冲无界增长；正常工具块远小于该值。
+_MAX_REASONING_BLOCK = 1 << 20
+
+
+def _markup_closer_re(tag_name):
+    """构造与 tag_name 配对的闭标签正则，容忍竖线与 DSML 装饰。"""
+    return re.compile(
+        r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*"
+        + re.escape(tag_name)
+        + r"\s*[｜\|]{0,2}>",
+        re.IGNORECASE,
+    )
+
+
+class ReasoningMarkupFilter:
+    """从推理(reasoning)分片中移除 DSML 工具标记。
+
+    parse_tools() 只作用于正文，因此推理通道会把模型在思考中写出的工具标记
+    原样透传给客户端，表现为思考内容里出现 ``｜｜DSML｜｜`` 一类的协议残留。
+    本过滤器复用正文同一套标签文法做净化，并处理两类分片边界：
+
+    ① 标签本身被切断——可能是标签前缀的尾部暂存到下一片再判定，判定依据
+       与 StreamToolParser 相同（_is_plausible_stream_entry_prefix 等）；
+    ② 开标签已到、闭标签未到——此时整段内容都属于待丢弃的块，必须一并丢弃。
+       若只删标签而保留内容，参数值会作为思考文本漏出，等于把泄漏换了个形态。
+
+    闭标签始终不到时缓冲按 _MAX_REASONING_BLOCK 上限丢弃并复位，避免异常流
+    造成无界增长；flush() 负责在流结束时释放残余。
+    """
+
+    def __init__(self):
+        self._buffer = ""
+        self._in_block = False
+        self._closer_re = None
+
+    def feed(self, chunk):
+        self._buffer += chunk
+        out = []
+        while True:
+            if self._in_block:
+                match = (
+                    self._closer_re.search(self._buffer) if self._closer_re else None
+                )
+                if match is None:
+                    # 只接受工具族闭标签：parameter/param 位于块内部，若在此
+                    # 收束，块内参数值会落到块外被当作思考文本输出。
+                    match = _TOOL_END_TAG_RE.search(self._buffer)
+                if match is None:
+                    if len(self._buffer) > _MAX_REASONING_BLOCK:
+                        # 闭标签始终未到：丢弃整块并复位，避免缓冲无限增长。
+                        self._buffer = ""
+                        self._in_block = False
+                        self._closer_re = None
+                    return "".join(out)
+                self._buffer = self._buffer[match.end() :]
+                self._in_block = False
+                self._closer_re = None
+                continue
+            match = _REASONING_MARKUP_RE.search(self._buffer)
+            if match:
+                out.append(_ORPHAN_CLOSER_RE.sub("", self._buffer[: match.start()]))
+                self._buffer = self._buffer[match.end() :]
+                self._in_block = True
+                self._closer_re = _markup_closer_re(match.group(1))
+                continue
+            last_lt = self._buffer.rfind("<")
+            if last_lt != -1:
+                tail = self._buffer[last_lt:]
+                if ">" not in tail and (
+                    _is_plausible_stream_entry_prefix(tail, _STREAM_CLOSER_TAGS)
+                    or _is_plausible_stream_closer_prefix(tail)
+                ):
+                    out.append(_ORPHAN_CLOSER_RE.sub("", self._buffer[:last_lt]))
+                    self._buffer = tail
+                    return "".join(out)
+            out.append(_ORPHAN_CLOSER_RE.sub("", self._buffer))
+            self._buffer = ""
+            return "".join(out)
+
+    def flush(self):
+        """释放流结束时的残余缓冲；未闭合的块内容一并丢弃。"""
+        buffered = self._buffer
+        was_in_block = self._in_block
+        self._buffer = ""
+        self._in_block = False
+        self._closer_re = None
+        if was_in_block:
+            # 块未闭合即流结束：缓冲内容属于待丢弃的工具标记，整体丢弃。
+            return ""
+        return _ORPHAN_CLOSER_RE.sub("", buffered)
+
 
 def _skip_bars(text, pos):
     for _ in range(2):

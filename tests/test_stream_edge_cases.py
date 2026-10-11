@@ -21,6 +21,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from functions import (  # noqa: E402
+    ReasoningMarkupFilter,
     StreamToolParser,
     _is_plausible_stream_closer_prefix,  # noqa: E402
     _is_plausible_stream_entry_prefix,
@@ -433,7 +434,73 @@ def test_dsml_openers_parse_when_split_across_chunks():
             assert flush_tools == [] and streamed + flush_text == "", where
 
 
+def test_reasoning_filter_strips_complete_dsml_block():
+    marker = chr(0xFF5C) * 2 + 'DSML' + chr(0xFF5C) * 2
+    corpus = ('先检查一下。'
+              + xml('[LT]' + marker + ' calls[GT]')
+              + xml('[LT]invoke name="Read"[GT]')
+              + xml('[LT]parameter name="file_path"[GT]/tmp/a[LT]/parameter[GT]')
+              + xml('[LT]/invoke[GT]')
+              + xml('[LT]/' + marker + ' calls[GT]')
+              + '然后继续。')
+    f = ReasoningMarkupFilter()
+    assert f.feed(corpus) == '先检查一下。然后继续。'
+    assert f.flush() == ''
+
+
+def test_reasoning_filter_never_leaks_across_chunk_boundaries():
+    marker = chr(0xFF5C) * 2 + 'DSML' + chr(0xFF5C) * 2
+    block = (xml('[LT]' + marker + ' invoke name="Bash"[GT]')
+             + xml('[LT]parameter name="command"[GT]rm -rf /[LT]/parameter[GT]')
+             + xml('[LT]/invoke[GT]'))
+    corpus = '头' + block + '尾'
+    for size in (1, 2, 3, 5, 7):
+        f = ReasoningMarkupFilter()
+        out = []
+        for i in range(0, len(corpus), size):
+            out.append(f.feed(corpus[i:i + size]))
+        out.append(f.flush())
+        assert ''.join(out) == '头尾', (size, ''.join(out))
+
+
+def test_reasoning_filter_drops_unclosed_block_body():
+    f = ReasoningMarkupFilter()
+    assert f.feed(xml('[LT]invoke name="Bash"[GT]')) == ''
+    assert f.feed('rm -rf /') == ''
+    assert f.flush() == ''
+
+
+def test_reasoning_filter_keeps_ordinary_angle_bracket_prose():
+    cases = ['if x < y then a > b', '比较 1 < b 与 1 < c', 'use <tool_ in prose', 'a</tool_x', '1 < cat']
+    for corpus in cases:
+        f = ReasoningMarkupFilter()
+        out = f.feed(corpus) + f.flush()
+        assert out == corpus, (corpus, out)
+
+
+def test_reasoning_filter_flush_releases_held_prefix():
+    f = ReasoningMarkupFilter()
+    assert f.feed('hi < ') == 'hi '
+    assert f.flush() == '< '
+
+
+def test_reasoning_filter_handles_halfwidth_and_bare_variants():
+    for decor in ('||DSML||', '|', '', chr(0xFF5C)):
+        for spacing in ('', ' '):
+            opener = xml('[LT]' + decor + spacing + 'invoke name="Read"[GT]')
+            closer = xml('[LT]/' + decor + spacing + 'invoke[GT]')
+            corpus = '前' + opener + '中间' + closer + '后'
+            f = ReasoningMarkupFilter()
+            assert f.feed(corpus) + f.flush() == '前后', (decor, spacing)
+
+
 TESTS = [
+    test_reasoning_filter_strips_complete_dsml_block,
+    test_reasoning_filter_never_leaks_across_chunk_boundaries,
+    test_reasoning_filter_drops_unclosed_block_body,
+    test_reasoning_filter_keeps_ordinary_angle_bracket_prose,
+    test_reasoning_filter_flush_releases_held_prefix,
+    test_reasoning_filter_handles_halfwidth_and_bare_variants,
     test_fix1_flush_salvages_attribute_style_tool,
     test_fix1_flush_salvages_truncated_json_tool,
     test_fix1_flush_drops_wrapper_noise_after_json,
