@@ -46,7 +46,7 @@ FACT_MEMORY_TOKENS = int(os.getenv("DEEPSEEKER_FACT_MEMORY_TOKENS", "1800"))
 # ``auto`` follows the latest user turn; an explicit value is useful when a
 # client (such as OpenCode) has an English-only system prompt but the user
 # expects Chinese reasoning and answers.
-PROMPT_LANGUAGE = os.getenv("DEEPSEEKER_PROMPT_LANGUAGE", "auto").strip().lower()
+PROMPT_LANGUAGE = os.getenv("DEEPSEEKER_PROMPT_LANGUAGE", "auto").strip()
 
 
 def context_window_tokens():
@@ -172,7 +172,7 @@ def _text_content(message):
 
 def detect_prompt_language(messages):
     """Choose the language that should govern reasoning, tool narration, and the answer."""
-    if PROMPT_LANGUAGE not in ("", "auto", "default"):
+    if PROMPT_LANGUAGE.lower() not in ("", "auto", "default"):
         return PROMPT_LANGUAGE
     latest = ""
     for message in reversed(messages or []):

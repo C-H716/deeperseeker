@@ -888,6 +888,7 @@ def test_handle_chat_retry_surrenders_lock_before_recursing():
             thinking=False,
             search=False,
             file_ids_=None,
+            search_sink=None,
         ):
             # send_message is an async-generator function: called un-awaited,
             # its body starts at the first __anext__ (inside _preflight_stream)
