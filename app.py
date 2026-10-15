@@ -333,6 +333,22 @@ app.mount(
 )
 
 
+def _static_version() -> str:
+    """用 style.css 的 mtime 作为缓存版本号。
+
+    StaticFiles 不发送 Cache-Control，浏览器会按 Last-Modified 做启发式缓存；
+    样式表 URL 固定不变时，即便镜像已重建，旧页面仍会沿用缓存的旧样式。
+    在 URL 上挂版本号可强制浏览器重新拉取，无需用户手动强刷。
+    """
+    try:
+        return str(int(os.path.getmtime(os.path.join(BASE_DIR, "static", "style.css"))))
+    except OSError:
+        return "0"
+
+
+templates.env.globals["static_version"] = _static_version()
+
+
 @app.middleware("http")
 async def limit_body_size(request: Request, call_next):
     _key_holder.set({})
