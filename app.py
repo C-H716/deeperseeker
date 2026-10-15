@@ -40,6 +40,7 @@ security = HTTPBasic()
 
 from functions import (  # noqa: E402
     CookieGenerationError,
+    ReasoningMarkupFilter,
     StreamToolParser,
     TokenLease,
     add_token,
