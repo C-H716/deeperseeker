@@ -114,6 +114,20 @@ API_KEY, _api_key_generated = _resolve_api_key()
 ADMIN_USER = os.getenv("DEEPSEEKER_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("DEEPSEEKER_ADMIN_PASSWORD", "admin")
 
+from usage_stats import (
+    RANGE_LABELS,
+    aggregate,
+    beijing_now,
+    build_heatmap,
+    cost_of_hour,
+    earliest_day,
+    hit_rate_series,
+    hour_key,
+    query_hours,
+    record_usage,
+    resolve_range,
+)
+
 from middleware import RealIPMiddleware, RecovererMiddleware, RequestIDMiddleware
 from plugin_helper import (
     MAX_SUMMARY_TOKENS,
@@ -252,6 +266,58 @@ def count_tok(text):
     # 走内容缓存：同一轮请求里 messages 不变，_messages_text() 的结果会被统计
     # 多次（上下文估算、usage 上报、成本计算），缓存让整次分词只发生一次。
     return count_tokens_cached(text)
+
+
+async def _record_response_usage(result, model, token_id, scope, req_model=None):
+    """从 handle_chat 的返回值里取 usage 并落库。
+
+    返回值不一定是 chat.completion 字典——上游失败时 handle_chat 会直接回
+    JSONResponse 之类，此时无用量可记，静默跳过即可。
+
+    @param req_model 客户端请求的原始模型名。落库要用它而不是归一后的
+        model，否则统计页的「按模型 / 按服务商」拆分只剩一个值。
+    """
+    if not isinstance(result, dict):
+        return
+    usage = result.get("usage")
+    if not isinstance(usage, dict):
+        return
+    await _record_usage(
+        model,
+        token_id,
+        scope,
+        usage.get("prompt_tokens", 0),
+        usage.get("completion_tokens", 0),
+        (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
+        req_model=req_model,
+    )
+
+
+async def _record_usage(
+    model, token_id, scope, in_tokens, out_tokens, cached_tokens=0, req_model=None
+):
+    """把一次成功调用的用量累加进小时桶。
+
+    统计是旁路：任何异常都只记日志、绝不冒泡，否则一次落库失败会连带
+    把已经生成好的响应打成 500。走 _db 是为了不在事件循环里做同步
+    SQLite 写（与其它 store 调用一致）。
+
+    落库的 model 优先取客户端原始模型名（``provider/model`` 或裸名），
+    归一后的 ``model`` 只在客户端没给名字时兜底——usage_stats 的
+    provider_of / model_name_of 依赖原始名做归因。
+    """
+    try:
+        await _db(
+            record_usage,
+            model=req_model or model,
+            token_id=token_id,
+            api_key=scope or "",
+            input_tokens=in_tokens,
+            output_tokens=out_tokens,
+            cache_read_tokens=cached_tokens,
+        )
+    except Exception:
+        logger.exception("usage record failed")
 
 
 TOKEN_CHECK_INTERVAL = int(os.getenv("DEEPSEEKER_TOKEN_CHECK_INTERVAL", "300"))
@@ -1004,7 +1070,7 @@ async def handle_chat(
                         rot_lease.release()
                         in_tokens = count_tok(_messages_text(messages))
                         _remember_prompt_tokens(next_sig, in_tokens)
-                        return format_response(
+                        result = format_response(
                             resp_text,
                             model,
                             messages,
@@ -1012,6 +1078,12 @@ async def handle_chat(
                             cached_tokens=_cached_prompt_tokens(sig, in_tokens),
                             prompt_tokens=in_tokens,
                         )
+                        # 轮换后的非流式分支同样要落库：这次调用跑在 new_token_id
+                        # 上，若漏记，号池里换过账号的请求就会整段消失在统计里。
+                        await _record_response_usage(
+                            result, model, new_token_id, scope, req_model
+                        )
+                        return result
             return JSONResponse(
                 {
                     "error": {
@@ -1256,6 +1328,7 @@ async def handle_chat(
                     session_id,
                     sig,
                     tools,
+                    req_model,
                     parent_message_id,
                     scope,
                     lease=lease,
@@ -1298,7 +1371,7 @@ async def handle_chat(
             )
             in_tokens = count_tok(_messages_text(messages))
             _remember_prompt_tokens(next_sig, in_tokens)
-            return format_response(
+            result = format_response(
                 resp_text,
                 model,
                 messages,
@@ -1306,6 +1379,8 @@ async def handle_chat(
                 cached_tokens=_cached_prompt_tokens(sig, in_tokens),
                 prompt_tokens=in_tokens,
             )
+            await _record_response_usage(result, model, token_id, scope, req_model)
+            return result
     except asyncio.CancelledError:
         # B2（Stage 1 审计）：客户端在请求中途断开时，本次交换从未在上游完成，
         # 已保存的 parent_message_id 会使下一轮从错误的分支继续，从而分叉会话。
@@ -1468,6 +1543,7 @@ async def stream_response(
     session_id,
     sig,
     tools,
+    req_model=None,
     parent_message_id=0,
     scope="",
     lease=None,
@@ -1611,6 +1687,15 @@ async def stream_response(
                 cached_tokens = _cached_prompt_tokens(sig, in_tokens)
                 if not failed:
                     _remember_prompt_tokens(next_sig, in_tokens)
+                await _record_usage(
+                    model,
+                    token_id,
+                    scope,
+                    in_tokens,
+                    out_tokens,
+                    cached_tokens,
+                    req_model=req_model,
+                )
                 yield f"data: {json.dumps({'choices': [], 'usage': {'prompt_tokens': in_tokens, 'completion_tokens': out_tokens, 'total_tokens': in_tokens + out_tokens, 'prompt_tokens_details': {'cached_tokens': cached_tokens}}})}\n\n"
                 yield "data: [DONE]\n\n"
             except asyncio.CancelledError:
@@ -1812,6 +1897,15 @@ async def stream_anthropic_response(
         )
 
         if not aborted and not failed:
+            await _record_usage(
+                model,
+                token_id,
+                scope,
+                in_tokens,
+                out_tokens,
+                cached_tokens,
+                req_model=req_model,
+            )
             try:
                 for evt in tail_events.split("\n\n"):
                     if evt.strip():
@@ -1843,8 +1937,6 @@ def _completion_usage_text(clean_text, parsed_tools):
 def format_response(
     text, model, messages, tools=None, cached_tokens=0, prompt_tokens=None
 ):
-    from functions import DEEPSEEK_TARIFFS
-
     parsed_tools, clean_text = parse_tools(text)
 
     reasoning = None
@@ -1869,10 +1961,16 @@ def format_response(
     # to pay for.
     usage_text = _completion_usage_text(clean_text, parsed_tools)
     out_tokens = count_tok(usage_text) if usage_text else 0
-    tariff = DEEPSEEK_TARIFFS["deepseek-v4.1-flash"]
-    cost = (in_tokens / 1_000_000 * tariff["cache_miss_input"]) + (
-        out_tokens / 1_000_000 * tariff["output_generation"]
+    # 计价与 /stats 面板同源：输入拆缓存命中/未命中，且按当前时刻的峰谷档取价。
+    # 这里是非流式的最终响应，只能按「生成完成的这一刻」定档；面板的逐小时
+    # 聚合仍以采样落库时的小时键为准，两者对同一小时不会给出不同档位。
+    cache_miss = max(0, in_tokens - cached_tokens)
+    charge = cost_of_hour(
+        model,
+        {"cache_hit": cached_tokens, "cache_miss": cache_miss, "output": out_tokens},
+        hour_key(beijing_now()),
     )
+    cost = charge["total"]
 
     msg_dict = {
         "role": "assistant",
@@ -2236,7 +2334,14 @@ async def chat_completions(request: Request):
     stream = body.get("stream", False)
     tools = body.get("tools", None)
     return await handle_chat(
-        messages, model, thinking, search, stream, tools, scope=get_api_key(request)
+        messages,
+        model,
+        thinking,
+        search,
+        stream,
+        tools,
+        req_model=body.get("model"),
+        scope=get_api_key(request),
     )
 
 
@@ -2661,7 +2766,14 @@ async def openai_responses(request: Request):
     tools = body.get("tools", None)
 
     result = await handle_chat(
-        messages, model, thinking, search, stream, tools, scope=get_api_key(request)
+        messages,
+        model,
+        thinking,
+        search,
+        stream,
+        tools,
+        req_model=body.get("model"),
+        scope=get_api_key(request),
     )
 
     if stream:
@@ -3033,6 +3145,90 @@ async def dashboard(request: Request):
             "account_message": account_message,
             "token_check_state": _token_check_state,
             "check_interval": TOKEN_CHECK_INTERVAL,
+        },
+    )
+
+
+# 图表降采样阈值：小时点超过这个数（约 30 天及以上区间）就退回按天聚合，
+# 否则 Chart.js 要在页面上画上千根柱子，渲染会明显卡顿。
+CHART_MAX_HOUR_POINTS = 720
+
+
+def _chart_series(stats, from_hour):
+    """挑图表的出点粒度，返回 (序列, "hour" / "day")。
+
+    24 小时窗口逐小时出点才能还原峰谷两档；再长的区间按小时出点会把
+    图挤成一团，超过 CHART_MAX_HOUR_POINTS 就改用逐日序列。
+    """
+    if from_hour and len(stats["hourly"]) <= CHART_MAX_HOUR_POINTS:
+        return stats["hourly"], "hour"
+    return stats["daily"], "day"
+
+
+def _chart_from_stats(stats, from_hour):
+    """把区间统计折成 Chart.js 需要的多序列。
+
+    峰谷两档成本各自成列、叠成同一根柱，便于一眼看出高峰时段多花的钱；
+    token 按输入（未缓存）/ 输出 / 缓存读拆三条折线走右轴，与顶部卡片的
+    口径一致（缓存写不单独出线，它已计入区间总量）。
+
+    命中率序列也在这里出：本函数才知道图表最终采用哪个粒度，模板不该
+    自己再按分母算一遍。
+
+    @param from_hour 区间是否为滚动 24 小时窗口（resolve_range 的小时下界
+        非 None）。只有它才值得逐小时出点，其余区间一律按天。
+    """
+    series, granularity = _chart_series(stats, from_hour)
+    if granularity == "hour":
+        labels = [s["hour"][11:] + ":00" for s in series]
+    else:
+        labels = [s["day"][5:] for s in series]
+    hit_rate = [round(v, 6) for v in hit_rate_series(series)]
+    return {
+        "labels": labels,
+        "cost_peak": [round(s["cost_peak"], 6) for s in series],
+        "cost_off_peak": [round(s["cost_off_peak"], 6) for s in series],
+        "input": [s["cache_miss"] for s in series],
+        "output": [s["output"] for s in series],
+        "cache_read": [s["cache_hit"] for s in series],
+        "cache_hit_rate": hit_rate,
+        "granularity": granularity,
+    }
+
+
+@app.get("/stats", response_class=HTMLResponse)
+async def stats_page(request: Request):
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    # resolve_range 读的是 parse_qs 形状（值一律是列表），QueryParams 直接转过去会
+    # 拿到裸字符串，故在这里包一层。
+    params = {k: [v] for k, v in request.query_params.items()}
+    # 「全部」预设的起点只能从库里读：resolve_range 是纯函数，读不到库，
+    # 所以先取最早一天再喂给它。
+    earliest = await _db(earliest_day)
+    from_day, to_day, from_hour, to_hour = resolve_range(params, earliest)
+    if from_hour:
+        rows = await _db(query_hours, from_hour, to_hour)
+    else:
+        rows = await _db(query_hours, from_day + "T00", to_day + "T23")
+    # 号池成员用别名显示，别名为空才退回 "Token #id"。
+    tokens = await _db(get_tokens)
+    labels = {
+        "tokens": {t["id"]: (t["alias"] or f"Token #{t['id']}") for t in tokens},
+        "keys": {},
+    }
+    stats = aggregate(rows, from_day, to_day, labels)
+    return templates.TemplateResponse(
+        request,
+        "stats.html",
+        {
+            "stats": stats,
+            "chart": _chart_from_stats(stats, bool(from_hour)),
+            "heatmap": build_heatmap(stats["daily"], from_day, to_day),
+            "range_preset": params.get("range", ["30"])[0],
+            "range_labels": RANGE_LABELS,
         },
     )
 

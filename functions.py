@@ -12,7 +12,7 @@ import sqlite3
 import string
 import time
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import deepseek_tokenizer
@@ -130,6 +130,27 @@ def init_db():
             token_id INTEGER,
             created_at REAL
         );
+        -- Token usage samples. One row per (hour, model, token, api key):
+        -- hours, not days, because DeepSeek bills input and output at double
+        -- the rate inside its peak windows and those boundaries fall on whole
+        -- hours (see usage_stats.py) — a daily row cannot reconstruct the
+        -- tier of each call. token_id -1 and '' stand for "unknown" so the
+        -- primary key never sees a NULL (SQLite treats NULLs as distinct,
+        -- which would let the same bucket be inserted twice).
+        CREATE TABLE IF NOT EXISTS usage_hours (
+            hour TEXT NOT NULL,
+            model TEXT NOT NULL,
+            token_id INTEGER NOT NULL DEFAULT -1,
+            api_key TEXT NOT NULL DEFAULT '',
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+            requests INTEGER NOT NULL DEFAULT 0,
+            last_seen REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY (hour, model, token_id, api_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_usage_hours_hour ON usage_hours(hour);
     """)
     # Keep existing Docker volumes compatible with the token health metadata.
     token_columns = {
@@ -1429,14 +1450,9 @@ def get_file_token(file_id):
 # for v4.1flash, this constant is the single place to set it.
 DEFAULT_MODEL_TYPE = None
 
-# Flat peak-hour rates (per 1M tokens) for the single default model,
-# per https://api-docs.deepseek.com/quick_start/pricing
-DEEPSEEK_TARIFFS = {
-    "deepseek-v4.1-flash": {
-        "cache_miss_input": 0.44,
-        "output_generation": 1.32,
-    },
-}
+# 单价表已迁至 usage_stats.PRICING：按「缓存命中 / 缓存未命中 / 输出」三档、
+# 高峰与低峰两档计价，由 format_response 的成本字段与 /stats 面板共用同一份
+# 定义，避免两处价格表各自漂移。
 
 
 def count_tokens(text, model="deepseek-v4.1-flash"):
