@@ -45,6 +45,7 @@ from functions import (  # noqa: E402
     TokenLease,
     add_token,
     check_token_status,
+    close_session,
     cookie_file_path,
     count_tokens_cached,
     create_new_chat,
@@ -114,20 +115,6 @@ API_KEY, _api_key_generated = _resolve_api_key()
 ADMIN_USER = os.getenv("DEEPSEEKER_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("DEEPSEEKER_ADMIN_PASSWORD", "admin")
 
-from usage_stats import (
-    RANGE_LABELS,
-    aggregate,
-    beijing_now,
-    build_heatmap,
-    cost_of_hour,
-    earliest_day,
-    hit_rate_series,
-    hour_key,
-    query_hours,
-    record_usage,
-    resolve_range,
-)
-
 from middleware import RealIPMiddleware, RecovererMiddleware, RequestIDMiddleware
 from plugin_helper import (
     MAX_SUMMARY_TOKENS,
@@ -141,6 +128,19 @@ from plugin_helper import (
     max_output_tokens,
     needs_rollover,
     strip_summary_tags,
+)
+from usage_stats import (
+    RANGE_LABELS,
+    aggregate,
+    beijing_now,
+    build_heatmap,
+    cost_of_hour,
+    earliest_day,
+    hit_rate_series,
+    hour_key,
+    query_hours,
+    record_usage,
+    resolve_range,
 )
 
 logger = logging.getLogger("uvicorn.error")
@@ -390,6 +390,9 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Token health-check task stopped with an error")
         _token_check_task = None
+    # Stage 1 次要项：释放共享 aiohttp ClientSession，避免关闭阶段泄漏其
+    # connector 套接字。
+    await close_session()
 
 
 app = FastAPI(title="DeeperSeeker", lifespan=lifespan)
@@ -782,6 +785,8 @@ async def handle_chat(
     search_sink=None,
     _attempt=0,
     _exclude_token=None,
+    is_responses=False,
+    response_opts=None,
 ):
     auth_token = await _db(get_auth_token)
     if not auth_token:
@@ -807,8 +812,31 @@ async def handle_chat(
                 estimated_context > rollover_limit,
             )
 
-    sig = await generate_signature(messages, model, scope)
+    # Responses 协议要求 previous_response_id 续接上一轮，且首轮不得按消息内容
+    # 派生签名：客户端可能只发增量输入，内容签名无法命中已存会话，会导致每轮
+    # 都新开一条上游 chat。因此首轮直接以响应 id 作签名，续接轮再回退查找。
+    has_prior_turn = any(
+        m.get("role") in ("assistant", "tool") for m in messages
+    ) or bool(
+        isinstance(response_opts, dict) and response_opts.get("previous_response_id")
+    )
+    if (
+        is_responses
+        and not has_prior_turn
+        and isinstance(response_opts, dict)
+        and response_opts.get("_resp_id")
+    ):
+        sig = str(response_opts["_resp_id"])
+    else:
+        sig = await generate_signature(messages, model, scope)
     sess = await _db(find_session, sig)
+    if (
+        not sess
+        and is_responses
+        and isinstance(response_opts, dict)
+        and response_opts.get("previous_response_id")
+    ):
+        sess = await _db(find_session, str(response_opts["previous_response_id"]))
     # A concurrent request may already have migrated this exact signature.
     # Reuse its handoff summary when sending the first turn on the new chat.
     rollover_summary = ROLLOVER_HANDOFFS.get(sig)
@@ -966,6 +994,8 @@ async def handle_chat(
                             scope,
                             search_sink=search_sink,
                             _attempt=_attempt + 1,
+                            is_responses=is_responses,
+                            response_opts=response_opts,
                         )
                     if stream:
                         gen = _release_chat_lock_stream(gen, rot_owner)
@@ -984,6 +1014,25 @@ async def handle_chat(
                                     req_model,
                                     0,
                                     scope,
+                                    lease=rot_lease,
+                                ),
+                                media_type="text/event-stream",
+                                background=BackgroundTask(rot_lease.release),
+                            )
+                        if is_responses:
+                            return StreamingResponse(
+                                stream_responses_response(
+                                    gen,
+                                    model,
+                                    messages,
+                                    new_token_id,
+                                    new_session_id,
+                                    sig,
+                                    tools,
+                                    req_model,
+                                    0,
+                                    scope,
+                                    response_opts,
                                     lease=rot_lease,
                                 ),
                                 media_type="text/event-stream",
@@ -1029,6 +1078,8 @@ async def handle_chat(
                                 scope,
                                 search_sink=search_sink,
                                 _attempt=_attempt + 1,
+                                is_responses=is_responses,
+                                response_opts=response_opts,
                             )
                         await _db(mark_active, new_token_id)
 
@@ -1065,6 +1116,20 @@ async def handle_chat(
                             new_session_id,
                             next_parent(0),
                         )
+                        if (
+                            is_responses
+                            and isinstance(response_opts, dict)
+                            and response_opts.get("_resp_id")
+                        ):
+                            r_id = response_opts["_resp_id"]
+                            await _db(
+                                save_session,
+                                r_id,
+                                new_token_id,
+                                new_session_id,
+                                next_parent(0),
+                            )
+                            _store_response_history(r_id, next_messages)
                         if rot_owner is not None:
                             rot_owner.release()
                         rot_lease.release()
@@ -1319,6 +1384,25 @@ async def handle_chat(
                     media_type="text/event-stream",
                     background=BackgroundTask(lease.release),
                 )
+            if is_responses:
+                return StreamingResponse(
+                    stream_responses_response(
+                        gen,
+                        model,
+                        messages,
+                        token_id,
+                        session_id,
+                        sig,
+                        tools,
+                        req_model,
+                        parent_message_id,
+                        scope,
+                        response_opts,
+                        lease=lease,
+                    ),
+                    media_type="text/event-stream",
+                    background=BackgroundTask(lease.release),
+                )
             return StreamingResponse(
                 stream_response(
                     gen,
@@ -1369,6 +1453,20 @@ async def handle_chat(
                 session_id,
                 next_parent(parent_message_id),
             )
+            if (
+                is_responses
+                and isinstance(response_opts, dict)
+                and response_opts.get("_resp_id")
+            ):
+                r_id = response_opts["_resp_id"]
+                await _db(
+                    save_session,
+                    r_id,
+                    token_id,
+                    session_id,
+                    next_parent(parent_message_id),
+                )
+                _store_response_history(r_id, next_messages)
             in_tokens = count_tok(_messages_text(messages))
             _remember_prompt_tokens(next_sig, in_tokens)
             result = format_response(
@@ -1423,6 +1521,8 @@ async def handle_chat(
                 search_sink=search_sink,
                 _attempt=_attempt + 1,
                 _exclude_token=token_id,
+                is_responses=is_responses,
+                response_opts=response_opts,
             )
 
         logger.exception(
@@ -1465,6 +1565,8 @@ async def handle_chat(
             search_sink=search_sink,
             _attempt=_attempt + 1,
             _exclude_token=token_id,
+            is_responses=is_responses,
+            response_opts=response_opts,
         )
     finally:
         if not lock_transferred:
@@ -2322,11 +2424,40 @@ def resolve_model(model_raw):
     return SINGLE_MODEL
 
 
+async def _json_body(request: Request):
+    """以 JSON 解析请求体；空体或畸形载荷属于客户端错误。
+
+    Stage 1 次要项：补全端点此前直接调用 request.json()，因此空请求体或非法
+    JSON 会上报为 500——把客户端错误报告成服务端故障，并触发服务端告警。
+    """
+    try:
+        raw = await request.body()
+    except Exception:
+        raise HTTPException(
+            status_code=400, detail="Unable to read request body"
+        ) from None
+    if not raw or not raw.strip():
+        raise HTTPException(
+            status_code=400, detail="Empty request body; expected a JSON object"
+        )
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400, detail="Invalid JSON in request body"
+        ) from None
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=400, detail="Request body must be a JSON object"
+        )
+    return body
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
-    body = await request.json()
+    body = await _json_body(request)
     messages = body.get("messages", [])
     model = resolve_model(body.get("model"))
     thinking = is_thinking_enabled(body, request)
@@ -2345,425 +2476,936 @@ async def chat_completions(request: Request):
     )
 
 
-def _responses_content_to_chat(content):
-    """Convert Responses API content parts into the bridge's chat format."""
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
+_response_history = OrderedDict()
+RESPONSE_HISTORY_MAX = 2048
+GENERIC_RESPONSE_ERROR = "An internal error occurred while generating the response."
 
-    converted = []
-    for part in content:
-        if isinstance(part, str):
-            converted.append({"type": "text", "text": part})
+
+def _store_response_history(resp_id, msgs):
+    if not resp_id:
+        return
+    copied = [dict(m) for m in msgs]
+    _response_history[resp_id] = copied
+    _response_history.move_to_end(resp_id)
+    while len(_response_history) > RESPONSE_HISTORY_MAX:
+        _response_history.popitem(last=False)
+
+
+def _normalize_responses_tools(tools):
+    if not isinstance(tools, list):
+        return []
+    out = []
+    for t in tools:
+        if not isinstance(t, dict):
             continue
-        if not isinstance(part, dict):
-            continue
-        part_type = part.get("type")
-        if part_type in {"input_text", "output_text", "text"}:
-            converted.append({"type": "text", "text": part.get("text", "")})
-        elif part_type == "input_image":
-            if part.get("image_url"):
-                converted.append(
-                    {"type": "image_url", "image_url": {"url": part["image_url"]}}
-                )
-            elif part.get("file_id"):
-                converted.append(
+        if t.get("type") == "function":
+            fn = t.get("function") if isinstance(t.get("function"), dict) else t
+            strict_val = fn.get("strict", t.get("strict"))
+            out.append(
+                {
+                    "type": "function",
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description"),
+                    "parameters": fn.get(
+                        "parameters",
+                        fn.get("input_schema", {"type": "object", "properties": {}}),
+                    ),
+                    "strict": strict_val if isinstance(strict_val, bool) else True,
+                }
+            )
+        else:
+            out.append(t)
+    return out
+
+
+def _responses_usage(in_tokens, out_tokens):
+    return {
+        "input_tokens": in_tokens,
+        "input_tokens_details": {
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+        },
+        "output_tokens": out_tokens,
+        "output_tokens_details": {
+            "reasoning_tokens": 0,
+        },
+        "total_tokens": in_tokens + out_tokens,
+    }
+
+
+def _responses_effort(opts):
+    reasoning_cfg = opts.get("reasoning")
+    effort = reasoning_cfg.get("effort") if isinstance(reasoning_cfg, dict) else None
+    if effort is None and isinstance(reasoning_cfg, str):
+        effort = reasoning_cfg
+    if effort is None:
+        for key in ("reasoning_effort", "effort"):
+            candidate = opts.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                effort = candidate
+                break
+    if isinstance(effort, str) and effort.strip().lower() in (
+        "minimal",
+        "low",
+        "medium",
+        "high",
+    ):
+        return effort.strip().lower()
+    return None
+
+
+def _build_response_object(
+    resp_id,
+    created_at,
+    model,
+    output,
+    status="completed",
+    usage=None,
+    completed_at=None,
+    error=None,
+    opts=None,
+):
+    opts = opts if isinstance(opts, dict) else {}
+    reasoning_cfg = opts.get("reasoning")
+    effort = _responses_effort(opts)
+    if isinstance(reasoning_cfg, dict):
+        reasoning_obj = {
+            "effort": effort,
+            "summary": reasoning_cfg.get("summary"),
+        }
+    else:
+        reasoning_obj = {
+            "effort": effort,
+            "summary": None,
+        }
+    text_cfg = opts.get("text")
+    if not isinstance(text_cfg, dict) or not isinstance(text_cfg.get("format"), dict):
+        text_cfg = {"format": {"type": "text"}}
+    metadata = opts.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    parallel_tc = opts.get("parallel_tool_calls")
+    if not isinstance(parallel_tc, bool):
+        parallel_tc = True
+    store_val = opts.get("store")
+    if not isinstance(store_val, bool):
+        store_val = True
+    temp_val = opts.get("temperature")
+    temp_val = float(temp_val) if isinstance(temp_val, (int, float)) else 1.0
+    top_p_val = opts.get("top_p")
+    top_p_val = float(top_p_val) if isinstance(top_p_val, (int, float)) else 1.0
+    top_logprobs = opts.get("top_logprobs")
+    top_logprobs = top_logprobs if isinstance(top_logprobs, int) else 0
+    truncation = opts.get("truncation")
+    if truncation not in ("auto", "disabled"):
+        truncation = "disabled"
+    background = opts.get("background")
+    if not isinstance(background, bool):
+        background = False
+    return {
+        "id": resp_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": status,
+        "completed_at": completed_at,
+        "background": background,
+        "error": error,
+        "incomplete_details": None,
+        "instructions": opts.get("instructions"),
+        "max_output_tokens": opts.get("max_output_tokens"),
+        "max_tool_calls": opts.get("max_tool_calls"),
+        "model": model,
+        "output": output,
+        "parallel_tool_calls": parallel_tc,
+        "previous_response_id": opts.get("previous_response_id"),
+        "reasoning": reasoning_obj,
+        "service_tier": opts.get("service_tier") or "default",
+        "store": store_val,
+        "temperature": temp_val,
+        "text": text_cfg,
+        "tool_choice": (
+            opts.get("tool_choice") if opts.get("tool_choice") is not None else "auto"
+        ),
+        "tools": _normalize_responses_tools(opts.get("tools")),
+        "top_logprobs": top_logprobs,
+        "top_p": top_p_val,
+        "truncation": truncation,
+        "usage": usage,
+        "user": opts.get("user"),
+        "metadata": metadata,
+    }
+
+
+def format_responses_response(result, model=None, opts=None):
+    choice = result["choices"][0]
+    msg = choice["message"]
+    output = []
+
+    if msg.get("reasoning_content"):
+        output.append(
+            {
+                "id": f"rs_{uuid.uuid4().hex}",
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [
                     {
-                        "type": "image",
-                        "source": {"type": "file", "file_id": part["file_id"]},
+                        "type": "summary_text",
+                        "text": msg["reasoning_content"],
+                    }
+                ],
+            }
+        )
+
+    tool_calls = msg.get("tool_calls") or []
+    content_text = msg.get("content")
+    if content_text is not None or not tool_calls:
+        output.append(
+            {
+                "id": f"msg_{uuid.uuid4().hex}",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": content_text or "",
+                        "annotations": [],
+                        "logprobs": [],
+                    }
+                ],
+            }
+        )
+
+    for tc in tool_calls:
+        fn = tc.get("function", {})
+        raw_args = fn.get("arguments", "{}")
+        args_str = raw_args if isinstance(raw_args, str) else json.dumps(raw_args)
+        output.append(
+            {
+                "id": f"fc_{uuid.uuid4().hex}",
+                "type": "function_call",
+                "status": "completed",
+                "call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                "name": fn.get("name", ""),
+                "arguments": args_str,
+            }
+        )
+
+    raw_usage = result.get("usage", {})
+    in_tokens = raw_usage.get("prompt_tokens", raw_usage.get("input_tokens", 0))
+    out_tokens = raw_usage.get("completion_tokens", raw_usage.get("output_tokens", 0))
+    preset_id = opts.get("_resp_id") if isinstance(opts, dict) else None
+    raw_id = str(result.get("id", ""))
+    if preset_id:
+        resp_id = preset_id
+    elif raw_id.startswith("resp_"):
+        resp_id = raw_id
+    elif raw_id.startswith("chatcmpl-"):
+        resp_id = f"resp_{raw_id[len('chatcmpl-') :].replace('-', '')}"
+    else:
+        resp_id = f"resp_{uuid.uuid4().hex}"
+    created_at = int(result.get("created", result.get("created_at", time.time())))
+    completed_at = int(time.time())
+    model_name = model or result.get("model", SINGLE_MODEL)
+    return _build_response_object(
+        resp_id,
+        created_at,
+        model_name,
+        output,
+        status="completed",
+        usage=_responses_usage(in_tokens, out_tokens),
+        completed_at=completed_at,
+        error=None,
+        opts=opts,
+    )
+
+
+async def stream_responses_response(
+    gen,
+    model,
+    messages,
+    token_id,
+    session_id,
+    sig,
+    tools,
+    req_model=None,
+    parent_message_id=0,
+    scope="",
+    opts=None,
+    lease=None,
+):
+    preset_id = opts.get("_resp_id") if isinstance(opts, dict) else None
+    resp_id = preset_id or f"resp_{uuid.uuid4().hex}"
+    created_at = int(time.time())
+    model_name = req_model if req_model else model
+    seq = 0
+    output_index = 0
+    completed_output = []
+    rs_id = None
+    rs_index = None
+    rs_started = False
+    rs_closed = False
+    rs_text = ""
+    msg_id = None
+    msg_index = None
+    msg_started = False
+    msg_text = ""
+
+    def _sse(payload):
+        nonlocal seq
+        payload["sequence_number"] = seq
+        seq += 1
+        return f"event: {payload['type']}\ndata: {json.dumps(payload)}\n\n"
+
+    def _open_rs():
+        nonlocal rs_id, rs_index, output_index, rs_started
+        rs_id = f"rs_{uuid.uuid4().hex}"
+        rs_index = output_index
+        output_index += 1
+        rs_started = True
+        return [
+            _sse(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": rs_index,
+                    "item": {
+                        "id": rs_id,
+                        "type": "reasoning",
+                        "status": "in_progress",
+                        "summary": [],
+                    },
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.reasoning_summary_part.added",
+                    "item_id": rs_id,
+                    "output_index": rs_index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": ""},
+                }
+            ),
+        ]
+
+    def _close_rs():
+        nonlocal rs_closed
+        rs_closed = True
+        rs_part = {"type": "summary_text", "text": rs_text}
+        rs_item = {
+            "id": rs_id,
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [rs_part],
+        }
+        completed_output.append(rs_item)
+        return [
+            _sse(
+                {
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": rs_id,
+                    "output_index": rs_index,
+                    "summary_index": 0,
+                    "text": rs_text,
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": rs_id,
+                    "output_index": rs_index,
+                    "summary_index": 0,
+                    "part": rs_part,
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": rs_index,
+                    "item": rs_item,
+                }
+            ),
+        ]
+
+    def _open_msg():
+        nonlocal msg_id, msg_index, output_index, msg_started
+        msg_id = f"msg_{uuid.uuid4().hex}"
+        msg_index = output_index
+        output_index += 1
+        msg_started = True
+        return [
+            _sse(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": msg_index,
+                    "item": {
+                        "id": msg_id,
+                        "type": "message",
+                        "status": "in_progress",
+                        "role": "assistant",
+                        "content": [],
+                    },
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.content_part.added",
+                    "item_id": msg_id,
+                    "output_index": msg_index,
+                    "content_index": 0,
+                    "part": {
+                        "type": "output_text",
+                        "text": "",
+                        "annotations": [],
+                        "logprobs": [],
+                    },
+                }
+            ),
+        ]
+
+    def _delta_msg(text):
+        nonlocal msg_text
+        frames = _open_msg() if not msg_started else []
+        msg_text += text
+        frames.append(
+            _sse(
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": msg_id,
+                    "output_index": msg_index,
+                    "content_index": 0,
+                    "delta": text,
+                    "logprobs": [],
+                }
+            )
+        )
+        return frames
+
+    initial_resp = _build_response_object(
+        resp_id,
+        created_at,
+        model_name,
+        [],
+        status="in_progress",
+        usage=None,
+        completed_at=None,
+        error=None,
+        opts=opts,
+    )
+    yield _sse({"type": "response.created", "response": initial_resp})
+    yield _sse({"type": "response.in_progress", "response": initial_resp})
+
+    parser = StreamToolParser()
+    full_text = ""
+    aborted = False
+    failed = False
+
+    try:
+        is_thinking = False
+        async for chunk in _hold_think_tags(gen):
+            if not chunk:
+                continue
+            full_text += chunk
+
+            if "<think>" in chunk:
+                is_thinking = True
+                chunk = chunk.replace("<think>", "").lstrip("\n")
+                if not rs_started:
+                    for f in _open_rs():
+                        yield f
+
+            end_thinking = False
+            if "</think>" in chunk:
+                is_thinking = False
+                end_thinking = True
+                parts = chunk.split("</think>")
+                think_part = parts[0]
+                chunk = parts[1].lstrip("\n") if len(parts) > 1 else ""
+                if think_part:
+                    if not rs_started:
+                        for f in _open_rs():
+                            yield f
+                    rs_text += think_part
+                    yield _sse(
+                        {
+                            "type": "response.reasoning_summary_text.delta",
+                            "item_id": rs_id,
+                            "output_index": rs_index,
+                            "summary_index": 0,
+                            "delta": think_part,
+                        }
+                    )
+
+            if is_thinking and chunk:
+                rs_text += chunk
+                yield _sse(
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": rs_id,
+                        "output_index": rs_index,
+                        "summary_index": 0,
+                        "delta": chunk,
                     }
                 )
-        elif part_type == "input_file":
-            file_data = {
-                key: part[key]
-                for key in ("file_id", "file_data", "filename")
-                if part.get(key) is not None
-            }
-            if file_data:
-                converted.append({"type": "file", "file": file_data})
-        elif part_type == "refusal" and part.get("refusal"):
-            converted.append({"type": "text", "text": part["refusal"]})
-    return converted
+                continue
+
+            if end_thinking:
+                if rs_started and not rs_closed:
+                    for f in _close_rs():
+                        yield f
+                if not chunk:
+                    continue
+
+            for r in parser.feed(chunk):
+                if "text" in r and r["text"]:
+                    if not msg_started and not r["text"].strip():
+                        continue
+                    for f in _delta_msg(r["text"]):
+                        yield f
+        await _db(mark_active, token_id)
+    except (asyncio.CancelledError, GeneratorExit):
+        aborted = True
+        failed = True
+        try:
+            await _db(delete_sessions_for_chat, token_id, session_id)
+        except Exception:
+            logger.exception(
+                "stream_responses_response: failed to purge session rows after client abort"
+            )
+        raise
+    except Exception as e:
+        failed = True
+        code = _upstream_http_code(e)
+        if code in (401, 403, 429):
+            await _db(mark_limited, token_id)
+            await _db(delete_sessions_for_chat, token_id, session_id)
+            logger.warning("stream_responses_response upstream HTTP %s: %s", code, e)
+        else:
+            await _db(delete_sessions_for_chat, token_id, session_id)
+            logger.exception("stream_responses_response failed")
+        with suppress(Exception):
+            failed_resp = _build_response_object(
+                resp_id,
+                created_at,
+                model_name,
+                completed_output,
+                status="failed",
+                usage=None,
+                completed_at=None,
+                error={"code": "server_error", "message": GENERIC_RESPONSE_ERROR},
+                opts=opts,
+            )
+            yield _sse({"type": "response.failed", "response": failed_resp})
+    finally:
+        parsed_tools, clean_text = parse_tools(full_text)
+        clean_text = re.sub(
+            r"<think>.*?</think>", "", clean_text, flags=re.DOTALL
+        ).strip()
+        clean_text = re.sub(
+            r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>",
+            "",
+            clean_text,
+            flags=re.IGNORECASE,
+        ).strip()
+        flushed_chunks = []
+        if not parsed_tools:
+            for r in parser.flush():
+                if "text" in r and r["text"]:
+                    if not msg_started and not flushed_chunks and not r["text"].strip():
+                        continue
+                    flushed_chunks.append(r["text"])
+        combined_stream_text = msg_text + "".join(flushed_chunks)
+        final_text = combined_stream_text if combined_stream_text else clean_text
+        in_tokens = count_tok(_messages_text(messages))
+        usage_out = _completion_usage_text(clean_text, parsed_tools)
+        out_tokens = count_tok(usage_out) if usage_out else 0
+
+        if not failed:
+            next_messages = messages.copy()
+            ast_msg = {"role": "assistant"}
+            if parsed_tools:
+                ast_msg["tool_calls"] = parsed_tools
+            else:
+                ast_msg["content"] = final_text.strip()
+            next_messages.append(ast_msg)
+            next_sig = generate_signature_sync(next_messages, model, scope)
+            await _db(
+                save_session, sig, token_id, session_id, next_parent(parent_message_id)
+            )
+            await _db(
+                save_session,
+                next_sig,
+                token_id,
+                session_id,
+                next_parent(parent_message_id),
+            )
+            await _db(
+                save_session,
+                resp_id,
+                token_id,
+                session_id,
+                next_parent(parent_message_id),
+            )
+            _store_response_history(resp_id, next_messages)
+
+        if not failed:
+            # 统计与计价的落点：与 chat/anthropic 两条流式路径同源，按清理后的
+            # 文本计费，思考内容与工具标记不计入输出。
+            await _record_usage(
+                model,
+                token_id,
+                scope,
+                in_tokens,
+                out_tokens,
+                _cached_prompt_tokens(sig, in_tokens),
+                req_model=req_model,
+            )
+
+        if not aborted and not failed:
+            try:
+                if rs_started and not rs_closed:
+                    for f in _close_rs():
+                        yield f
+
+                if not parsed_tools:
+                    for fc in flushed_chunks:
+                        for f in _delta_msg(fc):
+                            yield f
+                    if not msg_started:
+                        for f in _delta_msg(clean_text) if clean_text else _open_msg():
+                            yield f
+
+                if msg_started:
+                    final_part = {
+                        "type": "output_text",
+                        "text": final_text,
+                        "annotations": [],
+                        "logprobs": [],
+                    }
+                    final_msg_item = {
+                        "id": msg_id,
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [final_part],
+                    }
+                    completed_output.append(final_msg_item)
+                    yield _sse(
+                        {
+                            "type": "response.output_text.done",
+                            "item_id": msg_id,
+                            "output_index": msg_index,
+                            "content_index": 0,
+                            "text": final_text,
+                            "logprobs": [],
+                        }
+                    )
+                    yield _sse(
+                        {
+                            "type": "response.content_part.done",
+                            "item_id": msg_id,
+                            "output_index": msg_index,
+                            "content_index": 0,
+                            "part": final_part,
+                        }
+                    )
+                    yield _sse(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": msg_index,
+                            "item": final_msg_item,
+                        }
+                    )
+
+                if parsed_tools:
+                    for tc in parsed_tools:
+                        fn = tc.get("function", {})
+                        raw_args = fn.get("arguments", "{}")
+                        args_str = (
+                            raw_args
+                            if isinstance(raw_args, str)
+                            else json.dumps(raw_args)
+                        )
+                        fc_id = f"fc_{uuid.uuid4().hex}"
+                        call_id = tc.get("id") or f"call_{uuid.uuid4().hex[:24]}"
+                        fn_name = fn.get("name", "")
+                        fc_index = output_index
+                        output_index += 1
+                        yield _sse(
+                            {
+                                "type": "response.output_item.added",
+                                "output_index": fc_index,
+                                "item": {
+                                    "id": fc_id,
+                                    "type": "function_call",
+                                    "status": "in_progress",
+                                    "call_id": call_id,
+                                    "name": fn_name,
+                                    "arguments": "",
+                                },
+                            }
+                        )
+                        yield _sse(
+                            {
+                                "type": "response.function_call_arguments.delta",
+                                "item_id": fc_id,
+                                "output_index": fc_index,
+                                "delta": args_str,
+                            }
+                        )
+                        yield _sse(
+                            {
+                                "type": "response.function_call_arguments.done",
+                                "item_id": fc_id,
+                                "output_index": fc_index,
+                                "arguments": args_str,
+                            }
+                        )
+                        fc_item = {
+                            "id": fc_id,
+                            "type": "function_call",
+                            "status": "completed",
+                            "call_id": call_id,
+                            "name": fn_name,
+                            "arguments": args_str,
+                        }
+                        completed_output.append(fc_item)
+                        yield _sse(
+                            {
+                                "type": "response.output_item.done",
+                                "output_index": fc_index,
+                                "item": fc_item,
+                            }
+                        )
+
+                completed_resp = _build_response_object(
+                    resp_id,
+                    created_at,
+                    model_name,
+                    completed_output,
+                    status="completed",
+                    usage=_responses_usage(in_tokens, out_tokens),
+                    completed_at=int(time.time()),
+                    error=None,
+                    opts=opts,
+                )
+                yield _sse({"type": "response.completed", "response": completed_resp})
+            except asyncio.CancelledError:
+                pass
+        # 释放该 token 的在途占用。置于 finally 内：客户端中断
+        # （CancelledError / GeneratorExit）时同样要注销，否则计数只增不减，
+        # 该账号会在此后永久显得最忙，破坏负载均衡。
+        if lease is not None:
+            lease.release()
 
 
-def convert_responses_input(body):
-    """Normalize OpenAI Responses input items into chat messages."""
-    messages = []
-    instructions = body.get("instructions")
-    if isinstance(instructions, str) and instructions.strip():
-        messages.append({"role": "system", "content": instructions})
-
-    inputs = body.get("input", [])
+def _responses_input_to_messages(inputs):
     if isinstance(inputs, (str, dict)):
         inputs = [inputs]
-    if not isinstance(inputs, list):
-        return messages
-
+    messages = []
+    call_names = {}
     for item in inputs:
         if isinstance(item, str):
             messages.append({"role": "user", "content": item})
             continue
         if not isinstance(item, dict):
             continue
-
-        item_type = item.get("type", "message")
-        if item_type in {"message", None} or "role" in item:
-            role = item.get("role", "user")
-            if role == "developer":
-                role = "system"
-            content = _responses_content_to_chat(item.get("content", ""))
-            if content:
-                messages.append({"role": role, "content": content})
+        item_type = item.get("type")
+        if item_type == "reasoning":
+            continue
+        if item_type == "function_call":
+            raw_args = item.get("arguments", "{}")
+            args_str = raw_args if isinstance(raw_args, str) else json.dumps(raw_args)
+            call_id = (
+                item.get("call_id")
+                or item.get("id")
+                or ("call_" + uuid.uuid4().hex[:8])
+            )
+            fn_name = item.get("name", "")
+            if call_id and fn_name:
+                call_names[call_id] = fn_name
+            tc = {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": fn_name,
+                    "arguments": args_str,
+                },
+            }
+            if messages and messages[-1].get("role") == "assistant":
+                messages[-1].setdefault("tool_calls", []).append(tc)
+            else:
+                messages.append(
+                    {"role": "assistant", "content": None, "tool_calls": [tc]}
+                )
+            continue
+        if item_type == "function_call_output":
+            out_val = item.get("output", "")
+            if isinstance(out_val, list):
+                out_val = " ".join(
+                    p.get("text", "")
+                    for p in out_val
+                    if isinstance(p, dict)
+                    and p.get("type") in ("input_text", "output_text", "text")
+                )
+            elif not isinstance(out_val, str):
+                out_val = json.dumps(out_val)
+            call_id = item.get("call_id") or item.get("id") or ""
+            tool_msg = {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": out_val,
+            }
+            t_name = item.get("name") or call_names.get(call_id)
+            if t_name:
+                tool_msg["name"] = t_name
+            messages.append(tool_msg)
             continue
 
-        if item_type == "function_call":
-            call_id = (
-                item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:12]}"
-            )
-            arguments = item.get("arguments", "{}")
-            if not isinstance(arguments, str):
-                arguments = json.dumps(arguments)
-            if item.get("name"):
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "tool_calls": [
+        role = item.get("role", "user")
+        if role == "developer":
+            role = "system"
+        content = item.get("content", [])
+        msg_content = []
+        if isinstance(content, str):
+            msg_content = content
+        else:
+            for c in content:
+                if isinstance(c, str):
+                    msg_content.append({"type": "text", "text": c})
+                elif not isinstance(c, dict):
+                    continue
+                elif c.get("type") in ("input_text", "output_text"):
+                    msg_content.append({"type": "text", "text": c.get("text")})
+                elif c.get("type") == "refusal":
+                    msg_content.append({"type": "text", "text": c.get("refusal", "")})
+                elif c.get("type") == "input_file":
+                    if c.get("file_data"):
+                        msg_content.append(
                             {
-                                "id": call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": item["name"],
-                                    "arguments": arguments,
-                                },
+                                "type": "file",
+                                "file_data": c.get("file_data"),
+                                "filename": c.get("filename"),
                             }
-                        ],
-                    }
-                )
-        elif item_type == "function_call_output":
-            output = item.get("output", "")
-            if isinstance(output, (dict, list)):
-                output = json.dumps(output, ensure_ascii=False)
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": item.get("call_id") or item.get("id", ""),
-                    "content": str(output),
-                }
+                        )
+                    else:
+                        msg_content.append(
+                            {"type": "file", "file_id": c.get("file_id")}
+                        )
+                elif c.get("type") == "input_image":
+                    url = c.get("image_url")
+                    if isinstance(url, dict):
+                        url = url.get("url")
+                    if url:
+                        msg_content.append(
+                            {"type": "image_url", "image_url": {"url": url}}
+                        )
+                    elif c.get("file_id"):
+                        msg_content.append(
+                            {"type": "file", "file_id": c.get("file_id")}
+                        )
+                    else:
+                        msg_content.append(c)
+                else:
+                    msg_content.append(c)
+        if (
+            role == "assistant"
+            and isinstance(msg_content, list)
+            and all(
+                isinstance(p, dict) and p.get("type") == "text" for p in msg_content
             )
+        ):
+            msg_content = "\n".join(p.get("text", "") for p in msg_content)
+        if role == "assistant" and messages and messages[-1].get("role") == "assistant":
+            prev_c = messages[-1].get("content")
+            if not prev_c:
+                messages[-1]["content"] = msg_content
+            elif isinstance(prev_c, str) and isinstance(msg_content, str):
+                messages[-1]["content"] = (
+                    f"{prev_c}\n{msg_content}" if msg_content else prev_c
+                )
+            elif isinstance(prev_c, list) and isinstance(msg_content, list):
+                prev_c.extend(msg_content)
+            continue
+        messages.append({"role": role, "content": msg_content})
     return messages
 
 
-def _responses_payload(result, model, instructions=None):
-    """Convert an internal Chat Completions result to a Responses object."""
-    message = result["choices"][0]["message"]
-    response_id = result["id"].replace("chatcmpl-", "resp_", 1)
-    output = []
-    if message.get("content"):
-        output.append(
-            {
-                "type": "message",
-                "id": f"msg_{uuid.uuid4().hex}",
-                "status": "completed",
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "output_text",
-                        "text": message["content"],
-                        "annotations": [],
-                    }
-                ],
-            }
-        )
-    for tool_call in message.get("tool_calls") or []:
-        function = tool_call.get("function", {})
-        output.append(
-            {
-                "type": "function_call",
-                "id": f"fc_{uuid.uuid4().hex}",
-                "call_id": tool_call.get("id") or f"call_{uuid.uuid4().hex[:12]}",
-                "name": function.get("name", ""),
-                "arguments": function.get("arguments", "{}"),
-                "status": "completed",
-            }
-        )
-
-    usage = result.get("usage", {})
-    input_tokens = usage.get("prompt_tokens", 0)
-    output_tokens = usage.get("completion_tokens", 0)
-    return {
-        "id": response_id,
-        "object": "response",
-        "created_at": result.get("created", int(time.time())),
-        "status": "completed",
-        "completed_at": int(time.time()),
-        "error": None,
-        "incomplete_details": None,
-        "instructions": instructions,
-        "model": model,
-        "output": output,
-        "parallel_tool_calls": True,
-        "previous_response_id": None,
-        "usage": {
-            "input_tokens": input_tokens,
-            "input_tokens_details": {
-                "cached_tokens": usage.get("prompt_tokens_details", {}).get(
-                    "cached_tokens", 0
-                )
-            },
-            "output_tokens": output_tokens,
-            "output_tokens_details": {"reasoning_tokens": 0},
-            "total_tokens": usage.get("total_tokens", input_tokens + output_tokens),
-        },
-    }
-
-
-def _responses_stream_state(response_id, model, instructions, status, output=None):
-    return {
-        "id": response_id,
-        "object": "response",
-        "created_at": int(time.time()),
-        "status": status,
-        "error": None,
-        "incomplete_details": None,
-        "instructions": instructions,
-        "model": model,
-        "output": output or [],
-        "parallel_tool_calls": True,
-        "previous_response_id": None,
-        "usage": None,
-    }
-
-
-def _responses_sse(event_type, payload):
-    return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
-async def stream_openai_responses(chat_body_iterator, model, instructions=None):
-    """Translate the internal Chat Completions SSE stream to Responses events."""
-    response_id = f"resp_{uuid.uuid4().hex}"
-    message_id = f"msg_{uuid.uuid4().hex}"
-    response = _responses_stream_state(response_id, model, instructions, "in_progress")
-    yield _responses_sse(
-        "response.created", {"type": "response.created", "response": response}
-    )
-    yield _responses_sse(
-        "response.in_progress", {"type": "response.in_progress", "response": response}
-    )
-
-    buffer = ""
-    text_started = False
-    full_text = ""
-    tool_calls = {}
-
-    async for raw_chunk in chat_body_iterator:
-        if isinstance(raw_chunk, bytes):
-            raw_chunk = raw_chunk.decode("utf-8", errors="replace")
-        buffer += raw_chunk
-        while "\n\n" in buffer:
-            block, buffer = buffer.split("\n\n", 1)
-            data_lines = [
-                line[5:].lstrip()
-                for line in block.splitlines()
-                if line.startswith("data:")
-            ]
-            if not data_lines:
-                continue
-            raw_data = "\n".join(data_lines)
-            if raw_data == "[DONE]":
-                continue
-            try:
-                event = json.loads(raw_data)
-            except Exception as e:
-                logger.warning(
-                    "Could not translate internal Responses stream event: %s", e
-                )
-                continue
-            if event.get("error"):
-                error = event["error"]
-                yield _responses_sse(
-                    "error",
-                    {
-                        "type": "error",
-                        "message": error.get("message", "Upstream stream failed")
-                        if isinstance(error, dict)
-                        else str(error),
-                    },
-                )
-                return
-
-            for choice in event.get("choices", []):
-                delta = choice.get("delta", {})
-                text_delta = delta.get("content")
-                if text_delta:
-                    if not text_started:
-                        text_started = True
-                        yield _responses_sse(
-                            "response.output_item.added",
-                            {
-                                "type": "response.output_item.added",
-                                "output_index": 0,
-                                "item": {
-                                    "id": message_id,
-                                    "type": "message",
-                                    "status": "in_progress",
-                                    "role": "assistant",
-                                    "content": [],
-                                },
-                            },
-                        )
-                        yield _responses_sse(
-                            "response.content_part.added",
-                            {
-                                "type": "response.content_part.added",
-                                "item_id": message_id,
-                                "output_index": 0,
-                                "content_index": 0,
-                                "part": {
-                                    "type": "output_text",
-                                    "text": "",
-                                    "annotations": [],
-                                },
-                            },
-                        )
-                    full_text += text_delta
-                    yield _responses_sse(
-                        "response.output_text.delta",
-                        {
-                            "type": "response.output_text.delta",
-                            "item_id": message_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "delta": text_delta,
-                        },
-                    )
-
-                for tool_delta in delta.get("tool_calls", []):
-                    index = tool_delta.get("index", len(tool_calls))
-                    current = tool_calls.setdefault(
-                        index,
-                        {
-                            "id": tool_delta.get("id")
-                            or f"call_{uuid.uuid4().hex[:12]}",
-                            "name": "",
-                            "arguments": "",
-                        },
-                    )
-                    function = tool_delta.get("function", {})
-                    current["name"] += function.get("name", "")
-                    current["arguments"] += function.get("arguments", "")
-
-    output = []
-    if text_started:
-        message_item = {
-            "id": message_id,
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": full_text, "annotations": []}],
-        }
-        output.append(message_item)
-        yield _responses_sse(
-            "response.output_text.done",
-            {
-                "type": "response.output_text.done",
-                "item_id": message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "text": full_text,
-            },
-        )
-        yield _responses_sse(
-            "response.content_part.done",
-            {
-                "type": "response.content_part.done",
-                "item_id": message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "part": message_item["content"][0],
-            },
-        )
-        yield _responses_sse(
-            "response.output_item.done",
-            {
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": message_item,
-            },
-        )
-
-    for _, tool_call in sorted(tool_calls.items()):
-        output_index = len(output)
-        item = {
-            "type": "function_call",
-            "id": f"fc_{uuid.uuid4().hex}",
-            "call_id": tool_call["id"],
-            "name": tool_call["name"],
-            "arguments": tool_call["arguments"] or "{}",
-            "status": "completed",
-        }
-        output.append(item)
-        yield _responses_sse(
-            "response.output_item.added",
-            {
-                "type": "response.output_item.added",
-                "output_index": output_index,
-                "item": {**item, "status": "in_progress"},
-            },
-        )
-        yield _responses_sse(
-            "response.function_call_arguments.done",
-            {
-                "type": "response.function_call_arguments.done",
-                "item_id": item["id"],
-                "output_index": output_index,
-                "arguments": item["arguments"],
-            },
-        )
-        yield _responses_sse(
-            "response.output_item.done",
-            {
-                "type": "response.output_item.done",
-                "output_index": output_index,
-                "item": item,
-            },
-        )
-
-    completed = _responses_stream_state(
-        response_id, model, instructions, "completed", output
-    )
-    completed["completed_at"] = int(time.time())
-    yield _responses_sse(
-        "response.completed", {"type": "response.completed", "response": completed}
-    )
-
-
 @app.post("/v1/responses")
+@app.post("/responses")
 async def openai_responses(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
-    body = await request.json()
+    body = await _json_body(request)
     model = resolve_model(body.get("model"))
-    messages = convert_responses_input(body)
-    if not messages or not any(m.get("role") in {"user", "tool"} for m in messages):
-        return JSONResponse(
-            {
-                "error": {
-                    "message": "Responses request contains no usable input",
-                    "type": "invalid_request_error",
-                }
-            },
-            status_code=400,
+    inputs = body.get("input", [])
+    if isinstance(inputs, (str, dict)):
+        inputs = [inputs]
+
+    messages = _responses_input_to_messages(inputs)
+
+    instructions = body.get("instructions")
+    if isinstance(instructions, list):
+        inst_msgs = _responses_input_to_messages(instructions)
+        inst_text = "\n".join(
+            _messages_text([m]) for m in inst_msgs if _messages_text([m])
         )
+    elif isinstance(instructions, str):
+        inst_text = instructions
+    else:
+        inst_text = ""
+
+    text_cfg = body.get("text")
+    if (
+        isinstance(text_cfg, dict)
+        and isinstance(text_cfg.get("format"), dict)
+        and text_cfg["format"].get("type") == "json_schema"
+    ):
+        json_schema = text_cfg["format"].get("schema")
+        if json_schema:
+            schema_inst = f"You MUST return valid JSON adhering strictly to this JSON Schema:\n{json.dumps(json_schema)}"
+            inst_text = f"{inst_text}\n\n{schema_inst}" if inst_text else schema_inst
+
+    prev_resp_id = body.get("previous_response_id")
+    if (
+        prev_resp_id
+        and prev_resp_id in _response_history
+        and not any(m.get("role") == "assistant" for m in messages)
+    ):
+        prev_msgs = [dict(m) for m in _response_history[prev_resp_id]]
+        if inst_text and not (
+            prev_msgs
+            and prev_msgs[0].get("role") == "system"
+            and prev_msgs[0].get("content") == inst_text
+        ):
+            if prev_msgs and prev_msgs[0].get("role") == "system":
+                prev_msgs[0] = {"role": "system", "content": inst_text}
+            else:
+                prev_msgs.insert(0, {"role": "system", "content": inst_text})
+        messages = prev_msgs + messages
+    elif inst_text:
+        messages.insert(0, {"role": "system", "content": inst_text})
 
     thinking = is_thinking_enabled(body, request)
-    search = body.get("search", False) or any(
-        isinstance(tool, dict)
-        and tool.get("type") in {"web_search", "web_search_preview"}
-        for tool in body.get("tools", [])
-    )
-    stream = body.get("stream", False)
-    tools = body.get("tools", None)
+    search = bool(body.get("search", False))
+    stream = bool(body.get("stream", False))
+    raw_tools = body.get("tools", None)
+    chat_tools = None
+    if isinstance(raw_tools, list):
+        chat_tools = []
+        for t in raw_tools:
+            if not isinstance(t, dict):
+                continue
+            t_type = str(t.get("type", ""))
+            if t_type.startswith("web_search"):
+                search = True
+            else:
+                chat_tools.append(t)
+        if not chat_tools:
+            chat_tools = None
+
+    response_opts = dict(body)
+    response_opts["thinking"] = thinking
+    response_opts["_resp_id"] = f"resp_{uuid.uuid4().hex}"
 
     result = await handle_chat(
         messages,
@@ -2771,27 +3413,19 @@ async def openai_responses(request: Request):
         thinking,
         search,
         stream,
-        tools,
-        req_model=body.get("model"),
+        chat_tools,
         scope=get_api_key(request),
+        is_responses=True,
+        response_opts=response_opts,
     )
 
     if stream:
-        if isinstance(result, StreamingResponse):
-            # 外层重新包装了 body_iterator，内层 response 的 background 不会
-            # 自动继承；显式透传，否则 /v1/responses 流式路径下 lease 的兜底
-            # 释放丢失（客户端在首次迭代前断开时在途计数会泄漏）。
-            return StreamingResponse(
-                stream_openai_responses(
-                    result.body_iterator, model, body.get("instructions")
-                ),
-                media_type="text/event-stream",
-                background=result.background,
-            )
         return result
 
     if isinstance(result, dict) and "choices" in result:
-        return _responses_payload(result, model, body.get("instructions"))
+        return format_responses_response(
+            result, result.get("model", model), response_opts
+        )
     return result
 
 
@@ -2890,7 +3524,7 @@ def convert_anthropic_messages(messages):
 async def anthropic_messages(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
-    body = await request.json()
+    body = await _json_body(request)
     system = body.get("system", "")
 
     messages = body.get("messages", [])

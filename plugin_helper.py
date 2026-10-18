@@ -487,7 +487,7 @@ async def extract_tools(tools):
             fn = i.get("function") if isinstance(i.get("function"), dict) else i
             name = fn.get("name", "")
             desc = fn.get("description", "")
-            params = fn.get("parameters", {})
+            params = fn.get("parameters", fn.get("input_schema", {}))
             if name:
                 final_tools.append(
                     f"Tool: {name}\nDescription: {desc}\nParameters: {json.dumps(params)}"
@@ -618,11 +618,14 @@ async def extract_and_upload_files(messages, auth_token, last_user_only=False):
                         elif k[0] == "success":
                             result_fileids.append(k[1]["file_id"])
             elif j["type"] == "file":
-                if "file_id" in j["file"]:
-                    result_fileids.append(j["file"]["file_id"])
-                if "file_data" in j["file"]:
-                    filename = j["file"].get("filename") or "file.bin"
-                    data_parts = j["file"]["file_data"].split(",", 1)
+                # Responses API 把文件字段直接放在部件上，Chat Completions 则嵌在
+                # ``file`` 下；两种形态都要能取到，否则 Responses 的附件不会被上传。
+                file_obj = j.get("file") if isinstance(j.get("file"), dict) else j
+                if file_obj.get("file_id"):
+                    result_fileids.append(file_obj["file_id"])
+                if file_obj.get("file_data"):
+                    filename = file_obj.get("filename") or "file.bin"
+                    data_parts = file_obj["file_data"].split(",", 1)
                     if len(data_parts) != 2:
                         continue
                     mimetype_base, base64_data = data_parts
@@ -955,20 +958,33 @@ async def build_prompt(
             )
             final_prompt += _context_section("TOOL RESULTS", tools_result_extract)
 
+        trailing_sys_parts = []
         trailing_user_parts = []
         for m in trailing_messages:
-            if m.get("role") == "user":
+            # 轮内出现的 system 消息（Responses 的 instructions、工具循环里追加的
+            # 约束）不能并入用户段：语言与安全约束必须单独成段，否则会被后续的
+            # 用户文本掩盖。
+            if m.get("role") in ("user", "system"):
                 c = m.get("content", "")
+                txt = ""
                 if isinstance(c, str) and c:
-                    trailing_user_parts.append(c)
+                    txt = c
                 elif isinstance(c, list):
                     txt = " ".join(
                         part.get("text", "")
                         for part in c
                         if isinstance(part, dict) and part.get("type") == "text"
                     )
-                    if txt:
+                if txt:
+                    if m.get("role") == "system":
+                        trailing_sys_parts.append(txt)
+                    else:
                         trailing_user_parts.append(txt)
+
+        if trailing_sys_parts:
+            final_prompt += _context_section(
+                "SYSTEM", chr(10).join(trailing_sys_parts), data=False
+            )
 
         if trailing_user_parts:
             final_prompt += _context_section(

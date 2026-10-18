@@ -12,7 +12,7 @@ import sqlite3
 import string
 import time
 from collections import OrderedDict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import aiohttp
 import deepseek_tokenizer
@@ -196,6 +196,18 @@ async def get_session():
                     timeout=aiohttp.ClientTimeout(total=None, connect=15, sock_read=600)
                 )
     return _session
+
+
+async def close_session():
+    """关闭共享的 aiohttp ClientSession。
+
+    由应用 lifespan 关闭阶段调用。缺少该调用时，每次 uvicorn 重载或退出都会
+    泄漏会话的 connector 套接字，并产生 "Unclosed client session" 警告。
+    """
+    global _session
+    if _session is not None and not _session.closed:
+        await _session.close()
+    _session = None
 
 
 # ==============================================================================
@@ -1794,12 +1806,16 @@ def parse_tools(text):
                 )
                 if cmd_match:
                     clean_cmd = re.sub(
-                        r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*[^>]*>", "", cmd_match.group(1)
+                        r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*[^>]*>",
+                        "",
+                        cmd_match.group(1),
                     ).strip("\x22\x27() ")
                     args["command"] = clean_cmd
                 if desc_match:
                     clean_desc = re.sub(
-                        r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*[^>]*>", "", desc_match.group(1)
+                        r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*[^>]*>",
+                        "",
+                        desc_match.group(1),
                     ).strip("\x22\x27() ")
                     args["description"] = clean_desc
                 norm = normalize_tool_call(tool_name, args)
@@ -1813,7 +1829,10 @@ def parse_tools(text):
                 flags=re.DOTALL | re.IGNORECASE,
             ).strip()
             clean_text = re.sub(
-                r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*[^>]*>", "", clean_text, flags=re.IGNORECASE
+                r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*[^>]*>",
+                "",
+                clean_text,
+                flags=re.IGNORECASE,
             ).strip()
 
     if not tools:
