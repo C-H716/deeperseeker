@@ -1560,6 +1560,41 @@ _WRAPPER_TAG_NAMES = frozenset(
 )
 
 
+# 双重嵌套的 arguments 解包时认可的包装键。模型偶尔把整个参数对象当成单个
+# arguments 参数发出，解码后就会多出一层。
+_NESTED_ARG_KEYS = frozenset({"arguments", "parameters", "input", "args", "params"})
+
+
+def _unwrap_nested_arguments(args):
+    """Collapse the double-wrapped ``{"arguments": {...}}`` shape.
+
+    DeepSeek V4 occasionally emits the whole argument object as a single
+    ``arguments`` parameter (or as the value of a JSON ``arguments`` field),
+    so the decoded payload carries one extra level. Unwrap only when the
+    wrapper is the sole key and its value is itself an object, which leaves
+    genuine single-key tools untouched.
+    """
+    for _ in range(2):
+        if isinstance(args, str):
+            try:
+                decoded = json.loads(args)
+            except Exception:
+                return args
+            if not isinstance(decoded, (dict, list)):
+                return args
+            args = decoded
+        if not isinstance(args, dict) or len(args) != 1:
+            return args
+        key = next(iter(args))
+        if key.lower() not in _NESTED_ARG_KEYS:
+            return args
+        inner = args[key]
+        if not isinstance(inner, (dict, list)):
+            return args
+        args = inner
+    return args
+
+
 def normalize_tool_call(tool_data_or_name, args_if_name=None):
     if isinstance(tool_data_or_name, str):
         name = tool_data_or_name
@@ -1610,6 +1645,9 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
     if not probe or probe in _WRAPPER_TAG_NAMES:
         return None
 
+    # 官方补丁（vllm-ascend 2026-04-26）修复的正是 function call 双重嵌套
+    # arguments 字段导致的解析失败；这里在唯一的出口处统一拆层。
+    args = _unwrap_nested_arguments(args)
     if isinstance(args, (dict, list)):
         args_str = json.dumps(args)
     elif isinstance(args, str):
