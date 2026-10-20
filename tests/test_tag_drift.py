@@ -112,6 +112,37 @@ def test_decorated_closers_do_not_leak():
         assert "DSML" not in prose, (chunk, prose)
 
 
+def test_decorated_closers_without_gt_do_not_leak():
+    """装饰闭标签整串不写 ``>`` 时也不得漏进正文。
+
+    实测形态：``</ | | DSML | | ``（缺结尾 ``>``）连续重复几十次。旧正则
+    要求 ``>``，整串匹配不上，非流式与流式都会原样透传（见截图）。
+    """
+    unit = chr(60) + "/ | | DSML | | "
+    for text in (
+        "head\n" + unit * 12 + "\ntail",
+        "head\n" + unit * 12 + "tail",
+        "head\n" + unit + "tail",
+    ):
+        _, clean = parse_tools(text)
+        assert "DSML" not in clean, clean
+        for chunk in (1, 3, 7, 50, 1000):
+            tools, prose = _stream(text, chunk)
+            assert not tools, (chunk, tools)
+            assert "DSML" not in prose, (chunk, prose)
+            assert "tail" in prose, (chunk, prose)
+
+
+def test_decorated_closers_keep_surrounding_text():
+    """清理装饰闭标签时不得吞掉两侧的正常正文。"""
+    unit = chr(60) + "/ | | DSML | | "
+    text = "before\n" + unit * 5 + "after"
+    _, clean = parse_tools(text)
+    assert "before" in clean and "after" in clean, clean
+    _, prose = _stream(text, 3)
+    assert "before" in prose and "after" in prose, prose
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     bad = 0

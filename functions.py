@@ -2146,10 +2146,18 @@ def parse_tools(text):
         # 第二个分支覆盖「只有 DSML 标记、没有标签名」的纯装饰标签，例如
         # ``</ | | DSML | | >``；首个分支要求带标签名，匹配不到时模型收尾
         # 成串吐出的装饰标签会原样留在正文里（截图即此形态）。
+        # 收尾的 ``>`` 必须可选：模型常常整串都不写 ``>``（形如
+        # ``</ | | DSML | | `` 反复出现）。缺 ``>`` 时用 lookahead 限定只
+        # 吃到下一个 ``<`` 或文本末尾为止，避免把后续正文一并吞掉。
         r"</?(?:\s*[｜\|]){0,2}\s*(?:"
-        r"(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|invoke|function_call|parameter)[^>]*"
-        r"|DSML\s*(?:\s*[｜\|]){0,2}"
-        r")\s*>",
+        # 标签名后必须是不属于标识符的字符：否则正文里的 ``</tool_x`` 会被
+        # 当成 ``tool`` 标签并吞掉 ``_x``（缺 ``>`` 的分支尤其容易误伤）。
+        r"(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|invoke|function_call|parameter)(?![A-Za-z0-9_])[^<>]*"
+        r"\s*[｜\|]{0,2}\s*(?:>|(?=<|\Z))"
+        # 无标签名的纯装饰分支：``DSML`` 标记本身已是足够强的信号，``>`` 直接
+        # 可选，否则最后一个装饰串后面跟正文时仍会残留。
+        r"|DSML\s*(?:\s*[｜\|]){0,2}\s*>?"
+        r")",
         "",
         clean_text,
         flags=re.IGNORECASE,
@@ -2195,10 +2203,16 @@ _ORPHAN_CLOSER_RE = re.compile(
     # 第二分支覆盖「只有 DSML 标记、没有标签名」的纯装饰闭标签，例如
     # ``</ | | DSML | | >``。模型收尾时会成串吐这种标签；第一分支要求带
     # 标签名，匹配不到时整串会作为正文漏给客户端。
+    # 收尾的 ``>`` 可选：模型收尾的装饰串常整段不带 ``>``（形如
+    # ``</ | | DSML | | `` 反复出现）。缺 ``>`` 时只吃到下一个 ``<`` 或
+    # 文本末尾，避免把后续正文一并吞掉。
     r"</(?:\s*[｜\|]){0,2}\s*(?:"
-    r"(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|function_call|invoke|param(?:eter)?)\s*[｜\|]{0,2}"
-    r"|DSML\s*(?:\s*[｜\|]){0,2}"
-    r")\s*>",
+    # 标签名后必须是非标识符字符，避免正文 ``</tool_x`` 被误吞（同 parse_tools）。
+    r"(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|function_call|invoke|param(?:eter)?)(?![A-Za-z0-9_])[^<>]*"
+    r"\s*[｜\|]{0,2}\s*(?:>|(?=<|\Z))"
+    # 无标签名的纯装饰分支：``>`` 可选（同 parse_tools 处说明）。
+    r"|DSML\s*(?:\s*[｜\|]){0,2}\s*>?"
+    r")",
     re.IGNORECASE,
 )
 
@@ -2484,7 +2498,12 @@ class StreamToolParser:
     def flush(self):
         out = []
         if self.buffer and not self.in_tool:
-            out.append({"text": self.buffer})
+            # 流结束时缓冲里可能只剩模型收尾吐出的装饰闭标签串（例如
+            # ``</ | | DSML | | `` 反复出现，且整串不带 ``>``）。原样透传会
+            # 让协议残留出现在正文里，因此这里同样走孤立闭标签清理。
+            text = _ORPHAN_CLOSER_RE.sub("", self.buffer)
+            if text:
+                out.append({"text": text})
         elif self.in_tool:
             # [FIX 1] Recover the tool before stripping: if the stream was cut
             # off before the closing tag arrived but the payload itself is
