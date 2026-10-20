@@ -344,7 +344,10 @@ TOOL_USE_INSTRUCTIONS = (
     "TOOL USE INSTRUCTIONS:\n"
     "You have access to tools. When you need to call a tool, output ONLY the tool call XML block and nothing else:\n"
     '<tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>\n'
-    "Never repeat past messages, history, or XML tags. Output exactly one tool call block when invoking a tool."
+    "Never repeat past messages, history, or XML tags. Output exactly one tool call block when invoking a tool.\n"
+    "To call several tools at once, emit one complete <tool_call> block per tool, back to back, "
+    "each with its own JSON object; never merge them into one JSON object or wrap them in an extra tag.\n"
+    "Write tag names exactly as shown: <tool_call> and </tool_call>, never <tool call>, <tool calls> or </tool>."
 )
 
 

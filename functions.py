@@ -1550,6 +1550,7 @@ _WRAPPER_TAG_NAMES = frozenset(
     {
         "calls",
         "call",
+        "tool",
         "toolcall",
         "toolcalls",
         "functioncall",
@@ -1694,6 +1695,47 @@ def _code_fence_spans(text):
     ]
 
 
+# 逗号形态的入口：``<…invoke name="Edit", "arguments": {…}``。模型把
+# JSON 当成标签头的续写，合法 XML 不会出现，需要单独识别（见 parse_tools）。
+_COMMA_FORM_ENTRY_RE = re.compile(
+    r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*"
+    r"(?:invoke|tool_call|function_call)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22]\s*,"
+    r"\s*[\x27\x22](?:arguments|parameters|input|args|params)[\x27\x22]\s*:\s*",
+    re.IGNORECASE,
+)
+
+# 裸 parameter 标签：模型有时不写外层 invoke，直接把
+# ``<…parameter name="old_string" string="true">…`` 连同 JSON 残片写出来。
+# 这种片段没有工具名，构不成调用；留着只会把参数值漏进正文。
+_BARE_PARAM_ENTRY_RE = re.compile(
+    r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*"
+    r"(?:parameter|param)\b[^>]*>",
+    re.IGNORECASE,
+)
+
+# 裸 parameter 块的结束位置：自己的闭标签，或一个工具族闭标签（模型常常
+# 只写开标签就接 JSON 残片，后面跟的是 </tool> 之类）。
+_BARE_PARAM_END_RE = re.compile(
+    r"</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*"
+    r"(?:param(?:eter)?|tool[\s_]*calls?|tool|calls|invoke|function_call)"
+    r"\s*[｜\|]{0,2}\s*>",
+    re.IGNORECASE,
+)
+
+# 裸 parameter 块之后常跟着 JSON 残片（``, "new_string": "..."}}``），
+# 以及一串闭标签。两者都要吃掉，否则参数值会当作正文漏给客户端。
+_BARE_PARAM_TAIL_RE = re.compile(
+    r"(?:\s*,\s*[\x27\x22][A-Za-z0-9_\-]+[\x27\x22]\s*:\s*(?:\{[^{}]*\}|\[[^\[\]]*\]|\"[^\"]*\"|[^,}\]]+))+\s*\}*"
+)
+
+# JSON 负载之后可能紧跟一串闭合标签（</…> 连写），一并吞掉避免残片外泄。
+_CLOSER_RUN_RE = re.compile(
+    r"(?:\s*</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*"
+    r"(?:tool[\s_]*calls?|tool|calls|invoke|function_call|param(?:eter)?)\s*[｜\|]{0,2}\s*>)+",
+    re.IGNORECASE,
+)
+
+
 def parse_tools(text):
     tools = []
     clean_text = text
@@ -1701,6 +1743,52 @@ def parse_tools(text):
 
     def fenced(pos):
         return any(s <= pos < e for s, e in fence_spans)
+
+    # 逗号形态：模型偶尔把 invoke 的属性写成
+    # ``<…invoke name="Edit", "arguments": {...}``，JSON 直接悬在标签头里。
+    # 合法 XML 不会这样写，现成的 [^>]*> 会把整段 JSON 吞进标签头，导致
+    # 产出一个没有参数的调用（客户端随后报 file_path 缺失）。这里先把这种
+    # 形态整段吃出来并从文本中移除，避免后续分支再把它当空调用处理。
+    comma_spans = []
+    decoder = json.JSONDecoder()
+    for m in _COMMA_FORM_ENTRY_RE.finditer(text):
+        if fenced(m.start()):
+            continue
+        brace = m.end()
+        if brace >= len(text) or text[brace] != "{":
+            continue
+        try:
+            data, consumed = decoder.raw_decode(text[brace:])
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if isinstance(data.get("arguments"), (dict, list)):
+            args = data["arguments"]
+        elif isinstance(data.get("parameters"), (dict, list)):
+            args = data["parameters"]
+        else:
+            args = {
+                k: v for k, v in data.items() if k not in ("name", "tool", "function")
+            }
+        norm = normalize_tool_call(m.group(1).strip(), args)
+        if not norm:
+            continue
+        tools.append(norm)
+        end = brace + consumed
+        tail = _CLOSER_RUN_RE.match(text, end)
+        if tail:
+            end = tail.end()
+        comma_spans.append((m.start(), end))
+    if comma_spans:
+        pieces, cursor = [], 0
+        for start, end in comma_spans:
+            pieces.append(text[cursor:start])
+            cursor = end
+        pieces.append(text[cursor:])
+        text = "".join(pieces)
+        clean_text = text
+        fence_spans = _code_fence_spans(text)
 
     param_names = {
         "command",
@@ -1718,7 +1806,7 @@ def parse_tools(text):
     }
     tool_matches = list(
         re.finditer(
-            r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_call|invoke|function_call)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>",
+            r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool_call|invoke|function_call)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>",
             text,
             re.IGNORECASE,
         )
@@ -1737,7 +1825,7 @@ def parse_tools(text):
             body = text[start_idx:end_idx]
             args = {}
             p_matches = re.finditer(
-                r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)>|(?=<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=)|$)",
+                r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:parameter|tool_call|param|invoke)>|(?=<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:parameter|tool_call|param|invoke)\s+name=)|$)",
                 body,
                 flags=re.DOTALL | re.IGNORECASE,
             )
@@ -1780,13 +1868,13 @@ def parse_tools(text):
 
     if tools:
         clean_text = re.sub(
-            r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls)>|$)",
+            r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|calls)[^>]*>.*?(?:</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|calls|tool)>|$)",
             "",
             clean_text,
             flags=re.DOTALL | re.IGNORECASE,
         ).strip()
         clean_text = re.sub(
-            r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)>|$)",
+            r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:invoke|function_call)[^>]*>.*?(?:</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:invoke|function_call)>|$)",
             "",
             clean_text,
             flags=re.DOTALL | re.IGNORECASE,
@@ -1899,25 +1987,36 @@ def parse_tools(text):
             ).strip()
 
     if not tools:
+        # 标签名内部的空格/下划线可漂移："tool_call" / "tool call" /
+        # "tool calls" 都可能出现，统一用 tool[\s_]*calls? 覆盖。
         tag_regex = re.compile(
-            r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_call|function_call)(?:\s+(?:name|tool|function)=[\x27\x22]([^\x27\x22]+)[\x27\x22])?\s*>",
+            r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|function_call)(?:\s+(?:name|tool|function)=[\x27\x22]([^\x27\x22]+)[\x27\x22])?\s*>",
             re.IGNORECASE,
         )
         decoder = json.JSONDecoder()
         matches = [m for m in tag_regex.finditer(text) if not fenced(m.start())]
         if matches:
+            # 外层包裹标签会重复指向同一段 JSON："<tool calls> <tool call>{...}"
+            # 中两个开标签的 after_tag 都以同一个 '{' 开头，不去重会把同一次调用
+            # 解析两遍。consumed_upto 记录已消费到的绝对偏移，命中过的 JSON 不再
+            # 由后续标签重复解析。
+            consumed_upto = -1
             for m in matches:
                 tag_name = m.group(1)
                 after_tag = text[m.end() :]
                 brace_pos = after_tag.find("{")
+                abs_brace = m.end() + brace_pos if brace_pos != -1 else -1
+                if brace_pos == -1 or abs_brace < consumed_upto:
+                    continue
                 if brace_pos != -1:
                     json_substr = after_tag[brace_pos:]
                     data = None
+                    payload_len = 0
                     with contextlib.suppress(Exception):
-                        data, _ = decoder.raw_decode(json_substr)
+                        data, payload_len = decoder.raw_decode(json_substr)
                     if not data:
                         cleaned_json = re.sub(
-                            r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_call|function_call|tool_calls|invoke)[^>]*>.*",
+                            r"</?(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool_call|function_call|tool_calls|invoke)[^>]*>.*",
                             "",
                             json_substr,
                             flags=re.DOTALL,
@@ -1970,11 +2069,14 @@ def parse_tools(text):
                             norm = normalize_tool_call(name, args)
                             if norm:
                                 tools.append(norm)
+                                # 外层包裹标签（"<tool calls> <tool call>{...}"）
+                                # 与内层标签指向同一个 '{'，只消费一次。
+                                consumed_upto = abs_brace + max(payload_len, 1)
             clean_text = re.sub(
-                r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_call|function_call)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_call|function_call)>|$)",
+                r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|function_call|tool)[^>]*>.*?(?:</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|function_call|tool)>|$)",
                 "",
                 text,
-                flags=re.DOTALL,
+                flags=re.DOTALL | re.IGNORECASE,
             ).strip()
 
     if not tools:
@@ -2041,7 +2143,7 @@ def parse_tools(text):
     # Keep companion text: the tool-call blocks themselves were already removed
     # from clean_text above; only leftover bare tags are stripped here.
     clean_text = re.sub(
-        r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call|parameter)[^>]*>",
+        r"</?(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|invoke|function_call|parameter)[^>]*>",
         "",
         clean_text,
         flags=re.IGNORECASE,
@@ -2053,8 +2155,12 @@ def parse_tools(text):
 # the |/｜-decorated variants that parse_tools accepts. Used by
 # StreamToolParser so a mismatched closer closes the open block instead of
 # hanging until flush(). [FIX 3]
+# 标签名内部的空格/下划线属于可漂移部分：模型会把 "tool_call" 写成
+# "tool call"，甚至只把开标签写成 "<tool calls>"，闭标签退化为 "</tool>"。
+# 因此族内统一用 tool[\s_]*calls? 覆盖 tool_call / toolcalls / tool call(s)，
+# 并额外接受裸的 tool 作为闭标签。
 _TOOL_END_TAG_RE = re.compile(
-    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call)\s*>",
+    r"</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|invoke|function_call)\s*>",
     re.IGNORECASE,
 )
 
@@ -2064,7 +2170,7 @@ _TOOL_END_TAG_RE = re.compile(
 # substring start tags; this regex accepts bars, the DSML marker and the
 # space in any combination.
 _STREAM_ENTRY_RE = re.compile(
-    r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_call|invoke)\b[^>]*>",
+    r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(tool[\s_]*calls?|calls|function_call|invoke)\b[^>]*>",
     re.IGNORECASE,
 )
 
@@ -2080,24 +2186,32 @@ _STREAM_ENTRY_RE = re.compile(
 # block, and a parameter closer sits inside the block, so matching it would cut
 # the block short before </invoke> arrives.
 _ORPHAN_CLOSER_RE = re.compile(
-    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|function_call|invoke|param(?:eter)?)\s*[｜\|]{0,2}>",
+    r"</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|function_call|invoke|param(?:eter)?)\s*[｜\|]{0,2}>",
     re.IGNORECASE,
 )
 
 # Tag names _STREAM_ENTRY_RE can open on.
-_STREAM_ENTRY_TAGS = ("tool_calls", "tool_call", "function_call", "invoke", "calls")
+_STREAM_ENTRY_TAGS = (
+    "tool_calls",
+    "tool_call",
+    "tool calls",
+    "tool call",
+    "function_call",
+    "invoke",
+    "calls",
+)
 
 # 孤立闭合标签的候选标签名，比入口标签多出 param/parameter。模型可能发出
 # 没有配对开标签的 parameter 闭合标签，分片途中这种片段必须被 hold 住，
 # 否则会被当成正文漏给客户端（见 _ORPHAN_CLOSER_RE 的说明）。
-_STREAM_CLOSER_TAGS = _STREAM_ENTRY_TAGS + ("param", "parameter")
+_STREAM_CLOSER_TAGS = _STREAM_ENTRY_TAGS + ("param", "parameter", "tool")
 
 # 推理(reasoning)通道的标记入口。比工具入口多出 param/parameter：模型在思考
 # 中直接书写参数标签时不会有外层 invoke 包裹，漏掉这两个名字会让参数标签
 # 原样透传（app.py 的 reasoning 分支只做净化，不产出工具调用）。
 _REASONING_MARKUP_RE = re.compile(
-    r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*"
-    r"(tool_calls?|calls|function_call|invoke|param(?:eter)?)\b[^>]*>",
+    r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*"
+    r"(tool[\s_]*calls?|tool|calls|function_call|invoke|param(?:eter)?)\b[^>]*>",
     re.IGNORECASE,
 )
 
@@ -2110,7 +2224,7 @@ _MAX_REASONING_BLOCK = 1 << 20
 def _markup_closer_re(tag_name):
     """构造与 tag_name 配对的闭标签正则，容忍竖线与 DSML 装饰。"""
     return re.compile(
-        r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*"
+        r"</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*"
         + re.escape(tag_name)
         + r"\s*[｜\|]{0,2}>",
         re.IGNORECASE,
@@ -2249,6 +2363,7 @@ class StreamToolParser:
         self.in_tool = False
         self.has_tool = False
         self.json_done = False
+        self.in_bare = False
         self._end_re = None
 
     def feed(self, chunk):
@@ -2305,7 +2420,7 @@ class StreamToolParser:
                     self.buffer = self.buffer[start:]
                     tag_name = m.group(1).lower()
                     self._end_re = re.compile(
-                        r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*"
+                        r"</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*"
                         + re.escape(tag_name)
                         + r"[｜\|]{0,2}\s*>",
                         re.IGNORECASE,
@@ -2350,7 +2465,7 @@ class StreamToolParser:
                     out.append({"tool": item})
             elif not self.json_done:
                 stripped = re.sub(
-                    r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call|parameter)[^>]*>",
+                    r"</?(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|invoke|function_call|parameter)[^>]*>",
                     "",
                     self.buffer,
                     flags=re.IGNORECASE,
