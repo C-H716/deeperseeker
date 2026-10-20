@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import mimetypes
@@ -763,6 +764,78 @@ def _replay_stream(gen, first):
 MAX_UPSTREAM_ATTEMPTS = max(1, int(os.getenv("DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS", "3")))
 
 
+# 上下文滚动的抑制窗口。客户端每轮都会重发完整历史，而 rollover 只迁移上游
+# chat、不会让客户端历史变短，所以「历史超限」在之后每个用户轮都成立。若不加
+# 抑制，每个用户轮都会新建 chat 并额外跑一次摘要请求（实测单次 +20~30s）。
+#
+# 抑制键锚定「会话根」（首条 user 文本）而非签名：签名截到最后一个 assistant，
+# 跨用户轮就会变化，用它做键等于每轮都失效。
+ROLLOVER_SUPPRESS_SECONDS = int(
+    os.getenv("DEEPSEEKER_ROLLOVER_SUPPRESS_SECONDS", "600")
+)
+# 自上次滚动以来客户端历史至少新增这么多（相对上下文预算的比例）token，才
+# 允许再次滚动。保证抑制不会把远超上游上限的内容硬塞进新 chat。
+ROLLOVER_RESUME_FRACTION = float(
+    os.getenv("DEEPSEEKER_ROLLOVER_RESUME_FRACTION", "0.25")
+)
+_ROLLOVER_LAST = OrderedDict()
+_ROLLOVER_LAST_MAX = 4096
+
+
+def _conversation_root(messages, model, scope):
+    """One stable key per client conversation, immune to per-turn sig drift."""
+    first_user = next((m for m in messages if m.get("role") == "user"), None)
+    seed = ""
+    if first_user is not None:
+        c = first_user.get("content", "")
+        if isinstance(c, list):
+            seed = " ".join(
+                p.get("text", "")
+                for p in c
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        else:
+            seed = str(c)
+    return hashlib.sha256(f"{model}_{scope}_{seed[:2000]}".encode()).hexdigest()
+
+
+def _should_rollover(messages, model, scope):
+    """needs_rollover() plus the post-rollover suppression window."""
+    if not needs_rollover(messages):
+        return False
+    key = _conversation_root(messages, model, scope)
+    last = _ROLLOVER_LAST.get(key)
+    if last is None:
+        return True
+    last_ts, last_tokens = last
+    age = time.time() - last_ts
+    if age >= ROLLOVER_SUPPRESS_SECONDS:
+        return True
+    current = estimate_conversation_tokens(messages)
+    resume_at = last_tokens + max(
+        1, int(context_window_tokens() * ROLLOVER_RESUME_FRACTION)
+    )
+    if current >= resume_at:
+        return True
+    logger.info(
+        "Context rollover suppressed (root=%s age=%ds tokens=%d resume_at=%d)",
+        key[:12],
+        int(age),
+        current,
+        resume_at,
+    )
+    return False
+
+
+def _note_rollover(messages, model, scope):
+    """Record a completed rollover so the next turns can skip re-summarizing."""
+    key = _conversation_root(messages, model, scope)
+    _ROLLOVER_LAST[key] = (time.time(), estimate_conversation_tokens(messages))
+    _ROLLOVER_LAST.move_to_end(key)
+    while len(_ROLLOVER_LAST) > _ROLLOVER_LAST_MAX:
+        _ROLLOVER_LAST.popitem(last=False)
+
+
 async def _preflight_stream(gen):
     """Consume the first chunk eagerly so upstream errors surface before streaming starts."""
     try:
@@ -856,7 +929,7 @@ async def handle_chat(
             tok
             and tok.get("status") != "RATE_LIMITED"
             and parent_message_id != 0
-            and needs_rollover(messages)
+            and _should_rollover(messages, model, scope)
         ):
             old_session_id = session_id
             old_lock = await _own_chat_lock(old_session_id)
@@ -896,6 +969,7 @@ async def handle_chat(
                     ROLLOVER_HANDOFFS.move_to_end(sig)
                     while len(ROLLOVER_HANDOFFS) > ROLLOVER_HANDOFFS_MAX:
                         ROLLOVER_HANDOFFS.popitem(last=False)
+                    _note_rollover(messages, model, scope)
                     logger.info(
                         "Context rollover: migrated live chat %s -> %s (summary ~%d tokens)",
                         old_session_id,
@@ -944,6 +1018,7 @@ async def handle_chat(
                             rollover_summary = strip_summary_tags(
                                 await collect_response(summary_gen)
                             )[: MAX_SUMMARY_TOKENS * 4]
+                            _note_rollover(messages, model, scope)
                         prompt = await build_prompt(
                             messages,
                             tools or [],
@@ -1203,7 +1278,7 @@ async def handle_chat(
                 # that summary via build_prompt(rollover_summary=...). A single large
                 # first exchange is untouched (the first-message path accepts ~1M
                 # tokens); this only fires for accumulated session context.
-                if needs_rollover(messages):
+                if _should_rollover(messages, model, scope):
                     scratch_chat = await create_new_chat(tok["token"])
                     summary_gen = send_message(
                         scratch_chat,
@@ -1218,6 +1293,7 @@ async def handle_chat(
                     rollover_summary = summary[
                         : MAX_SUMMARY_TOKENS * 4
                     ]  # ~4 chars/token cap
+                    _note_rollover(messages, model, scope)
                     logger.info(
                         "Context rollover: handoff summary of ~%d tokens prepared in scratch chat %s",
                         count_tok(rollover_summary),
@@ -1289,7 +1365,7 @@ async def handle_chat(
                 # parent_message_id (which would fork the upstream exchange).
                 parent_message_id = fresh["parent_message_id"]
 
-        if parent_message_id != 0 and needs_rollover(messages):
+        if parent_message_id != 0 and _should_rollover(messages, model, scope):
             logger.info(
                 "Context rollover: accumulated context over limit; purging session mappings for chat %s",
                 session_id,
@@ -1311,6 +1387,7 @@ async def handle_chat(
             session_id = await create_new_chat(tok["token"])
             await _db(save_session, sig, token_id, session_id, 0)
             parent_message_id = 0
+            _note_rollover(messages, model, scope)
             # The rollover itself was serialized under the OLD chat's lock;
             # the send -> save section below must hold the FRESH chat's lock.
             # Queued same-signature requests re-derive the new mapping from
