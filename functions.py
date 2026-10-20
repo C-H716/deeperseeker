@@ -2143,7 +2143,13 @@ def parse_tools(text):
     # Keep companion text: the tool-call blocks themselves were already removed
     # from clean_text above; only leftover bare tags are stripped here.
     clean_text = re.sub(
-        r"</?(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|invoke|function_call|parameter)[^>]*>",
+        # 第二个分支覆盖「只有 DSML 标记、没有标签名」的纯装饰标签，例如
+        # ``</ | | DSML | | >``；首个分支要求带标签名，匹配不到时模型收尾
+        # 成串吐出的装饰标签会原样留在正文里（截图即此形态）。
+        r"</?(?:\s*[｜\|]){0,2}\s*(?:"
+        r"(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|invoke|function_call|parameter)[^>]*"
+        r"|DSML\s*(?:\s*[｜\|]){0,2}"
+        r")\s*>",
         "",
         clean_text,
         flags=re.IGNORECASE,
@@ -2186,7 +2192,13 @@ _STREAM_ENTRY_RE = re.compile(
 # block, and a parameter closer sits inside the block, so matching it would cut
 # the block short before </invoke> arrives.
 _ORPHAN_CLOSER_RE = re.compile(
-    r"</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|function_call|invoke|param(?:eter)?)\s*[｜\|]{0,2}>",
+    # 第二分支覆盖「只有 DSML 标记、没有标签名」的纯装饰闭标签，例如
+    # ``</ | | DSML | | >``。模型收尾时会成串吐这种标签；第一分支要求带
+    # 标签名，匹配不到时整串会作为正文漏给客户端。
+    r"</(?:\s*[｜\|]){0,2}\s*(?:"
+    r"(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|function_call|invoke|param(?:eter)?)\s*[｜\|]{0,2}"
+    r"|DSML\s*(?:\s*[｜\|]){0,2}"
+    r")\s*>",
     re.IGNORECASE,
 )
 
@@ -2310,9 +2322,24 @@ class ReasoningMarkupFilter:
 
 
 def _skip_bars(text, pos):
-    for _ in range(2):
-        if pos < len(text) and text[pos] in "|｜":
-            pos += 1
+    """跳过 DSML 装饰 "(?:\\s*[|｜]){0,2}" 及其后的空白。
+
+    模型输出装饰时竖线之间常夹空格（如 "</ | | DSML | | >"），只跳裸竖线会
+    让前缀判定提前失败，缓冲内容被当成正文泄漏出去。
+    """
+    length = len(text)
+    groups = 0
+    while groups < 2:
+        probe = pos
+        while probe < length and text[probe].isspace():
+            probe += 1
+        if probe < length and text[probe] in "|｜":
+            pos = probe + 1
+            groups += 1
+            continue
+        break
+    while pos < length and text[pos].isspace():
+        pos += 1
     return pos
 
 
@@ -2328,6 +2355,10 @@ def _is_plausible_stream_entry_prefix(segment: str, tags=None) -> bool:
     pos = _skip_bars(body, 0)
     length = len(body)
     if pos < length and body[pos] in "Dd":
+        # 裸 "< D" / "< DSML" 不是 DSML 前缀：模型在正文里写到 "< D..." 这类
+        # 内容时不能让缓冲无限挂起。装饰竖线必须成对出现（"<||DSML"）。
+        if sum(1 for c in body[:pos] if c in "|｜") < 2:
+            return False
         matched = 0
         while matched < 4 and pos < length and body[pos].upper() == "DSML"[matched]:
             pos += 1

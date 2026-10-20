@@ -97,6 +97,21 @@ def test_normal_tags_unaffected():
     assert "arguments" not in prose
 
 
+def test_decorated_closers_do_not_leak():
+    """模型收尾成串吐出的纯装饰闭标签（无标签名）不得漏进正文。
+
+    形态：``</ | | DSML | | >`` 重复多次。它没有 ``invoke`` / ``tool_call``
+    这类标签名，旧正则要求标签名，整串会被当作正文透传（见截图）。
+    """
+    text = "head\n" + (chr(60) + "/ | | DSML | | " + chr(62)) * 8 + "\ntail"
+    _, clean = parse_tools(text)
+    assert "DSML" not in clean, clean
+    for chunk in (1, 3, 7, 50, 1000):
+        tools, prose = _stream(text, chunk)
+        assert not tools, (chunk, tools)
+        assert "DSML" not in prose, (chunk, prose)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     bad = 0
