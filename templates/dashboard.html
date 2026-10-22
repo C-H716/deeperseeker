@@ -79,6 +79,8 @@
                             <th>别名</th>
                             <th>Token</th>
                             <th>状态</th>
+                            <th>占用</th>
+                            <th>转移</th>
                             <th>最近检查</th>
                             <th class="ta-right">操作</th>
                         </tr>
@@ -93,6 +95,21 @@
                                 <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] in ('RATE_LIMITED', 'CHECK_ERROR') %}warn{% else %}err{% endif %}">
                                     {% if tok['status'] == 'ACTIVE' %}有效{% elif tok['status'] == 'RATE_LIMITED' %}被限流{% elif tok['status'] == 'INVALID' %}已失效{% elif tok['status'] == 'CHECK_ERROR' %}检查失败{% else %}{{ tok['status'] }}{% endif %}
                                 </span>
+                            </td>
+                            <td class="nowrap">
+                                {% set busy = inflight.get(tok['id'], 0) %}
+                                <span class="status {% if busy %}busy{% else %}idle{% endif %}">
+                                    {% if busy %}使用中 {{ busy }}{% if concurrency_cap %} / {{ concurrency_cap }}{% endif %}{% else %}空闲{% endif %}
+                                </span>
+                            </td>
+                            <td class="muted nowrap">
+                                {% set rot = rotation_stats.get(tok['id']) %}
+                                {% if rot and (rot.out or rot.in) %}
+                                    转出 {{ rot.out }} · 转入 {{ rot.in }}
+                                    {% if rot.last_at %}<span class="sub">最近 {{ rot.last_at|fmt_ts }}</span>{% endif %}
+                                {% else %}
+                                    —
+                                {% endif %}
                             </td>
                             <td class="muted nowrap">
                                 {% if tok['last_checked_at'] %}{{ tok['last_checked_at'] }}{% else %}未检查{% endif %}

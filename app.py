@@ -43,6 +43,7 @@ from functions import (  # noqa: E402
     CookieGenerationError,
     ReasoningMarkupFilter,
     StreamToolParser,
+    TOKEN_CONCURRENCY_CAP,
     TokenLease,
     add_token,
     check_token_status,
@@ -59,8 +60,10 @@ from functions import (  # noqa: E402
     get_auth_token,
     get_file_content,
     get_file_token,
+    get_rotation_stats,
     get_token,
     get_tokens,
+    inflight_snapshot,
     init_db,
     login_deepseek_account,
     mark_active,
@@ -71,6 +74,7 @@ from functions import (  # noqa: E402
     pick_token,
     record_cached_input,
     record_file,
+    record_rotation,
     reset_cached_input,
     save_account_login,
     save_session,
@@ -417,6 +421,23 @@ def _static_version() -> str:
 
 
 templates.env.globals["static_version"] = _static_version()
+
+
+def _fmt_ts(value, fmt="%m-%d %H:%M:%S"):
+    """把 epoch 秒格式化成控制台用的本地时间；空值渲染成破折号。
+
+    号池表格里 last_used / 转移时间 / 限流冷却截止都是 epoch 秒，模板里
+    逐个 strftime 太啰嗦，统一走这个过滤器。
+    """
+    if not value:
+        return "—"
+    try:
+        return time.strftime(fmt, time.localtime(float(value)))
+    except (TypeError, ValueError, OSError):
+        return "—"
+
+
+templates.env.filters["fmt_ts"] = _fmt_ts
 
 
 @app.middleware("http")
@@ -1003,6 +1024,11 @@ async def handle_chat(
                     try:
                         await _db(delete_sessions_for_chat, token_id, session_id)
                         new_session_id = await create_new_chat(new_tok["token"])
+                        # 控制台的「转移」列据此统计每个账号的转出/转入。写在
+                        # 会话重建成功之后，失败的轮换不会污染统计。
+                        await _db(
+                            record_rotation, token_id, new_token_id, session_id
+                        )
                         rot_owner = await _own_chat_lock(new_session_id)
                         if needs_rollover(messages):
                             scratch_chat = await create_new_chat(new_tok["token"])
@@ -3844,6 +3870,7 @@ async def dashboard(request: Request):
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     tokens = await _db(get_tokens)
     accounts = await _db(get_accounts)
+    rotation_stats = await _db(get_rotation_stats)
     account_error = request.query_params.get("account_error")
     account_message = request.query_params.get("account_message")
     return templates.TemplateResponse(
@@ -3852,11 +3879,50 @@ async def dashboard(request: Request):
         {
             "tokens": tokens,
             "accounts": accounts,
+            "rotation_stats": rotation_stats,
+            # 在途计数只在事件循环线程内维护，直接取快照即可，无需进线程池。
+            "inflight": inflight_snapshot(),
+            "concurrency_cap": TOKEN_CONCURRENCY_CAP,
             "account_error": account_error,
             "account_message": account_message,
             "token_check_state": _token_check_state,
             "check_interval": TOKEN_CHECK_INTERVAL,
         },
+    )
+
+
+@app.get("/dashboard/status")
+async def dashboard_status(request: Request):
+    """号池表格的轻量实时数据：在途占用、状态、冷却截止、轮换统计。
+
+    页面每几秒轮询一次，只读本地状态，不触达上游，因此不会干扰正常请求；
+    相比整页刷新，轮询不会打断正在进行的检查或表单输入。
+    """
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    tokens = await _db(get_tokens)
+    rotations = await _db(get_rotation_stats)
+    # 在途计数只在事件循环线程内维护，直接取快照即可。
+    inflight = inflight_snapshot()
+    return JSONResponse(
+        {
+            "concurrency_cap": TOKEN_CONCURRENCY_CAP,
+            "now": time.time(),
+            "tokens": [
+                {
+                    "id": tok["id"],
+                    "status": tok["status"],
+                    "inflight": inflight.get(tok["id"], 0),
+                    "limited_until": tok["limited_until"],
+                    "last_checked_at": tok["last_checked_at"],
+                    "last_check_error": tok["last_check_error"],
+                    "rotation": rotations.get(tok["id"]),
+                }
+                for tok in tokens
+            ],
+        }
     )
 
 

@@ -252,6 +252,12 @@ tbody tr:hover { background: #fbfcfd; }
 .status.ok { background: var(--ok-soft); color: var(--ok); border-color: var(--ok-border); }
 .status.warn { background: var(--warn-soft); color: var(--warn); border-color: var(--warn-border); }
 .status.err { background: var(--danger-soft); color: var(--danger); border-color: var(--danger-border); }
+/* 使用中 / 空闲：在途占用用主色，空闲与冷却用中性色 */
+.status.busy { background: var(--primary-soft); color: var(--primary); border-color: #c7d2fe; }
+.status.idle { background: #f4f5f7; color: var(--text-muted); border-color: var(--border); }
+
+/* 表格单元格里的次要说明行（转移时间、冷却截止等） */
+.sub { display: block; margin-top: 3px; font-size: 11.5px; color: var(--text-faint); }
 
 /* ---------- 按钮 ---------- */
 button {

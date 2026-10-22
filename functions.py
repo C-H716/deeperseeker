@@ -130,6 +130,18 @@ def init_db():
             token_id INTEGER,
             created_at REAL
         );
+        -- 号池轮换记录：某会话因原 token 被限流而改由另一个 token 重建时
+        -- 写一行。控制台据此展示每个账号的「转出 / 转入」次数与最近一次
+        -- 转移。chat_id 是被放弃的上游会话 id（排障用，允许为空）。
+        CREATE TABLE IF NOT EXISTS token_rotations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_token_id INTEGER,
+            to_token_id INTEGER NOT NULL,
+            chat_id TEXT,
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_token_rotations_created
+            ON token_rotations(created_at);
         -- Token usage samples. One row per (hour, model, token, api key):
         -- hours, not days, because DeepSeek bills input and output at double
         -- the rate inside its peak windows and those boundaries fall on whole
@@ -947,7 +959,8 @@ def add_token(token, alias=None, account_id=None):
 def get_tokens():
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, alias, token, status, last_checked_at, last_check_error, account_id FROM tokens ORDER BY id"
+        "SELECT id, alias, token, status, last_checked_at, last_check_error, "
+        "account_id, last_used, limited_until FROM tokens ORDER BY id"
     ).fetchall()
     conn.close()
     return [
@@ -959,6 +972,8 @@ def get_tokens():
             "last_checked_at": r[4],
             "last_check_error": r[5],
             "account_id": r[6],
+            "last_used": r[7],
+            "limited_until": r[8],
         }
         for r in rows
     ]
@@ -989,6 +1004,53 @@ def delete_token(token_id):
     conn.execute("DELETE FROM tokens WHERE id = ?", (token_id,))
     conn.commit()
     conn.close()
+
+
+def record_rotation(from_token_id, to_token_id, chat_id=None):
+    """记录一次号池轮换：会话因原 token 不可用而改由另一个 token 重建。
+
+    控制台的「转移」列据此展示每个账号的转出 / 转入次数与最近一次时间。
+    from_token_id 允许为空（会话首次建立时就没有旧账号）。
+    """
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO token_rotations (from_token_id, to_token_id, chat_id, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (from_token_id, to_token_id, chat_id, time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_rotation_stats():
+    """按 token 汇总轮换次数与最近一次转移时间。
+
+    返回 {token_id: {out, in, last_at}}；last_at 为 epoch 秒，从未转移时为 None。
+    已删除 token 的历史行仍保留，因此另一侧的计数不会因删除对端而丢失。
+    这里保留 epoch 秒而不预格式化：控制台既要显示时间，也要据此判断
+    「最近一次是转出还是转入」，格式化交给模板过滤器 _fmt_ts。
+    """
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT token_id, SUM(out_n), SUM(in_n), MAX(last_at) FROM ("
+        "  SELECT from_token_id AS token_id, COUNT(*) AS out_n, 0 AS in_n, "
+        "         MAX(created_at) AS last_at "
+        "  FROM token_rotations WHERE from_token_id IS NOT NULL "
+        "  GROUP BY from_token_id"
+        "  UNION ALL"
+        "  SELECT to_token_id, 0, COUNT(*), MAX(created_at) "
+        "  FROM token_rotations GROUP BY to_token_id"
+        ") GROUP BY token_id"
+    ).fetchall()
+    conn.close()
+    stats = {}
+    for token_id, out_n, in_n, last_at in rows:
+        stats[token_id] = {
+            "out": out_n or 0,
+            "in": in_n or 0,
+            "last_at": last_at or None,
+        }
+    return stats
 
 
 RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("DEEPSEEKER_RATE_LIMIT_COOLDOWN", "60"))
