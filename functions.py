@@ -1783,6 +1783,26 @@ def _code_fence_spans(text):
     ]
 
 
+# 开启思考时该请求的推理强度（"high"、"max" 等），由各对话端点写入；
+# build_prompt 据此追加「更充分推理」的指令。
+request_effort = contextvars.ContextVar("request_effort", default=None)
+
+
+def effort_level(body):
+    """从各协议方言中取出客户端的 effort 字符串。"""
+    cands = [body.get("reasoning_effort"), body.get("effort")]
+    for key in ("reasoning", "output_config", "thinking"):
+        v = body.get(key)
+        if isinstance(v, dict):
+            cands += [v.get("effort"), v.get("reasoning_effort"), v.get("level")]
+        elif key == "thinking" and isinstance(v, str):
+            cands.append(v)
+    for c in cands:
+        if isinstance(c, str) and c.strip():
+            return c.strip().lower()
+    return None
+
+
 # 参数开标签存在多种畸形写法：闭标签误当开标签（``</…parameter name=…>``）、
 # 缺 ``name`` 只留 ``parameter="x"``、以及完全省略 ``parameter name=`` 而直接写成
 # ``<…command" string="true">``。参数值的结束位置同样不确定：可能是规范闭标签、
@@ -3086,6 +3106,34 @@ def _deepseek_event_finished(data):
     )
 
 
+def _deepseek_status_words(data):
+    """收集事件中所有状态字段的取值（``response/status``、``quasi_status`` 等）。
+
+    状态字段承载的是 FINISHED、INCOMPLETE、WIP 这类状态词，永远不是答案内容。
+    批内（BATCH）事件会把状态字段嵌套在 ``v`` 数组中，因此需要递归遍历。
+    """
+    words = set()
+    if isinstance(data, list):
+        for item in data:
+            words |= _deepseek_status_words(item)
+        return words
+    if not isinstance(data, dict):
+        return words
+    path = data.get("p")
+    value = data.get("v")
+    if (
+        isinstance(path, str)
+        and isinstance(value, str)
+        and (path == "quasi_status" or path.endswith("status"))
+    ):
+        words.add(value)
+    for key in ("v", "data", "value"):
+        child = data.get(key)
+        if isinstance(child, (dict, list)):
+            words |= _deepseek_status_words(child)
+    return words
+
+
 def _deepseek_event_search_results(data):
     """Collect structured web-search results carried by a DeepSeek SSE event.
 
@@ -3429,6 +3477,10 @@ async def _send_message_unlocked(
 
     think_open = False
     got_output = False
+    # DeepSeek 会以 status INCOMPLETE 结束被截断的回复（长上下文下常见于思考中途）。
+    # 此时若尚无答案文本，该轮属于失败而非完成：空 stop 会让 agent 客户端结束回合。
+    incomplete = False
+    got_response = False
     recent_events = []
     # c181d06：错误归类需要两条独立轨迹——parsed_events 供 _scan_recent_sse_errors
     # 读取结构化 error 事件，recent_lines 供 _sse_context_limit_hint 做文本正则匹配。
@@ -3452,6 +3504,13 @@ async def _send_message_unlocked(
                 error_text[:300],
             )
             raise Exception(f"HTTP {resp.status}: {error_text}")
+
+        def _check_incomplete():
+            if incomplete and not got_response:
+                raise UpstreamError(
+                    502,
+                    "DeepSeek stopped the reply before any answer (status INCOMPLETE)",
+                )
 
         async for payload in _iter_deepseek_sse_payloads(resp.content):
             payload_count += 1
@@ -3496,6 +3555,19 @@ async def _send_message_unlocked(
                 )
                 raise DeepSeekRateLimitError()
 
+            # 状态字段（``response/status``、``.../status`` 与批内的 ``quasi_status``）
+            # 承载的是 FINISHED、INCOMPLETE、WIP 这类状态词，永远不是答案内容。
+            status_words = _deepseek_status_words(data)
+            if "INCOMPLETE" in status_words:
+                incomplete = True
+            p_name = str(data.get("p") or "")
+            if p_name.endswith("status") and not (
+                p_name == "response/status" and data.get("v") == "FINISHED"
+            ):
+                # 纯状态事件：既不能作为正文输出，也不代表本轮结束；FINISHED
+                # 交由下方结束分支处理。
+                continue
+
             for fragment_type, content in _deepseek_event_fragments(data):
                 if fragment_type == "THINK":
                     if not think_open:
@@ -3506,15 +3578,19 @@ async def _send_message_unlocked(
                     think_open = False
                 if content:
                     got_output = True
+                    if fragment_type == "RESPONSE":
+                        got_response = True
                     yield content
 
             v = data.get("v")
             if not _deepseek_event_finished(data) and isinstance(v, str) and v:
                 got_output = True
+                got_response = got_response or not think_open
                 yield v
             if _deepseek_event_finished(data):
                 if think_open:
                     yield "\n</think>\n\n"
+                _check_incomplete()
                 if not got_output:
                     content_type = getattr(resp, "headers", {}).get(
                         "Content-Type", "unknown"
@@ -3535,6 +3611,7 @@ async def _send_message_unlocked(
                 return
         if think_open:
             yield "\n</think>\n\n"
+        _check_incomplete()
         if not got_output:
             content_type = getattr(resp, "headers", {}).get("Content-Type", "unknown")
             logger.warning(

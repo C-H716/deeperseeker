@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from functions import count_tokens, get_session, upload_file
+from functions import count_tokens, get_session, request_effort, upload_file
 
 # Token budgets for injected history when (re)building a session prompt.
 MAX_HISTORY_TOKENS = int(os.getenv("DEEPSEEKER_MAX_HISTORY_TOKENS", "24000"))
@@ -853,6 +853,26 @@ async def generate_signature(messages, model, scope=""):
     return generate_signature_sync(messages, model, scope)
 
 
+# DeepSeek web 仅有单一思考模式（DeepThink 开关），因此高于 medium 的 effort 只能
+# 通过要求更充分的推理来近似；实测思考长度增加约 1.1–2.4 倍。
+# "high" 不附加指令：在长会话中该指令会把推理长度放大（中位数 452 → 7401 字符），
+# 过长的推理会触发 DeepSeek 截断，最终以 INCOMPLETE 状态结束且没有答案。
+EFFORT_INSTRUCTIONS = {
+    "max": (
+        "[REASONING EFFORT: max] Before answering, reason exhaustively in your thinking: try at least two "
+        "different approaches, check edge cases, verify every step and re-check the final answer "
+        "independently. Take as long as needed."
+    ),
+}
+for _alias in ("xhigh", "ultra", "extreme"):
+    EFFORT_INSTRUCTIONS[_alias] = EFFORT_INSTRUCTIONS["max"]
+
+
+def _with_effort(prompt):
+    instruction = EFFORT_INSTRUCTIONS.get(request_effort.get() or "")
+    return prompt + instruction + "\n" if instruction else prompt
+
+
 async def build_prompt(
     messages, tools, model, is_first_message=False, rollover_summary=None
 ):
@@ -908,7 +928,7 @@ async def build_prompt(
         if tools_extract:
             final_prompt += _context_section("TOOLS", tools_extract, data=False)
             final_prompt += tool_instructions + "\n"
-        return final_prompt.strip() + "\n\n"
+        return _with_effort(final_prompt.strip() + "\n\n")
     if is_first_message:
         system_prompt = await extract_system(messages)
         if system_prompt:
@@ -1025,4 +1045,4 @@ async def build_prompt(
         if tools_extract:
             final_prompt += TOOL_USE_INSTRUCTIONS + "\n"
 
-    return final_prompt
+    return _with_effort(final_prompt)

@@ -12,3 +12,7 @@ CI 环境本就没有 .env，该默认值与未设置时的行为一致，不改
 import os
 
 os.environ.setdefault("HOST", "127.0.0.1")
+# 开发机 .env 可能显式放行默认口令。该键在 app.py 导入时由 load_dotenv 读回，
+# 而 load_dotenv 默认不覆盖已存在的环境变量，因此这里先以空值占位：键存在即被
+# 跳过，安全用例得以继续验证「默认拒绝」这一被测语义。
+os.environ.setdefault("DEEPSEEKER_ALLOW_DEFAULT_ADMIN", "")

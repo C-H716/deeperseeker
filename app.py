@@ -55,6 +55,7 @@ from functions import (  # noqa: E402
     delete_account,
     delete_sessions_for_chat,
     delete_token,
+    effort_level,
     find_session,
     get_accounts,
     get_auth_token,
@@ -75,6 +76,7 @@ from functions import (  # noqa: E402
     record_cached_input,
     record_file,
     record_rotation,
+    request_effort,
     request_tools,
     reset_cached_input,
     save_account_login,
@@ -826,6 +828,10 @@ def _replay_stream(gen, first):
 # 尝试之间加入抖动退避。预算耗尽时按 502 类返回上游错误（已脱敏、已截断）。
 MAX_UPSTREAM_ATTEMPTS = max(1, int(os.getenv("DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS", "3")))
 
+# 如何把当前对话请求换到另一账号重跑：由 handle_chat 写入，供 stream_response
+# 在 DeepSeek 于任何可见输出到达客户端之前断流时调用（重试预算耗尽后为 None）。
+_stream_retry = ContextVar("stream_retry", default=None)
+
 
 # 上下文滚动的抑制窗口。客户端每轮都会重发完整历史，而 rollover 只迁移上游
 # chat、不会让客户端历史变短，所以「历史超限」在之后每个用户轮都成立。若不加
@@ -924,6 +930,25 @@ async def handle_chat(
     is_responses=False,
     response_opts=None,
 ):
+    _stream_retry.set(
+        None
+        if _attempt + 1 >= MAX_UPSTREAM_ATTEMPTS
+        else lambda failed_token: handle_chat(
+            messages,
+            model,
+            thinking,
+            search,
+            stream,
+            tools,
+            is_anthropic,
+            req_model,
+            scope,
+            _attempt=_attempt + 1,
+            _exclude_token=failed_token,
+            is_responses=is_responses,
+            response_opts=response_opts,
+        )
+    )
     # 把本次请求的工具清单写入上下文变量，供 parse_tools 在模型漏写工具名时
     # 依据参数集合反推真实工具名。
     request_tools.set(tools)
@@ -1818,6 +1843,7 @@ async def stream_response(
     is_thinking = False
     aborted = False
     failed = False
+    sent_content = False  # 已有可见文本到达客户端（推理内容不计）
     try:
         async for chunk in _hold_think_tags(gen):
             if not chunk:
@@ -1851,6 +1877,7 @@ async def stream_response(
 
             for r in parser.feed(chunk):
                 if "text" in r:
+                    sent_content = True
                     yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
         await _db(mark_active, token_id)
     except (asyncio.CancelledError, GeneratorExit):
@@ -1882,8 +1909,22 @@ async def stream_response(
         else:
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.exception("stream_response failed")
-        with suppress(Exception):
-            yield f"data: {json.dumps({'error': {'message': str(e)[:300]}})}\n\n"
+        # 在任何可见文本或工具调用到达客户端之前断流：换一个账号重跑该请求并把
+        # 结果流式转发，而不是把错误抛给客户端。
+        retry = _stream_retry.get()
+        retried = None
+        if not sent_content and retry is not None:
+            logger.warning(
+                "stream_response: upstream failed before any output, retrying on another account"
+            )
+            with suppress(Exception):
+                retried = await retry(token_id)
+        if isinstance(retried, StreamingResponse):
+            async for part in retried.body_iterator:
+                yield part
+        else:
+            with suppress(Exception):
+                yield f"data: {json.dumps({'error': {'message': str(e)[:300]}})}\n\n"
     finally:
         parsed_tools, clean_text = parse_tools(full_text)
         clean_text = re.sub(
@@ -2623,6 +2664,7 @@ async def chat_completions(request: Request):
     messages = body.get("messages", [])
     model = resolve_model(body.get("model"))
     thinking = is_thinking_enabled(body, request)
+    request_effort.set(effort_level(body) if thinking else None)
     search = body.get("search", False)
     stream = body.get("stream", False)
     tools = body.get("tools", None)
@@ -3548,6 +3590,7 @@ async def openai_responses(request: Request):
         messages.insert(0, {"role": "system", "content": inst_text})
 
     thinking = is_thinking_enabled(body, request)
+    request_effort.set(effort_level(body) if thinking else None)
     search = bool(body.get("search", False))
     stream = bool(body.get("stream", False))
     raw_tools = body.get("tools", None)
