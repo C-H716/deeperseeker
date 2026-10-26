@@ -88,12 +88,71 @@ def test_module_api_key_always_present():
     assert app_module.API_KEY, "API_KEY must never be empty (fail-open)"
 
 
+def test_boot3_default_admin_non_loopback_refuses():
+    """默认口令遇到非环回绑定必须拒绝启动，且拒绝信息须指明具体改法。"""
+    with mock.patch.dict(os.environ, {"HOST": "0.0.0.0"}):
+        try:
+            app_module._enforce_exposure_policy()
+        except SystemExit as e:
+            message = str(e)
+            assert "DEEPSEEKER_ADMIN_PASSWORD" in message, (
+                "拒绝信息必须指明具体的环境变量改法"
+            )
+            assert "DEEPSEEKER_ADMIN_USER" in message
+        else:
+            raise AssertionError("默认口令与非环回绑定同时存在时必须拒绝启动")
+
+
+def test_boot2_default_admin_loopback_still_boots():
+    """环回绑定配合默认口令保持既有行为：仅告警，不拒绝。"""
+    with mock.patch.dict(os.environ, {"HOST": "127.0.0.1"}):
+        app_module._enforce_exposure_policy()  # 不得抛出
+
+
+def test_boot2_default_admin_unset_host_still_boots():
+    """HOST 未设置时取默认值 127.0.0.1，属于环回启动。"""
+    with mock.patch.dict(os.environ, {}, clear=True):
+        app_module._enforce_exposure_policy()  # 不得抛出
+
+
+def test_non_default_admin_non_loopback_boots():
+    """显式口令加对外绑定属于合法部署，应予放行。"""
+    with (
+        mock.patch.dict(os.environ, {"HOST": "0.0.0.0"}),
+        mock.patch.object(app_module, "ADMIN_USER", "ops"),
+        mock.patch.object(app_module, "ADMIN_PASSWORD", "correct horse battery staple"),
+    ):
+        app_module._enforce_exposure_policy()  # 不得抛出
+
+
+def test_boot3_escape_hatch_is_explicit():
+    """放行开关必须存在，且只认显式取值 1。"""
+    with mock.patch.dict(
+        os.environ, {"HOST": "0.0.0.0", "DEEPSEEKER_ALLOW_DEFAULT_ADMIN": "1"}
+    ):
+        app_module._enforce_exposure_policy()  # 显式接受风险，放行
+    with mock.patch.dict(
+        os.environ, {"HOST": "0.0.0.0", "DEEPSEEKER_ALLOW_DEFAULT_ADMIN": "0"}
+    ):
+        try:
+            app_module._enforce_exposure_policy()
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("除 1 以外的任何取值都必须继续拒绝")
+
+
 TESTS = [
     test_explicit_key_honored,
     test_empty_key_generates_and_persists,
     test_generated_key_never_equals_documented_default,
     test_banner_classifies_loopback_and_exposed_hosts,
     test_module_api_key_always_present,
+    test_boot3_default_admin_non_loopback_refuses,
+    test_boot2_default_admin_loopback_still_boots,
+    test_boot2_default_admin_unset_host_still_boots,
+    test_non_default_admin_non_loopback_boots,
+    test_boot3_escape_hatch_is_explicit,
 ]
 
 

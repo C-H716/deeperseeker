@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextlib
+import contextvars
 import hashlib
 import json
 import logging
@@ -49,6 +50,21 @@ class DeepSeekRateLimitError(Exception):
 
     def __init__(self, message="DeepSeek rate limit reached"):
         super().__init__(f"HTTP 429: {message}")
+
+
+class UpstreamError(Exception):
+    """Upstream DeepSeek failure carrying the HTTP status and body.
+
+    取代早期以 Exception(f"HTTP {status}: ...") 传递状态码的字符串协议：
+    该协议要求调用方用正则解析消息文本，措辞一变就会失效。调用方改为直接
+    读取 .status；str() 仍保持 'HTTP <status>: <body>' 的形态，便于日志与
+    既有 app._upstream_http_code 解析兼容。
+    """
+
+    def __init__(self, status, body=""):
+        self.status = int(status)
+        self.body = str(body)
+        super().__init__(f"HTTP {self.status}: {self.body}")
 
 
 def cookie_file_path():
@@ -1652,6 +1668,16 @@ def _unwrap_nested_arguments(args):
         if key.lower() not in _NESTED_ARG_KEYS:
             return args
         inner = args[key]
+        # 内层也可能是序列化后的 JSON 字符串（XML parameter 的 string="true"
+        # 语义会把整个对象当字符串发出），必须先解码才能继续判断层级。
+        if isinstance(inner, str):
+            try:
+                decoded_inner = json.loads(inner)
+            except Exception:
+                return args
+            if not isinstance(decoded_inner, (dict, list)):
+                return args
+            inner = decoded_inner
         if not isinstance(inner, (dict, list)):
             return args
         args = inner
@@ -1755,6 +1781,94 @@ def _code_fence_spans(text):
     return [
         (m.start(), m.end()) for m in re.finditer(r"```.*?(?:```|$)", text, re.DOTALL)
     ]
+
+
+# 参数开标签存在多种畸形写法：闭标签误当开标签（``</…parameter name=…>``）、
+# 缺 ``name`` 只留 ``parameter="x"``、以及完全省略 ``parameter name=`` 而直接写成
+# ``<…command" string="true">``。参数值的结束位置同样不确定：可能是规范闭标签、
+# 下一个参数开标签，或任意 DSML 标记（裸 ``</…>``、被截断的 ``</…``、
+# ``</… calls>``、缺 ``<`` 的 ``｜｜DSML｜｜parameter>``）。标记本身不属于参数值，
+# 故一律作为值终止符处理。
+_DSML_PARAM_RE = re.compile(
+    r"(?:</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)(?:\s+name\s*=|\s*=)\s*[\x27\x22]([^\x27\x22]+)[\x27\x22]"
+    r"|</?[｜\|]{1,2}DSML[｜\|]{1,2}\s*([A-Za-z_][\w\-]*)[\x27\x22])([^>]*)>"
+    r"(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)>|(?=</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=)|(?=(?:</?)?[｜\|]{1,2}DSML|</?[｜\|]{0,2}DSML[｜\|])|$)",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _dsml_params(body):
+    """按畸形容忍规则解析一个 invoke 块内的参数表。"""
+    args = {}
+    for pm in _DSML_PARAM_RE.finditer(body):
+        p_name = (pm.group(1) or pm.group(2)).strip()
+        p_val = pm.group(4).strip()
+        p_val = re.sub(
+            r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>",
+            "",
+            p_val,
+            flags=re.IGNORECASE,
+        ).strip()
+        # string="true" 表示字面字符串，不得把 "42"/"true" 解析成 JSON 标量。
+        if re.search(r"string=[\x27\x22]true", pm.group(3), re.IGNORECASE):
+            args[p_name] = p_val
+            continue
+        try:
+            args[p_name] = json.loads(p_val)
+        except Exception:
+            args[p_name] = p_val
+    return args
+
+
+# 本次请求的工具清单，由 handle_chat 写入，供 parse_tools 在模型漏写工具名时
+# 反推调用（如只有 function_calls 包裹块而没有 invoke 的情形）。
+request_tools = contextvars.ContextVar("request_tools", default=None)
+
+
+def _tool_schemas():
+    """把本次请求的工具定义整理成 {工具名: JSON Schema}。"""
+    schemas = {}
+    for t in request_tools.get() or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        name = fn.get("name")
+        params = fn.get("parameters") or fn.get("input_schema") or {}
+        if name and isinstance(params, dict):
+            schemas[name] = params
+    return schemas
+
+
+def _infer_tool_name(args, schemas):
+    """返回参数名恰好匹配的唯一工具；存在并列候选时返回 None。"""
+    fits = []
+    for name, params in schemas.items():
+        props = set(params.get("properties") or {})
+        required = set(params.get("required") or [])
+        if set(args) <= props and required <= set(args):
+            fits.append((len(props - set(args)), name))
+    fits.sort()
+    if fits and (len(fits) == 1 or fits[0][0] < fits[1][0]):
+        return fits[0][1]
+    return None
+
+
+def _repair_tool_names(tools):
+    """对不在本次工具清单中的调用名，按参数集合反推真实工具名。"""
+    schemas = _tool_schemas()
+    if not schemas:
+        return tools
+    for t in tools:
+        fn = t["function"]
+        if fn["name"] in schemas:
+            continue
+        try:
+            args = json.loads(fn["arguments"])
+        except Exception:
+            continue
+        if isinstance(args, dict):
+            fn["name"] = _infer_tool_name(args, schemas) or fn["name"]
+    return tools
 
 
 # 逗号形态的入口：``<…invoke name="Edit", "arguments": {…}``。模型把
@@ -1866,44 +1980,50 @@ def parse_tools(text):
         "url",
         "input",
     }
-    tool_matches = list(
-        re.finditer(
-            r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool_call|invoke|function_call)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>",
+    # 调用起点有两类：invoke 开标签（含模型把开闭标签写反的
+    # ``</…invoke name=…>``），以及完全没有 invoke 的 DSML function_calls
+    # 包裹块——后者的工具名由参数集合反推。
+    starts = [
+        (m, m.group(1).strip())
+        for m in re.finditer(
+            r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|invoke|function_calls?)(?:\s+(?:name|tool)\s*=|\s*=)\s*[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>",
             text,
             re.IGNORECASE,
         )
+    ] + [
+        (m, None)
+        for m in re.finditer(
+            r"<[｜\|]{0,2}DSML[｜\|]{0,2}\s*(?:function_calls?|tool_calls?|calls)\s*>",
+            text,
+            re.IGNORECASE,
+        )
+    ]
+    real_tool_matches = sorted(
+        (st for st in starts if not fenced(st[0].start())), key=lambda st: st[0].start()
     )
-    real_tool_matches = [tm for tm in tool_matches if not fenced(tm.start())]
 
     if real_tool_matches:
-        for i, tm in enumerate(real_tool_matches):
-            candidate_name = tm.group(1).strip()
+        schemas = _tool_schemas()
+        for i, (tm, candidate_name) in enumerate(real_tool_matches):
             start_idx = tm.end()
+            # ``invoke name="i" string="true">…``：模型把 invoke 与首个参数连成
+            # 一体。此时该名字是参数名而非工具名，需从标签头开始读作参数，
+            # 工具名改由参数集合反推。
+            if (
+                candidate_name
+                and "string=" in tm.group(0)
+                and schemas
+                and candidate_name not in schemas
+            ):
+                start_idx = tm.start()
+                candidate_name = None
             end_idx = (
-                real_tool_matches[i + 1].start()
+                real_tool_matches[i + 1][0].start()
                 if i + 1 < len(real_tool_matches)
                 else len(text)
             )
             body = text[start_idx:end_idx]
-            args = {}
-            p_matches = re.finditer(
-                r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:parameter|tool_call|param|invoke)>|(?=<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:parameter|tool_call|param|invoke)\s+name=)|$)",
-                body,
-                flags=re.DOTALL | re.IGNORECASE,
-            )
-            for pm in p_matches:
-                p_name = pm.group(1).strip()
-                p_val = pm.group(2).strip()
-                p_val = re.sub(
-                    r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>",
-                    "",
-                    p_val,
-                    flags=re.IGNORECASE,
-                ).strip()
-                try:
-                    args[p_name] = json.loads(p_val)
-                except Exception:
-                    args[p_name] = p_val
+            args = _dsml_params(body)
             tag_param_matches = re.finditer(
                 r"<([A-Za-z0-9_\-]+)>(.*?)(?:</\1>|$)",
                 body,
@@ -1923,8 +2043,10 @@ def parse_tools(text):
                         args[t_name] = json.loads(t_val)
                     except Exception:
                         args[t_name] = t_val
-            if candidate_name:
-                norm = normalize_tool_call(candidate_name, args)
+            if candidate_name or args:
+                # 只有包裹块、没有 invoke 的调用：工具名由参数集合反推，
+                # 此处先用占位名占位，_repair_tool_names 再按工具清单修正。
+                norm = normalize_tool_call(candidate_name or "function_calls", args)
                 if norm:
                     tools.append(norm)
 
@@ -2224,6 +2346,7 @@ def parse_tools(text):
         clean_text,
         flags=re.IGNORECASE,
     ).strip()
+    tools = _repair_tool_names(tools)
     return tools, clean_text
 
 
@@ -2246,7 +2369,7 @@ _TOOL_END_TAG_RE = re.compile(
 # substring start tags; this regex accepts bars, the DSML marker and the
 # space in any combination.
 _STREAM_ENTRY_RE = re.compile(
-    r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(tool[\s_]*calls?|calls|function_call|invoke)\b[^>]*>",
+    r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(tool[\s_]*calls?|calls|function_calls?|invoke)\b[^>]*>",
     re.IGNORECASE,
 )
 
@@ -2270,13 +2393,37 @@ _ORPHAN_CLOSER_RE = re.compile(
     # 文本末尾，避免把后续正文一并吞掉。
     r"</(?:\s*[｜\|]){0,2}\s*(?:"
     # 标签名后必须是非标识符字符，避免正文 ``</tool_x`` 被误吞（同 parse_tools）。
-    r"(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|function_call|invoke|param(?:eter)?)(?![A-Za-z0-9_])[^<>]*"
+    r"(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|function_calls?|invoke|param(?:eter)?)(?![A-Za-z0-9_])[^<>]*"
     r"\s*[｜\|]{0,2}\s*(?:>|(?=<|\Z))"
     # 无标签名的纯装饰分支：``>`` 可选（同 parse_tools 处说明）。
     r"|DSML\s*(?:\s*[｜\|]){0,2}\s*>?"
     r")",
     re.IGNORECASE,
 )
+
+# 裸 DSML 装饰残片：只有 `<` 或 `</` 加 DSML 标记、却没有标签名的串。
+# 模型收尾或分片时会单独吐出这类串；孤立闭标签正则要求 `</` 前缀且必须
+# 带标签名，覆盖不到它们。DSML 之后用先行断言排除「装饰串后紧跟标识符
+# 字母」的形态，否则会把真实开标签咬掉半截。上游用占有量词表达同一约束，
+# 但 Python 3.10 的 re 不支持，故改写为等价的先行断言形式。
+
+
+def _strip_stray_markers(text):
+    """正文路径清洗：只去掉裸 DSML 残片与孤立闭标签。
+
+    开标签不在这里清：正文里真的提到 DSML 开标签时不应被静默删除，只有
+    纯粹的装饰残片才需要清掉。
+    """
+    if not text:
+        return text
+    text = re.sub(
+        r"</?[｜\|]{0,2}DSML(?![｜\|\s]*[A-Za-z_])[｜\|]{0,2}\s*[>＞]?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return _ORPHAN_CLOSER_RE.sub("", text)
+
 
 # Tag names _STREAM_ENTRY_RE can open on.
 _STREAM_ENTRY_TAGS = (
@@ -2285,6 +2432,7 @@ _STREAM_ENTRY_TAGS = (
     "tool calls",
     "tool call",
     "function_call",
+    "function_calls",
     "invoke",
     "calls",
 )
@@ -2299,7 +2447,7 @@ _STREAM_CLOSER_TAGS = _STREAM_ENTRY_TAGS + ("param", "parameter", "tool")
 # 原样透传（app.py 的 reasoning 分支只做净化，不产出工具调用）。
 _REASONING_MARKUP_RE = re.compile(
     r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*"
-    r"(tool[\s_]*calls?|tool|calls|function_call|invoke|param(?:eter)?)\b[^>]*>",
+    r"(tool[\s_]*calls?|tool|calls|function_calls?|invoke|param(?:eter)?)\b[^>]*>",
     re.IGNORECASE,
 )
 
@@ -2365,7 +2513,7 @@ class ReasoningMarkupFilter:
                 continue
             match = _REASONING_MARKUP_RE.search(self._buffer)
             if match:
-                out.append(_ORPHAN_CLOSER_RE.sub("", self._buffer[: match.start()]))
+                out.append(_strip_stray_markers(self._buffer[: match.start()]))
                 self._buffer = self._buffer[match.end() :]
                 self._in_block = True
                 self._closer_re = _markup_closer_re(match.group(1))
@@ -2377,10 +2525,10 @@ class ReasoningMarkupFilter:
                     _is_plausible_stream_entry_prefix(tail, _STREAM_CLOSER_TAGS)
                     or _is_plausible_stream_closer_prefix(tail)
                 ):
-                    out.append(_ORPHAN_CLOSER_RE.sub("", self._buffer[:last_lt]))
+                    out.append(_strip_stray_markers(self._buffer[:last_lt]))
                     self._buffer = tail
                     return "".join(out)
-            out.append(_ORPHAN_CLOSER_RE.sub("", self._buffer))
+            out.append(_strip_stray_markers(self._buffer))
             self._buffer = ""
             return "".join(out)
 
@@ -2394,7 +2542,7 @@ class ReasoningMarkupFilter:
         if was_in_block:
             # 块未闭合即流结束：缓冲内容属于待丢弃的工具标记，整体丢弃。
             return ""
-        return _ORPHAN_CLOSER_RE.sub("", buffered)
+        return _strip_stray_markers(buffered)
 
 
 def _skip_bars(text, pos):
@@ -2522,7 +2670,7 @@ class StreamToolParser:
                     start = m.start()
                     if start > 0:
                         results.append(
-                            {"text": _ORPHAN_CLOSER_RE.sub("", self.buffer[:start])}
+                            {"text": _strip_stray_markers(self.buffer[:start])}
                         )
                     self.buffer = self.buffer[start:]
                     tag_name = m.group(1).lower()
@@ -2547,12 +2695,12 @@ class StreamToolParser:
                 if last_lt != -1 and hold:
                     if last_lt > 0:
                         results.append(
-                            {"text": _ORPHAN_CLOSER_RE.sub("", self.buffer[:last_lt])}
+                            {"text": _strip_stray_markers(self.buffer[:last_lt])}
                         )
                     self.buffer = tail
                     break
                 if self.buffer:
-                    results.append({"text": _ORPHAN_CLOSER_RE.sub("", self.buffer)})
+                    results.append({"text": _strip_stray_markers(self.buffer)})
                 self.buffer = ""
                 break
         return results
@@ -2563,7 +2711,7 @@ class StreamToolParser:
             # 流结束时缓冲里可能只剩模型收尾吐出的装饰闭标签串（例如
             # ``</ | | DSML | | `` 反复出现，且整串不带 ``>``）。原样透传会
             # 让协议残留出现在正文里，因此这里同样走孤立闭标签清理。
-            text = _ORPHAN_CLOSER_RE.sub("", self.buffer)
+            text = _strip_stray_markers(self.buffer)
             if text:
                 out.append({"text": text})
         elif self.in_tool:
@@ -3203,7 +3351,52 @@ def _raise_sse_error_event(data, recent_lines):
     raise Exception(f"HTTP 502: {content}")
 
 
-async def send_message(
+# DeepSeek 同一账号同一时刻只允许一个生成任务：并发发送会返回
+# 「A message is being generated」或「Messages too frequent」。因此按账号串行化，
+# 所有生成均经由 send_message，覆盖全部调用方。
+_send_locks = {}
+
+
+def token_busy(auth_token):
+    """账号正在生成时返回 True（其发送锁被持有）。"""
+    lock = _send_locks.get(auth_token)
+    return bool(lock and lock.locked())
+
+
+async def send_message(chat_id, auth_token, *args, **kwargs):
+    # 上游流由独立任务排空，锁在 DeepSeek 结束生成时即释放；即使消费方中途
+    # 放弃该生成器（客户端断开且未调用 aclose），锁也不会泄漏。此前在 yield
+    # 期间持有锁，一次放弃即会长期占用该账号，后续请求全部阻塞。
+    lock = _send_locks.setdefault(auth_token, asyncio.Lock())
+    queue = asyncio.Queue()
+    done = object()
+
+    async def pump():
+        try:
+            async with lock:
+                gen = _send_message_unlocked(chat_id, auth_token, *args, **kwargs)
+                try:
+                    async for chunk in gen:
+                        queue.put_nowait(chunk)
+                finally:
+                    await gen.aclose()
+        except Exception as e:
+            queue.put_nowait(e)
+        finally:
+            queue.put_nowait(done)
+
+    task = asyncio.create_task(pump())
+    try:
+        while (item := await queue.get()) is not done:
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        # 消费方关闭本生成器（断开、中止）时仍需取消上游任务。
+        task.cancel()
+
+
+async def _send_message_unlocked(
     chat_id,
     auth_token,
     message,

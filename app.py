@@ -40,10 +40,10 @@ security = HTTPBasic()
 
 
 from functions import (  # noqa: E402
+    TOKEN_CONCURRENCY_CAP,
     CookieGenerationError,
     ReasoningMarkupFilter,
     StreamToolParser,
-    TOKEN_CONCURRENCY_CAP,
     TokenLease,
     add_token,
     check_token_status,
@@ -75,10 +75,12 @@ from functions import (  # noqa: E402
     record_cached_input,
     record_file,
     record_rotation,
+    request_tools,
     reset_cached_input,
     save_account_login,
     save_session,
     send_message,
+    token_busy,
     upload_file,
 )
 
@@ -192,6 +194,46 @@ def _log_security_banner():
 
 
 _log_security_banner()
+
+
+def _enforce_exposure_policy():
+    """P0-8：默认面板口令不得与非环回绑定同时存在。
+
+    _log_security_banner 对「admin/admin + 公网绑定」只发出告警，进程照常启动；
+    任何能访问该端口的人因此可以直接接管整个号池。此处在启动阶段直接拒绝，
+    并给出三种可执行的改法，把配置事故拦截在启动时而非事后排查。
+
+    「admin/admin + 环回绑定」保持原有的告警行为，本地开发仍是零配置。
+    显式声明接受风险（DEEPSEEKER_ALLOW_DEFAULT_ADMIN=1）的部署放行，其它取值
+    继续拒绝。
+    """
+    host = (os.getenv("HOST") or "").strip().lower()
+    if host in ("", "127.0.0.1", "localhost", "::1"):
+        return
+    if not (ADMIN_USER == "admin" and ADMIN_PASSWORD == "admin"):
+        return
+    if os.getenv("DEEPSEEKER_ALLOW_DEFAULT_ADMIN", "").strip() == "1":
+        logger.error(
+            "SECURITY: DEEPSEEKER_ALLOW_DEFAULT_ADMIN=1，面板在非环回地址（%s）上"
+            "保留 admin/admin 默认口令；该配置等同于公开中继，风险由部署方承担。",
+            host or "0.0.0.0",
+        )
+        return
+    raise SystemExit(
+        "\n"
+        "SECURITY: refusing to start — the dashboard uses the default admin/admin\n"
+        "credentials while binding a NON-LOOPBACK host (%s). Anyone who can reach\n"
+        "this service owns its token pool.\n"
+        "Fix one of these and start again:\n"
+        "  1. set DEEPSEEKER_ADMIN_USER and DEEPSEEKER_ADMIN_PASSWORD to\n"
+        "     non-default values (recommended), or\n"
+        "  2. keep HOST on 127.0.0.1 / localhost (local-only), or\n"
+        "  3. set DEEPSEEKER_ALLOW_DEFAULT_ADMIN=1 to accept the risk explicitly\n"
+        "     (not recommended).\n" % (host or "0.0.0.0")
+    )
+
+
+_enforce_exposure_policy()
 
 # The token used for this request, logged as "key: <alias>".
 # Must stay a dict: BaseHTTPMiddleware runs the endpoint in a child task, and
@@ -882,6 +924,9 @@ async def handle_chat(
     is_responses=False,
     response_opts=None,
 ):
+    # 把本次请求的工具清单写入上下文变量，供 parse_tools 在模型漏写工具名时
+    # 依据参数集合反推真实工具名。
+    request_tools.set(tools)
     auth_token = await _db(get_auth_token)
     if not auth_token:
         return JSONResponse(
@@ -1008,7 +1053,23 @@ async def handle_chat(
                 )
             finally:
                 old_lock.release()
-        if not tok or tok["status"] == "RATE_LIMITED":
+        # 会话所属账号正在生成时改由空闲账号承载：新建上游会话并带上完整
+        # 历史，而不是让请求停在发送锁上排队——排队会把首字节延迟抬到一次
+        # 完整生成的量级。pick_token 已按在途数最少优先，这里再确认候选账号
+        # 的发送锁确实空闲，避免刚被别的请求占走。
+        moved_off_busy = False
+        if tok and tok["status"] == "ACTIVE" and token_busy(tok["token"]):
+            cand = await _db(pick_token)
+            cand_tok = await _db(get_token, cand) if cand and cand != token_id else None
+            moved_off_busy = bool(cand_tok) and not token_busy(cand_tok["token"])
+            if moved_off_busy:
+                logger.info(
+                    "Account %s is generating; moving chat %s to idle account %s",
+                    tok.get("alias") or token_id,
+                    session_id,
+                    cand_tok.get("alias") or cand,
+                )
+        if not tok or tok["status"] == "RATE_LIMITED" or moved_off_busy:
             new_token_id = await _db(pick_token)
             if new_token_id and (not tok or new_token_id != token_id):
                 new_tok = await _db(get_token, new_token_id)
@@ -1026,9 +1087,7 @@ async def handle_chat(
                         new_session_id = await create_new_chat(new_tok["token"])
                         # 控制台的「转移」列据此统计每个账号的转出/转入。写在
                         # 会话重建成功之后，失败的轮换不会污染统计。
-                        await _db(
-                            record_rotation, token_id, new_token_id, session_id
-                        )
+                        await _db(record_rotation, token_id, new_token_id, session_id)
                         rot_owner = await _own_chat_lock(new_session_id)
                         if needs_rollover(messages):
                             scratch_chat = await create_new_chat(new_tok["token"])

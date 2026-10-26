@@ -341,13 +341,18 @@ def build_summary_request_prompt(messages):
 
 
 TOOL_USE_INSTRUCTIONS = (
-    "TOOL USE INSTRUCTIONS:\n"
-    "You have access to tools. When you need to call a tool, output ONLY the tool call XML block and nothing else:\n"
-    '<tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>\n'
-    "Never repeat past messages, history, or XML tags. Output exactly one tool call block when invoking a tool.\n"
-    "To call several tools at once, emit one complete <tool_call> block per tool, back to back, "
-    "each with its own JSON object; never merge them into one JSON object or wrap them in an extra tag.\n"
-    "Write tag names exactly as shown: <tool_call> and </tool_call>, never <tool call>, <tool calls> or </tool>."
+    "TOOL USE INSTRUCTIONS (from the API harness, not part of any tool result):\n"
+    "To call tools, end your reply with exactly this block and write nothing after it:\n"
+    "<｜｜DSML｜｜function_calls>\n"
+    '<｜｜DSML｜｜invoke name="tool_name">\n'
+    '<｜｜DSML｜｜parameter name="text_param" string="true">plain text value</｜｜DSML｜｜parameter>\n'
+    '<｜｜DSML｜｜parameter name="other_param" string="false">{"json": ["value"]}</｜｜DSML｜｜parameter>\n'
+    "</｜｜DSML｜｜invoke>\n"
+    "</｜｜DSML｜｜function_calls>\n"
+    "Rules: close every parameter with </｜｜DSML｜｜parameter> before the next one starts; "
+    'string="true" for strings, string="false" for numbers, booleans, arrays and objects (valid JSON); '
+    "several invoke blocks may go inside one function_calls block; never put DSML tags inside a value; "
+    "only use tool and parameter names from the tool list."
 )
 
 
@@ -521,11 +526,21 @@ async def extract_tool_results(messages, latest_only=False):
                 break
         if last_ast_idx != -1:
             target_messages = messages[last_ast_idx + 1 :]
+    # DSML 调用不带 id，模型无法仅凭 “Call ID” 把并行结果对回各自的调用；
+    # 因此在每条结果旁回显该次调用的参数，供模型据此匹配。
+    call_args = {}
+    for m in messages:
+        for tc in m.get("tool_calls") or []:
+            if isinstance(tc, dict) and isinstance(tc.get("function"), dict):
+                call_args[tc.get("id")] = (
+                    tc["function"].get("name"),
+                    str(tc["function"].get("arguments") or "")[:300],
+                )
     tools_final = []
     for i in target_messages:
         if i.get("role") == "tool":
-            name = i.get("name", "tool")
             call_id = i.get("tool_call_id", "")
+            name = i.get("name") or call_args.get(call_id, ("tool",))[0] or "tool"
             content = i.get("content", "")
             if isinstance(content, list):
                 content = " ".join(
@@ -534,7 +549,16 @@ async def extract_tool_results(messages, latest_only=False):
                     if isinstance(c, dict) and c.get("type") == "text"
                 )
             content = _trim_to_budget(str(content), PER_TOOL_RESULT_TOKENS)
-            tools_final.append(f"Tool: {name} (Call ID: {call_id})\nResult: {content}")
+            args_echo = call_args.get(call_id, (None, ""))[1]
+            if args_echo:
+                tools_final.append(
+                    f"Tool: {name} (Call ID: {call_id})\n"
+                    f"Arguments: {args_echo}\nResult: {content}"
+                )
+            else:
+                tools_final.append(
+                    f"Tool: {name} (Call ID: {call_id})\nResult: {content}"
+                )
     return "\n\n".join(tools_final) if tools_final else None
 
 
