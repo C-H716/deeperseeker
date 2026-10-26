@@ -87,22 +87,22 @@
                     </thead>
                     <tbody>
                         {% for tok in tokens %}
-                        <tr>
+                        <tr data-token-id="{{ tok['id'] }}">
                             <td class="mono muted">{{ tok['id'] }}</td>
                             <td>{{ tok['alias'] or '—' }}</td>
                             <td><code class="nowrap">{{ tok['token'][:12] }}…{{ tok['token'][-4:] }}</code></td>
-                            <td>
+                            <td data-cell="status">
                                 <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] in ('RATE_LIMITED', 'CHECK_ERROR') %}warn{% else %}err{% endif %}">
                                     {% if tok['status'] == 'ACTIVE' %}有效{% elif tok['status'] == 'RATE_LIMITED' %}被限流{% elif tok['status'] == 'INVALID' %}已失效{% elif tok['status'] == 'CHECK_ERROR' %}检查失败{% else %}{{ tok['status'] }}{% endif %}
                                 </span>
                             </td>
-                            <td class="nowrap">
+                            <td class="nowrap" data-cell="inflight">
                                 {% set busy = inflight.get(tok['id'], 0) %}
                                 <span class="status {% if busy %}busy{% else %}idle{% endif %}">
                                     {% if busy %}使用中 {{ busy }}{% if concurrency_cap %} / {{ concurrency_cap }}{% endif %}{% else %}空闲{% endif %}
                                 </span>
                             </td>
-                            <td class="muted nowrap">
+                            <td class="muted nowrap" data-cell="rotation">
                                 {% set rot = rotation_stats.get(tok['id']) %}
                                 {% if rot and (rot.out or rot.in) %}
                                     转出 {{ rot.out }} · 转入 {{ rot.in }}
@@ -111,7 +111,7 @@
                                     —
                                 {% endif %}
                             </td>
-                            <td class="muted nowrap">
+                            <td class="muted nowrap" data-cell="check">
                                 {% if tok['last_checked_at'] %}{{ tok['last_checked_at'] }}{% else %}未检查{% endif %}
                                 {% if tok['last_check_error'] %}<span class="check-error" title="{{ tok['last_check_error'] }}">⚠</span>{% endif %}
                             </td>
@@ -232,5 +232,120 @@ async function checkToken(tokenId) {
 }
 checkButtons.forEach(button => button.addEventListener('click', () => checkToken(button.dataset.tokenId)));
 if (checkAll) checkAll.addEventListener('click', () => checkToken(null));
+
+// ---- 号池实时轮询 ----
+// 每 3 秒拉一次 /dashboard/status，只重绘「状态 / 占用 / 转移 / 最近检查」四列。
+// 不用整页刷新：整页刷新会打断正在进行的检查、清空表单输入，也会让滚动位置跳动。
+const POLL_MS = 3000;
+const STATUS_META = {
+    ACTIVE: ['ok', '有效'],
+    RATE_LIMITED: ['warn', '被限流'],
+    INVALID: ['err', '已失效'],
+    CHECK_ERROR: ['warn', '检查失败'],
+};
+const pad2 = value => String(value).padStart(2, '0');
+
+// 与后端 _fmt_ts 过滤器保持同一格式（MM-DD HH:MM:SS，本地时间）。
+function fmtEpoch(sec) {
+    if (!sec) return '';
+    const d = new Date(sec * 1000);
+    return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ` +
+           `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+
+function renderStatus(cell, tok, now) {
+    const [cls, label] = STATUS_META[tok.status] || ['', tok.status];
+    const span = document.createElement('span');
+    span.className = `status ${cls}`;
+    // 冷却中的账号显示剩余秒数，「被限流」才不是一个静止的词。
+    if (tok.status === 'RATE_LIMITED' && tok.limited_until && tok.limited_until > now) {
+        span.textContent = `${label} ${Math.ceil(tok.limited_until - now)}s`;
+        span.title = '限流冷却中，到期后自动恢复';
+    } else {
+        span.textContent = label;
+    }
+    cell.replaceChildren(span);
+}
+
+function renderInflight(cell, tok, cap) {
+    const span = document.createElement('span');
+    span.className = `status ${tok.inflight ? 'busy' : 'idle'}`;
+    span.textContent = tok.inflight
+        ? `使用中 ${tok.inflight}${cap ? ` / ${cap}` : ''}`
+        : '空闲';
+    cell.replaceChildren(span);
+}
+
+function renderRotation(cell, rot) {
+    if (!rot || (!rot.out && !rot.in)) {
+        cell.textContent = '—';
+        return;
+    }
+    cell.textContent = `转出 ${rot.out} · 转入 ${rot.in}`;
+    if (rot.last_at) {
+        const sub = document.createElement('span');
+        sub.className = 'sub';
+        sub.textContent = `最近 ${fmtEpoch(rot.last_at)}`;
+        cell.appendChild(sub);
+    }
+}
+
+function renderCheck(cell, tok) {
+    cell.textContent = tok.last_checked_at || '未检查';
+    if (tok.last_check_error) {
+        const warn = document.createElement('span');
+        warn.className = 'check-error';
+        warn.title = tok.last_check_error;
+        warn.textContent = '⚠';
+        cell.appendChild(warn);
+    }
+}
+
+let pollTimer = null;
+async function pollPool() {
+    pollTimer = null;
+    try {
+        const response = await fetch('/dashboard/status', {headers: {'Accept': 'application/json'}});
+        // 会话失效时不跳转：交给下一次整页操作或手动刷新去登录页，避免死循环。
+        if (response.status === 401) return;
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        const byId = new Map(data.tokens.map(tok => [String(tok.id), tok]));
+        document.querySelectorAll('tr[data-token-id]').forEach(row => {
+            const tok = byId.get(row.dataset.tokenId);
+            if (!tok) return;  // 表格已过期（新增/删除了账号），等整页刷新
+            const statusCell = row.querySelector('[data-cell="status"]');
+            if (statusCell) renderStatus(statusCell, tok, data.now);
+            const inflightCell = row.querySelector('[data-cell="inflight"]');
+            if (inflightCell) renderInflight(inflightCell, tok, data.concurrency_cap);
+            const rotationCell = row.querySelector('[data-cell="rotation"]');
+            if (rotationCell) renderRotation(rotationCell, tok.rotation);
+            const checkCell = row.querySelector('[data-cell="check"]');
+            if (checkCell) renderCheck(checkCell, tok);
+        });
+    } catch (error) {
+        // 网络抖动或后端重启：静默跳过本轮，下一轮继续，不打扰用户。
+    }
+    if (!document.hidden) pollTimer = setTimeout(pollPool, POLL_MS);
+}
+
+function startPolling() {
+    if (pollTimer !== null) return;
+    if (!document.querySelector('tr[data-token-id]')) return;  // 号池为空，无需轮询
+    pollTimer = setTimeout(pollPool, POLL_MS);
+}
+
+// 标签页不可见时停掉轮询，切回来立刻补一次，避免后台空转。
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        if (pollTimer !== null) {
+            clearTimeout(pollTimer);
+            pollTimer = null;
+        }
+    } else {
+        startPolling();
+    }
+});
+startPolling();
 </script>
 {% endblock %}
