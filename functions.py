@@ -153,6 +153,8 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             from_token_id INTEGER,
             to_token_id INTEGER NOT NULL,
+            from_token_key TEXT,
+            to_token_key TEXT,
             chat_id TEXT,
             created_at REAL NOT NULL
         );
@@ -203,6 +205,17 @@ def init_db():
     }
     if "last_used" not in session_columns:
         conn.execute("ALTER TABLE sessions ADD COLUMN last_used REAL")
+    # 轮换统计按 token 字符串归属，而不是 tokens.id：id 只是槽位，删除
+    # 账号后 add_token() 会复用最小空位，新账号便会继承旧账号的转移历史。
+    # 旧行只有自增 id，无法还原当时是哪个 token，因此不参与统计（留 NULL）。
+    rotation_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(token_rotations)").fetchall()
+    }
+    if "from_token_key" not in rotation_columns:
+        conn.execute("ALTER TABLE token_rotations ADD COLUMN from_token_key TEXT")
+    if "to_token_key" not in rotation_columns:
+        conn.execute("ALTER TABLE token_rotations ADD COLUMN to_token_key TEXT")
     conn.commit()
     conn.close()
     try:
@@ -1022,17 +1035,46 @@ def delete_token(token_id):
     conn.close()
 
 
+def _token_key(token):
+    """轮换统计的归属键：token 字符串的短哈希，不落明文 Token。
+
+    用 token 值而不是 tokens.id，是因为 id 会被 add_token() 回收复用，
+    统计会跟着槽位而不是账号走。哈希只用于本地比对，16 位足够区分。
+    """
+    if not token:
+        return None
+    return hashlib.sha1(token.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
 def record_rotation(from_token_id, to_token_id, chat_id=None):
     """记录一次号池轮换：会话因原 token 不可用而改由另一个 token 重建。
 
     控制台的「转移」列据此展示每个账号的转出 / 转入次数与最近一次时间。
-    from_token_id 允许为空（会话首次建立时就没有旧账号）。
+    from_token_id 允许为空（会话首次建立时就没有旧账号）。同时落两侧
+    token 的哈希键，统计按它归属，删除后复用同一 id 的新账号不会继承。
     """
     conn = get_db()
+    keys = {}
+    for token_id in {from_token_id, to_token_id}:
+        if token_id is None:
+            continue
+        row = conn.execute(
+            "SELECT token FROM tokens WHERE id = ?", (token_id,)
+        ).fetchone()
+        if row:
+            keys[token_id] = _token_key(row[0])
     conn.execute(
-        "INSERT INTO token_rotations (from_token_id, to_token_id, chat_id, created_at) "
-        "VALUES (?, ?, ?, ?)",
-        (from_token_id, to_token_id, chat_id, time.time()),
+        "INSERT INTO token_rotations (from_token_id, to_token_id, "
+        "from_token_key, to_token_key, chat_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            from_token_id,
+            to_token_id,
+            keys.get(from_token_id),
+            keys.get(to_token_id),
+            chat_id,
+            time.time(),
+        ),
     )
     conn.commit()
     conn.close()
@@ -1048,24 +1090,30 @@ def get_rotation_stats():
     """
     conn = get_db()
     rows = conn.execute(
-        "SELECT token_id, SUM(out_n), SUM(in_n), MAX(last_at) FROM ("
-        "  SELECT from_token_id AS token_id, COUNT(*) AS out_n, 0 AS in_n, "
+        "SELECT token_key, SUM(out_n), SUM(in_n), MAX(last_at) FROM ("
+        "  SELECT from_token_key AS token_key, COUNT(*) AS out_n, 0 AS in_n, "
         "         MAX(created_at) AS last_at "
-        "  FROM token_rotations WHERE from_token_id IS NOT NULL "
-        "  GROUP BY from_token_id"
+        "  FROM token_rotations WHERE from_token_key IS NOT NULL "
+        "  GROUP BY from_token_key"
         "  UNION ALL"
-        "  SELECT to_token_id, 0, COUNT(*), MAX(created_at) "
-        "  FROM token_rotations GROUP BY to_token_id"
-        ") GROUP BY token_id"
+        "  SELECT to_token_key, 0, COUNT(*), MAX(created_at) "
+        "  FROM token_rotations WHERE to_token_key IS NOT NULL "
+        "  GROUP BY to_token_key"
+        ") GROUP BY token_key"
     ).fetchall()
+    tokens = conn.execute("SELECT id, token FROM tokens").fetchall()
     conn.close()
+    by_key = {
+        key: {"out": out_n or 0, "in": in_n or 0, "last_at": last_at or None}
+        for key, out_n, in_n, last_at in rows
+    }
+    # 只在当前仍存在的 token 上展示；已删除账号的历史行保留在库里，
+    # 但不归属到占用同一 id 的新账号。
     stats = {}
-    for token_id, out_n, in_n, last_at in rows:
-        stats[token_id] = {
-            "out": out_n or 0,
-            "in": in_n or 0,
-            "last_at": last_at or None,
-        }
+    for token_id, token in tokens:
+        entry = by_key.get(_token_key(token))
+        if entry:
+            stats[token_id] = entry
     return stats
 
 
