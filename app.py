@@ -61,6 +61,7 @@ from functions import (  # noqa: E402
     get_account_device_id,
     get_accounts,
     get_auth_token,
+    get_effort_enhance,
     get_file_content,
     get_file_token,
     get_rotation_stats,
@@ -88,6 +89,7 @@ from functions import (  # noqa: E402
     save_account_login,
     save_session,
     send_message,
+    set_effort_enhance,
     token_busy,
     upload_file,
 )
@@ -4160,6 +4162,33 @@ async def stats_page(request: Request):
             "range_preset": params.get("range", ["30"])[0],
             "range_labels": RANGE_LABELS,
         },
+    )
+
+
+@app.get("/features/effort-enhance")
+async def effort_enhance_get(request: Request):
+    """读取提示词增强总开关（管理员）。"""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return JSONResponse({"error": "未登录或登录已过期"}, status_code=401)
+    return JSONResponse({"effort_enhance": await _db(get_effort_enhance)})
+
+
+@app.post("/features/effort-enhance")
+async def effort_enhance_set(request: Request):
+    """切换提示词增强总开关（管理员），即时生效，无需重启。"""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return JSONResponse({"error": "未登录或登录已过期"}, status_code=401)
+    try:
+        body = await request.json()
+        enabled = bool(body.get("enabled"))
+    except Exception:
+        return JSONResponse({"error": "enabled (bool) required"}, status_code=400)
+    return JSONResponse(
+        {"ok": True, "effort_enhance": await _db(set_effort_enhance, enabled)}
     )
 
 

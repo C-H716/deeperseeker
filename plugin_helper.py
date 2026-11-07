@@ -11,7 +11,13 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from functions import count_tokens, get_session, request_effort, upload_file
+from functions import (
+    count_tokens,
+    get_effort_enhance,
+    get_session,
+    request_effort,
+    upload_file,
+)
 
 # Token budgets for injected history when (re)building a session prompt.
 MAX_HISTORY_TOKENS = int(os.getenv("DEEPSEEKER_MAX_HISTORY_TOKENS", "24000"))
@@ -869,6 +875,10 @@ for _alias in ("xhigh", "ultra", "extreme"):
 
 
 def _with_effort(prompt):
+    # 提示词增强总开关（移植自 1515asd/rh-deeperseeker v89.6）：关闭时
+    # 不附加任何强化指令，与开关加入前的行为逐字节一致。
+    if not get_effort_enhance():
+        return prompt
     instruction = EFFORT_INSTRUCTIONS.get(request_effort.get() or "")
     return prompt + instruction + "\n" if instruction else prompt
 

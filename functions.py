@@ -278,6 +278,11 @@ def init_db():
             PRIMARY KEY (hour, model, token_id, api_key)
         );
         CREATE INDEX IF NOT EXISTS idx_usage_hours_hour ON usage_hours(hour);
+        -- 管理员运行时设置（提示词增强总开关，移植自 rh v89.6）
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
     """)
     # Keep existing Docker volumes compatible with the token health metadata.
     token_columns = {
@@ -2431,6 +2436,44 @@ def _code_fence_spans(text):
 # 开启思考时该请求的推理强度（"high"、"max" 等），由各对话端点写入；
 # build_prompt 据此追加「更充分推理」的指令。
 request_effort = contextvars.ContextVar("request_effort", default=None)
+
+# ── 提示词增强总开关（移植自 1515asd/rh-deeperseeker v89.6）──────────────
+_effort_enhance_cache = None
+
+
+def get_effort_enhance():
+    """提示词增强是否开启。settings 表持久化，进程内缓存；缺省开启。
+
+    关闭后 plugin_helper._with_effort 不再附加强化指令，行为与开关加入
+    前逐字节一致。旧数据卷尚未建立 settings 表时按缺省开启处理。
+    """
+    global _effort_enhance_cache
+    if _effort_enhance_cache is None:
+        try:
+            conn = get_db()
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = 'effort_enhance'"
+            ).fetchone()
+            conn.close()
+            _effort_enhance_cache = (row[0] != "off") if row else True
+        except sqlite3.Error:
+            _effort_enhance_cache = True
+    return _effort_enhance_cache
+
+
+def set_effort_enhance(enabled):
+    """写入开关并立即刷新内存缓存，下一个请求即时生效。"""
+    global _effort_enhance_cache
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES ('effort_enhance', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        ("on" if enabled else "off",),
+    )
+    conn.commit()
+    conn.close()
+    _effort_enhance_cache = bool(enabled)
+    return _effort_enhance_cache
 
 
 def effort_level(body):

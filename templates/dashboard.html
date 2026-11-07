@@ -218,6 +218,18 @@
 
         <section class="card">
             <div class="card-head">
+                <h2>功能开关</h2>
+            </div>
+            <div class="card-body">
+                <p class="hint">提示词增强 <span id="effort-state" class="status idle">读取中…</span>
+                    <button type="button" id="effort-btn" class="btn-sm btn-secondary">切换</button>
+                </p>
+                <p class="hint">当客户端请求写了 <code>reasoning_effort=max</code> 等高强度档位时，给模型附加一段「多角度验证、逐步检查」的强化指令；关闭后完全按模型默认方式回答。设置即时生效，无需重启。</p>
+            </div>
+        </section>
+
+        <section class="card">
+            <div class="card-head">
                 <h2>接口信息</h2>
             </div>
             <div class="card-body">
@@ -235,6 +247,47 @@
 </div>
 
 <script>
+// ---- 提示词增强总开关 ----
+const effortState = document.getElementById('effort-state');
+const effortBtn = document.getElementById('effort-btn');
+
+function renderEffort(on) {
+    effortState.textContent = on ? '已开启' : '已关闭';
+    effortState.className = 'status ' + (on ? 'ok' : 'idle');
+    effortBtn.textContent = on ? '关闭' : '开启';
+    effortBtn.dataset.on = on ? '1' : '0';
+}
+
+async function refreshEffort() {
+    try {
+        const response = await fetch('/features/effort-enhance', {headers: {'Accept': 'application/json'}});
+        if (!response.ok) return;
+        const data = await response.json();
+        renderEffort(data.effort_enhance);
+    } catch (error) {
+        effortState.textContent = '读取失败';
+    }
+}
+
+effortBtn.addEventListener('click', async () => {
+    const enabled = effortBtn.dataset.on !== '1';
+    effortBtn.disabled = true;
+    try {
+        const response = await fetch('/features/effort-enhance', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+            body: JSON.stringify({enabled: enabled}),
+        });
+        const data = await response.json();
+        renderEffort(data.effort_enhance);
+    } catch (error) {
+        effortState.textContent = '设置失败';
+    } finally {
+        effortBtn.disabled = false;
+    }
+});
+refreshEffort();
+
 const message = document.getElementById('check-message');
 const checkButtons = document.querySelectorAll('.check-one');
 const checkAll = document.getElementById('check-all');
