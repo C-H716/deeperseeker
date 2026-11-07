@@ -12,6 +12,7 @@ import re
 import sqlite3
 import string
 import time
+import uuid
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 
@@ -313,6 +314,10 @@ def init_db():
         conn.execute(
             "ALTER TABLE accounts ADD COLUMN relogin_disabled INTEGER DEFAULT 0"
         )
+    # 按账号持久化数美设备指纹：登录与自动重登复用同一指纹，避免每次
+    # 登录都被识别为新设备（移植自 rh v89.13）。
+    if "device_id" not in account_columns:
+        conn.execute("ALTER TABLE accounts ADD COLUMN device_id TEXT")
     # B13: session pruning keys on real recency of USE, so older volumes need
     # the column; the ALTER is idempotent behind the pragma check.
     session_columns = {
@@ -520,7 +525,16 @@ def _extract_login_token(payload):
 
 def _redact_login_response(value):
     """Redact credentials before writing a DeepSeek login response to logs."""
-    sensitive_markers = ("token", "password", "authorization", "cookie", "secret")
+    # 设备指纹是可识别的设备标识，与凭据一样不写入日志。
+    sensitive_markers = (
+        "token",
+        "password",
+        "authorization",
+        "cookie",
+        "secret",
+        "device_id",
+        "device-id",
+    )
     if isinstance(value, dict):
         redacted = {}
         for key, item in value.items():
@@ -830,31 +844,51 @@ class AccountLoginError(Exception):
         super().__init__(message)
 
 
-async def login_deepseek_account(email, password, device_id=None):
-    """Log in through DeepSeek's web endpoint and return its bearer token."""
-    if not email or not password:
-        raise ValueError("邮箱和密码不能为空")
-    # Match the browser login request; Android client headers can change the response shape.
+def _login_device_uuid(account):
+    """按账号确定性派生 x-device-id（UUID），重启不变。
+
+    移植自 1515asd/rh-deeperseeker v89.12。该值只是请求头里的设备 UUID，
+    与请求体的数美设备指纹是两个不同的字段，真实客户端分别发送。
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, "deeperseeker-native:" + account))
+
+
+async def login_deepseek_account(account, password, device_id=None):
+    """按官方安卓 App 形态在桥内登录，返回结构化结果。
+
+    移植自 1515asd/rh-deeperseeker v89.12 / v89.13：会话出生与使用都在桥
+    内，绕开「浏览器出生令牌跨环境使用即整体吊销」的风控。请求头使用安卓
+    客户端头组并补 x-device-id（UUID）与空 x-device-model；请求体的
+    device_id 必须是数美 SDK 的真实指纹，随机或伪造 UUID 会被以
+    RISK_DEVICE_DETECTED（biz_code=11）拒绝。
+
+    device_id 优先级：调用方显式传入（面板填写或该账号已持久化的值） >
+    DEEPSEEKER_DEVICE_ID / 全局缓存 / 浏览器自动采集 > 结构化占位。
+    """
+    if not account or not password:
+        raise ValueError("账号和密码不能为空")
+    normalized_account = str(account).strip().replace("\\@", "@")
+    is_email = "@" in normalized_account
+    email = normalized_account if is_email else None
+    mobile = None if is_email else normalized_account
+    device_uuid = _login_device_uuid(normalized_account)
     headers = {
-        "content-type": "application/json",
-        "accept": "application/json",
-        "origin": "https://chat.deepseek.com",
-        "referer": "https://chat.deepseek.com/",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        **get_headers(None),
+        "referer": "https://chat.deepseek.com/sign_in",
+        "x-device-id": device_uuid,
+        "x-device-model": "",
     }
-    normalized_email = str(email).strip().replace("\\@", "@")
-    # The risk check validates the fingerprint SDK's device ID, so a real value
-    # is harvested and cached rather than generated per request.
-    normalized_device_id = await _resolve_login_device_id(device_id)
+    explicit = str(device_id).strip() if device_id else ""
+    fingerprint = explicit or await _resolve_login_device_id()
     payload = {
-        "email": normalized_email,
-        "mobile": "",
+        "email": email,
+        "mobile": mobile,
         "password": password,
-        "area_code": "",
-        "device_id": normalized_device_id,
-        "os": "web",
+        "area_code": "+86",
+        "device_id": fingerprint,
+        "os": "android",
     }
-    # Log the outbound contract for diagnosis, while never exposing the password.
+    # 记录出站契约以便诊断，密码与凭据一律经脱敏后再写入日志。
     logger.info(
         "DeepSeek login request path=%s headers=%s payload=%s",
         "/api/v0/users/login",
@@ -873,7 +907,6 @@ async def login_deepseek_account(email, password, device_id=None):
     )
     async with response:
         raw = await response.text()
-        # Log non-JSON responses too; 202 responses are often empty during upstream checks.
         try:
             response_for_log = (
                 json.dumps(
@@ -892,7 +925,6 @@ async def login_deepseek_account(email, password, device_id=None):
             response_for_log,
         )
         if response.status != 200:
-            # Never include the submitted password in an error or log message.
             detail = raw[:300] if raw else "empty response body"
             raise Exception(f"HTTP {response.status}: {detail}")
         try:
@@ -926,8 +958,22 @@ async def login_deepseek_account(email, password, device_id=None):
                     reason_map.get(str(biz_code), f"biz_{biz_code}"),
                     f"DeepSeek 登录失败（{biz_code or 'unknown'}: {biz_msg or 'unknown'}）",
                 )
-        raise Exception("DeepSeek 登录成功但响应中没有找到 Token")
-    return token
+        raise AccountLoginError("no_token", "DeepSeek 登录成功但响应中没有找到 Token")
+    biz_data = {}
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        candidate = data["data"].get("biz_data")
+        if isinstance(candidate, dict):
+            biz_data = candidate
+    user = biz_data.get("user") if isinstance(biz_data.get("user"), dict) else {}
+    chat = user.get("chat") if isinstance(user.get("chat"), dict) else {}
+    return {
+        "ok": True,
+        "token": token,
+        "muted": chat.get("is_muted") == 1,
+        "mute_until": chat.get("mute_until"),
+        "device_id": fingerprint,
+        "account": normalized_account,
+    }
 
 
 # ==============================================================================
@@ -1483,8 +1529,8 @@ def restore_token(token_id):
 #   * 未通过账号登录加入的令牌没有凭据，模块保持惰性（零上游请求）
 #   * 自动重登保守节流，默认 6 小时；宁可不自愈，绝不形成异常登录节奏
 #   * 密码以本机密钥加密后落库，不写入日志、不返回给页面
-#   * 登录请求形态沿用本项目已验证可用的 web 形态与已采集的设备指纹，
-#     不改为 rh 的 android 形态，避免重新触发 RISK_DEVICE_DETECTED
+#   * 登录请求形态对齐 rh 的 android 形态；请求体的数美设备指纹按账号
+#     持久化并复用，避免同一账号每次重登都被识别为新设备
 _RELOGIN_MIN_INTERVAL = float(os.getenv("DEEPSEEKER_RELOGIN_MIN_INTERVAL", "21600"))
 _relogin_inflight: set = set()
 _ACCOUNT_KEY_FILE = os.path.join(data_dir(), "account_secret.key")
@@ -1543,7 +1589,8 @@ def get_relogin_credentials(token_id):
     conn = get_db()
     try:
         row = conn.execute(
-            "SELECT a.email, a.password_secret, a.relogin_at, a.relogin_disabled "
+            "SELECT a.email, a.password_secret, a.relogin_at, "
+            "a.relogin_disabled, a.device_id "
             "FROM accounts a JOIN tokens t ON t.account_id = a.id WHERE t.id = ?",
             (token_id,),
         ).fetchone()
@@ -1558,7 +1605,12 @@ def get_relogin_credentials(token_id):
     password = _unseal_password(row[1])
     if not password:
         return None
-    return {"email": row[0], "password": password, "relogin_at": row[2] or 0.0}
+    return {
+        "email": row[0],
+        "password": password,
+        "relogin_at": row[2] or 0.0,
+        "device_id": row[4],
+    }
 
 
 def update_relogin_token(token_id, new_token):
@@ -1594,7 +1646,7 @@ async def relogin_account(token_id):
     """保守自动重登：节流内绝不尝试；结果如实入库。
 
     移植自 1515asd/rh-deeperseeker v89.12，登录链路复用本项目已有的
-    login_deepseek_account（沿用已验证的 web 形态与设备指纹复用）。
+    login_deepseek_account（安卓形态，并复用按账号持久化的设备指纹）。
     并发去重保证同一令牌同一时刻只跑一个重登任务。
     """
     if token_id in _relogin_inflight:
@@ -1613,7 +1665,9 @@ async def relogin_account(token_id):
             )
             return
         try:
-            auth_token = await login_deepseek_account(creds["email"], creds["password"])
+            result = await login_deepseek_account(
+                creds["email"], creds["password"], creds.get("device_id")
+            )
         except AccountLoginError as exc:
             if exc.reason in ("banned", "risk_device", "bad_credentials", "no_token"):
                 await asyncio.to_thread(_disable_relogin, token_id, str(exc))
@@ -1630,8 +1684,22 @@ async def relogin_account(token_id):
                 str(exc)[:200],
             )
             return
-        await asyncio.to_thread(update_relogin_token, token_id, auth_token)
-        logger.info("[relogin] token #%s 已通过桥内登录自愈", token_id)
+        await asyncio.to_thread(update_relogin_token, token_id, result["token"])
+        if result["muted"]:
+            until = _format_mute_until(result["mute_until"])
+            await asyncio.to_thread(
+                mark_quarantined,
+                token_id,
+                f"user is muted (until {until}) — bridge login",
+                result["mute_until"],
+            )
+            logger.warning(
+                "[relogin] token #%s 的新会话处于禁言期（至 %s），已隔离",
+                token_id,
+                until,
+            )
+        else:
+            logger.info("[relogin] token #%s 已通过桥内登录自愈", token_id)
     finally:
         _relogin_inflight.discard(token_id)
 
@@ -1639,11 +1707,25 @@ async def relogin_account(token_id):
 def get_accounts():
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, email, alias, token_id, status, last_login_at, last_error, created_at "
-        "FROM accounts ORDER BY id"
+        "SELECT id, email, alias, token_id, status, last_login_at, last_error, "
+        "created_at, device_id FROM accounts ORDER BY id"
     ).fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+
+def get_account_device_id(account):
+    """读取账号已持久化的数美设备指纹；未绑定或旧库缺列时返回 None。"""
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT device_id FROM accounts WHERE email = ?", (account,)
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    finally:
+        conn.close()
+    return row[0] if row and row[0] else None
 
 
 def delete_account(account_id):
@@ -1668,11 +1750,12 @@ def _set_account_result(account_id, status, error=None, token_id=None):
     conn.close()
 
 
-def save_account_login(email, alias, auth_token, password=None):
+def save_account_login(email, alias, auth_token, password=None, device_id=None):
     """Create or replace an account and its corresponding pool token.
 
     password 仅在通过面板添加账号时传入，经本地密钥加密后落库，供令牌
-    失效时的自动重登使用；手动粘贴的令牌不携带凭据，重登保持惰性。
+    失效时的自动重登使用；device_id 是按账号持久化的数美设备指纹，登录
+    与自动重登复用同一值。手动粘贴的令牌不携带凭据，重登保持惰性。
     """
     conn = get_db()
     existing = conn.execute(
@@ -1718,8 +1801,8 @@ def save_account_login(email, alias, auth_token, password=None):
     if password is not None:
         conn.execute(
             "UPDATE accounts SET password_secret = ?, relogin_at = ?, "
-            "relogin_disabled = 0 WHERE id = ?",
-            (_seal_password(password), time.time(), account_id),
+            "relogin_disabled = 0, device_id = COALESCE(?, device_id) WHERE id = ?",
+            (_seal_password(password), time.time(), device_id, account_id),
         )
     conn.commit()
     conn.close()

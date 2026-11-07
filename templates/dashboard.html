@@ -24,9 +24,10 @@
                     <thead>
                         <tr>
                             <th>编号</th>
-                            <th>邮箱</th>
+                            <th>账号</th>
                             <th>别名</th>
                             <th>状态</th>
+                            <th>设备指纹</th>
                             <th>最近登录</th>
                             <th class="ta-right">操作</th>
                         </tr>
@@ -41,6 +42,9 @@
                                 <span class="status {% if account['status'] == 'ACTIVE' %}ok{% elif account['status'] == 'CHECK_ERROR' %}warn{% else %}err{% endif %}">
                                     {% if account['status'] == 'ACTIVE' %}有效{% elif account['status'] == 'INVALID' %}已失效{% elif account['status'] == 'RATE_LIMITED' %}被限流{% else %}检查失败{% endif %}
                                 </span>
+                            </td>
+                            <td>
+                                {% if account.get('device_id') %}<span class="status ok" title="按账号持久化，自动重登复用同一指纹">已绑定</span>{% else %}<span class="status warn" title="未填写指纹，使用全局兜底或浏览器自动采集">未绑定</span>{% endif %}
                             </td>
                             <td class="muted nowrap">{{ account['last_login_at'] or '未登录' }}</td>
                             <td class="ta-right nowrap">
@@ -136,23 +140,37 @@
     <aside class="col-side">
         <section class="card">
             <div class="card-head">
-                                <h2>添加 DeepSeek 账号（推荐）</h2>
+                <h2>添加 DeepSeek 账号（推荐）</h2>
             </div>
             <div class="card-body">
-                <p class="hint">账号在桥内直接登录，会话出生于本服务并复用已采集的设备指纹；令牌失效时按 6 小时间隔自动重登。密码经本地密钥加密后仅存于本机数据库，不写入日志、不返回页面。</p>
+                <p class="hint">按官方安卓 App 形态在桥内直接登录，会话出生与使用都在本服务内，避免浏览器令牌跨环境使用被整体吊销；同一账号始终复用同一设备指纹，令牌失效时按 6 小时间隔自动重登。密码经本地密钥加密后仅存于本机数据库，不写入日志、不返回页面。</p>
                 <form method="post" action="/accounts/add" class="stack">
                     <label class="field">
                         <span>别名（可选）</span>
                         <input type="text" name="alias" placeholder="例如：个人">
                     </label>
                     <label class="field">
-                        <span>邮箱</span>
-                        <input type="email" name="email" placeholder="you@example.com" required>
+                        <span>邮箱或手机号</span>
+                        <input type="text" name="account" placeholder="you@example.com 或 13800138000" required autocomplete="off">
                     </label>
                     <label class="field">
                         <span>密码</span>
                         <input type="password" name="password" placeholder="请输入账号密码" required autocomplete="new-password">
                     </label>
+                    <label class="field">
+                        <span>设备指纹（可选，强烈建议填写）</span>
+                        <input type="text" name="device_id" placeholder="SMSdk.getDeviceId() 返回的 base64 串" autocomplete="off">
+                    </label>
+                    <details class="guide">
+                        <summary>设备指纹怎么获取？为什么建议填写？</summary>
+                        <p>真实安卓 App 登录时，请求体会携带数美（SMSdk）生成的设备指纹（约 89 字符的 base64 串）。随机或伪造的 UUID 会被风控以 <code>RISK_DEVICE_DETECTED</code>（biz_code=11）直接拒绝。</p>
+                        <ol>
+                            <li>Chrome 打开 <a href="https://chat.deepseek.com" target="_blank" rel="noopener">chat.deepseek.com</a>（不需要登录），等页面完全加载</li>
+                            <li>F12 → Console，执行 <code>SMSdk.getDeviceId()</code></li>
+                            <li>把输出的 base64 串粘贴到上方输入框</li>
+                        </ol>
+                        <p>留空时依次回退到该账号已保存的指纹、<code>DEEPSEEKER_DEVICE_ID</code>、本机缓存或浏览器自动采集；仍失败才使用结构化占位值，此时登录大概率被风控拒绝。同一账号请始终使用同一个指纹，桥会记住并在自动重登时复用。</p>
+                    </details>
                     <button type="submit" class="btn-block">登录并加入号池</button>
                 </form>
             </div>

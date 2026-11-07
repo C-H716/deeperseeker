@@ -278,9 +278,16 @@ def test_login_token_extraction_handles_null_sections():
 
 def test_login_response_logging_redacts_credentials():
     response = _redact_login_response(
-        {"token": "secret", "user": {"password": "pw", "email": "user@example.com"}}
+        {
+            "token": "secret",
+            "device_id": "fingerprint",
+            "x-device-id": "device-uuid",
+            "user": {"password": "pw", "email": "user@example.com"},
+        }
     )
     assert response["token"] == "[REDACTED]"
+    assert response["device_id"] == "[REDACTED]"
+    assert response["x-device-id"] == "[REDACTED]"
     assert response["user"]["password"] == "[REDACTED]"
     assert response["user"]["email"] == "user@example.com"
 
@@ -393,10 +400,12 @@ def test_login_device_id_precedence_prefers_env_then_file():
                     os.environ[key] = value
 
 
-def test_account_login_uses_browser_contract():
+def _run_login(monkeypatch, account="user@example.com", device_id=None, body=None):
+    """以桩替换上游 POST，钉住设备指纹，返回 (请求快照, 登录结果)。"""
     import functions
 
     captured = {}
+    response_body = body or '{"data":{"biz_data":{"user":{"token":"abc"}}}}'
 
     class FakeResponse:
         status = 200
@@ -408,31 +417,69 @@ def test_account_login_uses_browser_contract():
             return False
 
         async def text(self):
-            return '{"data":{"biz_data":{"user":{"token":"abc"}}}}'
+            return response_body
 
     async def fake_post(path, *, headers, **kwargs):
         captured.update(path=path, headers=headers, payload=kwargs["json"])
         return FakeResponse()
 
-    original_post = functions.post_with_failover
-    saved_env = os.environ.get("DEEPSEEKER_DEVICE_ID")
-    functions.post_with_failover = fake_post
-    # Pin the device ID so the test never launches a browser and never depends
-    # on whatever the host happens to have cached.
-    os.environ["DEEPSEEKER_DEVICE_ID"] = "test-device-id"
-    try:
-        token = asyncio.run(login_deepseek_account(r"user\@example.com", "password"))
-    finally:
-        functions.post_with_failover = original_post
-        if saved_env is None:
-            os.environ.pop("DEEPSEEKER_DEVICE_ID", None)
-        else:
-            os.environ["DEEPSEEKER_DEVICE_ID"] = saved_env
+    monkeypatch.setattr(functions, "post_with_failover", fake_post)
+    monkeypatch.setenv("DEEPSEEKER_DEVICE_ID", "test-device-id")
+    result = asyncio.run(login_deepseek_account(account, "password", device_id))
+    return captured, result
 
-    assert token == "abc"
-    assert captured["payload"]["email"] == "user@example.com"
-    assert captured["payload"]["device_id"] == "test-device-id"
-    assert captured["headers"]["user-agent"].startswith("Mozilla/5.0")
+
+def test_account_login_uses_android_contract(monkeypatch):
+    captured, result = _run_login(monkeypatch, r"user\@example.com")
+    assert result["token"] == "abc"
+    assert result["device_id"] == "test-device-id"
+    payload = captured["payload"]
+    assert payload["email"] == "user@example.com"
+    assert payload["mobile"] is None
+    assert payload["os"] == "android"
+    assert payload["area_code"] == "+86"
+    assert payload["device_id"] == "test-device-id"
+    headers = captured["headers"]
+    assert headers["user-agent"].startswith("Dalvik/")
+    assert headers["x-client-platform"] == "android"
+    assert headers["referer"] == "https://chat.deepseek.com/sign_in"
+    assert headers["x-device-model"] == ""
+    assert len(headers["x-device-id"]) == 36
+    assert "authorization" not in headers
+
+
+def test_account_login_accepts_mobile_number(monkeypatch):
+    captured, _ = _run_login(monkeypatch, "13800138000")
+    assert captured["payload"]["email"] is None
+    assert captured["payload"]["mobile"] == "13800138000"
+
+
+def test_account_login_prefers_explicit_fingerprint(monkeypatch):
+    captured, result = _run_login(monkeypatch, device_id="explicit-smsdk-fingerprint")
+    assert captured["payload"]["device_id"] == "explicit-smsdk-fingerprint"
+    assert result["device_id"] == "explicit-smsdk-fingerprint"
+
+
+def test_account_login_reports_muted_account(monkeypatch):
+    body = (
+        '{"data":{"biz_data":{"user":{"token":"abc",'
+        '"chat":{"is_muted":1,"mute_until":1762502400}}}}}'
+    )
+    _, result = _run_login(monkeypatch, body=body)
+    assert result["muted"] is True
+    assert result["mute_until"] == 1762502400
+
+
+def test_account_login_maps_risk_device_error(monkeypatch):
+    from functions import AccountLoginError
+
+    body = '{"code":0,"data":{"biz_code":11,"biz_msg":"RISK_DEVICE_DETECTED"}}'
+    try:
+        _run_login(monkeypatch, body=body)
+    except AccountLoginError as exc:
+        assert exc.reason == "risk_device"
+    else:
+        raise AssertionError("expected AccountLoginError for biz_code=11")
 
 
 def test_device_id_falls_back_when_harvest_fails():

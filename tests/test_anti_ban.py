@@ -248,7 +248,7 @@ def test_relogin_is_inert_for_manually_pasted_token(pool, monkeypatch):
 
     async def fake_login(email, password, device_id=None):
         called.append((email, password))
-        return "new"
+        return {"ok": True, "token": "new", "muted": False}
 
     monkeypatch.setattr(functions, "login_deepseek_account", fake_login)
     asyncio.run(relogin_account(tid))
@@ -262,7 +262,7 @@ def test_relogin_honours_throttle(pool, monkeypatch):
 
     async def fake_login(email, password, device_id=None):
         called.append(email)
-        return "new"
+        return {"ok": True, "token": "new", "muted": False}
 
     monkeypatch.setattr(functions, "login_deepseek_account", fake_login)
     asyncio.run(relogin_account(tid))
@@ -270,7 +270,9 @@ def test_relogin_honours_throttle(pool, monkeypatch):
 
 
 def test_relogin_refreshes_token_after_expiry(pool, monkeypatch):
-    save_account_login("a@b.com", None, "old-token", password="pw")
+    save_account_login(
+        "a@b.com", None, "old-token", password="pw", device_id="smsdk-fingerprint"
+    )
     tid = get_tokens()[0]["id"]
     conn = functions.get_db()
     conn.execute("UPDATE accounts SET relogin_at = 0")
@@ -279,7 +281,15 @@ def test_relogin_refreshes_token_after_expiry(pool, monkeypatch):
 
     async def fake_login(email, password, device_id=None):
         assert (email, password) == ("a@b.com", "pw")
-        return "fresh-token"
+        # 重登复用按账号持久化的同一指纹，不会被识别为新设备。
+        assert device_id == "smsdk-fingerprint"
+        return {
+            "ok": True,
+            "token": "fresh-token",
+            "muted": False,
+            "device_id": device_id,
+            "account": email,
+        }
 
     monkeypatch.setattr(functions, "login_deepseek_account", fake_login)
     asyncio.run(relogin_account(tid))
@@ -303,3 +313,42 @@ def test_relogin_terminal_rejection_disables_account(pool, monkeypatch):
     assert functions.get_relogin_credentials(tid) is None
     assert get_token(tid)["token"] == "old-token"
 
+
+def test_device_id_persists_per_account_and_reaches_dashboard(pool):
+    save_account_login(
+        "a@b.com", None, "tok-a", password="pw", device_id="fingerprint-a"
+    )
+    save_account_login(
+        "13800138000", None, "tok-b", password="pw", device_id="fingerprint-b"
+    )
+    accounts = {a["email"]: a for a in functions.get_accounts()}
+    assert accounts["a@b.com"]["device_id"] == "fingerprint-a"
+    assert accounts["13800138000"]["device_id"] == "fingerprint-b"
+    assert functions.get_account_device_id("a@b.com") == "fingerprint-a"
+    assert functions.get_account_device_id("missing@example.com") is None
+
+
+def test_relogin_quarantines_muted_session(pool, monkeypatch):
+    save_account_login("a@b.com", None, "old-token", password="pw")
+    tid = get_tokens()[0]["id"]
+    conn = functions.get_db()
+    conn.execute("UPDATE accounts SET relogin_at = 0")
+    conn.commit()
+    conn.close()
+
+    async def fake_login(email, password, device_id=None):
+        return {
+            "ok": True,
+            "token": "fresh-token",
+            "muted": True,
+            "mute_until": 1762502400,
+            "device_id": None,
+            "account": email,
+        }
+
+    monkeypatch.setattr(functions, "login_deepseek_account", fake_login)
+    asyncio.run(relogin_account(tid))
+    row = get_tokens()[0]
+    assert row["token"] == "fresh-token"
+    assert row["status"] == "QUARANTINED"
+    assert row["mute_until"] == 1762502400

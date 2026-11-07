@@ -58,6 +58,7 @@ from functions import (  # noqa: E402
     delete_token,
     effort_level,
     find_session,
+    get_account_device_id,
     get_accounts,
     get_auth_token,
     get_file_content,
@@ -4160,28 +4161,47 @@ async def tokens_add(request: Request):
 
 @app.post("/accounts/add")
 async def accounts_add(request: Request):
-    """Log in an account and add only its returned bearer token to the pool."""
+    """按安卓形态在桥内登录账号，并把返回的令牌加入号池。"""
     try:
         get_current_admin(request)
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     form = await request.form()
-    email = str(form.get("email", "")).strip()
+    account = str(form.get("account", "")).strip()
     password = str(form.get("password", ""))
     alias = str(form.get("alias", "")).strip() or None
-    if not email or not password:
+    device_id = str(form.get("device_id", "")).strip() or None
+    if not account or not password:
         return RedirectResponse(
-            "/dashboard?account_error=" + quote("邮箱和密码不能为空"), status_code=303
+            "/dashboard?account_error=" + quote("账号和密码不能为空"), status_code=303
         )
     try:
-        auth_token = await login_deepseek_account(email, password)
-        save_account_login(email, alias, auth_token, password=password)
+        # 面板留空时复用该账号已持久化的指纹，保证登录与自动重登使用同一
+        # 台设备；仍未绑定时才回退到全局兜底或浏览器自动采集。
+        if not device_id:
+            device_id = await _db(get_account_device_id, account)
+        result = await login_deepseek_account(account, password, device_id)
+        save_account_login(
+            account,
+            alias,
+            result["token"],
+            password=password,
+            device_id=result["device_id"],
+        )
+        message = "账号登录成功，会话在桥内生成并已加入 Token 号池"
+        if result["muted"]:
+            message += "；上游确认该账号处于禁言期，稍后会自动隔离，解禁后恢复"
         return RedirectResponse(
-            "/dashboard?account_message=" + quote("账号登录成功，已加入 Token 号池"),
-            status_code=303,
+            "/dashboard?account_message=" + quote(message), status_code=303
         )
     except Exception as e:
-        logger.warning("DeepSeek account login failed for %s: %s", email, str(e)[:300])
+        reason = getattr(e, "reason", "unknown")
+        logger.warning(
+            "DeepSeek account login failed for %s (reason=%s): %s",
+            account,
+            reason,
+            str(e)[:300],
+        )
         return RedirectResponse(
             "/dashboard?account_error=" + quote("登录失败：" + str(e)[:180]),
             status_code=303,
