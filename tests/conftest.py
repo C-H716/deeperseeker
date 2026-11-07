@@ -36,7 +36,6 @@ collect_ignore = [
     "test_deepseek_sse.py",
     "test_dsml_decorated_json.py",
     "test_minor_fixes.py",
-    "test_pow_prefetch.py",
     "test_rate_limit_failover.py",
     "test_rollover_suppression.py",
     "test_tag_drift.py",

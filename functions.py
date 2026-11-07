@@ -3248,20 +3248,117 @@ async def find_pow_answer(challange_data):
     return await asyncio.to_thread(_find_pow_answer_blocking, challange_data)
 
 
-async def solve_create_pow(target_path, auth_token):
-    pow = await create_challange_pow(target_path, auth_token)
-    answer = await find_pow_answer(pow)
-    if answer is None:
-        raise Exception("PoW solve failed")
-    json_data = {
+# ── PoW 预取池（移植自本地早期实现）──────────────────────────────────
+# 每轮对话都要付一次 create_pow_challenge 往返 + 一次 wasm 解算。挑战只约束
+# expire_at 与签发给哪个 token，不依赖本轮消息内容，因此可以在后台预先解好。
+# 池只是加速器：命中省一次往返；任何退化都只应表现为「变慢」，不得报错。
+_POW_PREFETCH_ENABLED = os.getenv(
+    "DEEPSEEKER_POW_PREFETCH", "1"
+).strip().lower() not in (
+    "0",
+    "false",
+    "off",
+)
+_POW_POOL_MAX = max(1, int(os.getenv("POW_POOL_MAX", "64")))
+POW_PREFETCH_TTL = max(1.0, float(os.getenv("POW_PREFETCH_TTL", "600")))
+# 到期前留出的安全余量：宁可早一点重解，也不把临界过期的挑战发出去。
+_POW_EXPIRE_MARGIN = 5.0
+_POW_POOL: dict = {}
+_pow_prefetch_tasks: set = set()
+
+
+def _pow_expire_epoch(challenge):
+    """返回挑战自身的过期时刻（秒）；0/None/缺失/无法解析一律返回 None。"""
+    if not isinstance(challenge, dict):
+        return None
+    try:
+        stamp = float(challenge.get("expire_at"))
+    except (TypeError, ValueError):
+        return None
+    if stamp <= 0:
+        return None
+    if stamp > 1e12:  # 毫秒
+        stamp /= 1000.0
+    return int(stamp)
+
+
+def _build_pow_header(challenge, answer, target_path):
+    """把挑战与解算结果打包成 x-ds-pow-response 需要的 base64 串。"""
+    payload = {
         "algorithm": "DeepSeekHashV1",
-        "challenge": pow["challenge"],
-        "salt": pow["salt"],
+        "challenge": challenge["challenge"],
+        "salt": challenge["salt"],
         "answer": answer,
-        "signature": pow["signature"],
+        "signature": challenge["signature"],
         "target_path": target_path,
     }
-    return base64.b64encode(json.dumps(json_data).encode()).decode()
+    return base64.b64encode(json.dumps(payload).encode()).decode()
+
+
+def _pow_pool_take(target_path, auth_token):
+    """取出并弹出该桶的预取条目；已过期则丢弃并返回 None。"""
+    entry = _POW_POOL.pop((target_path, auth_token), None)
+    if not entry:
+        return None
+    header, expire_at = entry
+    if time.time() >= expire_at:
+        return None
+    return header
+
+
+def _pow_pool_store(target_path, auth_token, header, challenge):
+    """写入预取条目；超过上限时丢弃最早过期的一条。"""
+    if len(_POW_POOL) >= _POW_POOL_MAX:
+        oldest = min(_POW_POOL, key=lambda key: _POW_POOL[key][1])
+        _POW_POOL.pop(oldest, None)
+    ttl_expire = time.time() + POW_PREFETCH_TTL
+    challenge_expire = _pow_expire_epoch(challenge)
+    expire_at = (
+        min(ttl_expire, challenge_expire) if challenge_expire else ttl_expire
+    ) - _POW_EXPIRE_MARGIN
+    _POW_POOL[(target_path, auth_token)] = (header, expire_at)
+
+
+async def _prefetch_pow(target_path, auth_token):
+    """后台预解一个 PoW；任何失败都静默，绝不影响主路径。"""
+    try:
+        challenge = await create_challange_pow(target_path, auth_token)
+        answer = await find_pow_answer(challenge)
+        if answer is not None:
+            _pow_pool_store(
+                target_path,
+                auth_token,
+                _build_pow_header(challenge, answer, target_path),
+                challenge,
+            )
+    except Exception as exc:
+        logger.debug("PoW prefetch failed for %s: %s", target_path, exc)
+
+
+# 「跑一次预取」的语义别名，调用方与测试都用这个名字。
+_prefetch_pow_once = _prefetch_pow
+
+
+def _schedule_prefetch(target_path, auth_token):
+    if not _POW_PREFETCH_ENABLED:
+        return
+    task = asyncio.create_task(_prefetch_pow(target_path, auth_token))
+    _pow_prefetch_tasks.add(task)
+    task.add_done_callback(_pow_prefetch_tasks.discard)
+
+
+async def solve_create_pow(target_path, auth_token):
+    header = _pow_pool_take(target_path, auth_token)
+    if header is not None:
+        # 命中即用，同时补下一轮的预取。
+        _schedule_prefetch(target_path, auth_token)
+        return header
+    challenge = await create_challange_pow(target_path, auth_token)
+    answer = await find_pow_answer(challenge)
+    if answer is None:
+        raise Exception("PoW solve failed")
+    _schedule_prefetch(target_path, auth_token)
+    return _build_pow_header(challenge, answer, target_path)
 
 
 async def create_new_chat(auth_token):
