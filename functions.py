@@ -1690,6 +1690,32 @@ def get_pool_view():
     return view
 
 
+_PROBE_VERDICT = {
+    "valid": "ok",
+    "muted": "muted",
+    "invalid": "invalid",
+    "banned": "banned",
+    "rate_limited": "rate_limited",
+    "challenge_required": "challenge_required",
+}
+
+
+async def probe_token_mute(auth_token: str) -> dict:
+    """只读探测的稳定接口：把 probe_token 的分类结果折成 verdict。
+
+    返回 ``{"verdict", "detail", "mute_until"}``。verdict 取值：ok / muted /
+    invalid / banned / rate_limited / challenge_required / error。上层（健康
+    探针、面板）只依赖这一层，不再各自解释 status 字符串。
+    """
+    res = await probe_token(auth_token) or {}
+    status = res.get("status")
+    return {
+        "verdict": _PROBE_VERDICT.get(status, status or "error"),
+        "detail": res.get("msg") or "",
+        "mute_until": res.get("mute_until"),
+    }
+
+
 async def probe_token(auth_token: str) -> dict:
     cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
     headers = get_headers(auth_token, device_id=device_id)

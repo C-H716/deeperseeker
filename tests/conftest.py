@@ -31,7 +31,6 @@ collect_ignore = [
     "test_real_parent.py",
     "test_responses_api.py",
     "test_token_pool_balance.py",
-    "test_deep_health.py",
     "test_deepseek_sse.py",
     "test_minor_fixes.py",
     "test_rate_limit_failover.py",

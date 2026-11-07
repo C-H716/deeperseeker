@@ -43,23 +43,22 @@ def test_deep_probe_healthy_reports_shape_without_secrets():
         raise AssertionError("create_new_chat must not be called by deep health probe")
 
     async def ok_probe(token):
-        return {"status": "valid", "msg": "ok"}
+        return {"verdict": "ok", "detail": "ok", "mute_until": None}
 
     with (
         mock.patch.object(app_module, "create_new_chat", fail_create),
-        mock.patch.object(app_module, "probe_token", ok_probe),
-        # Review fix (PR #62): the probe rides the state-aware pick
-        # (pick_token -> get_token) instead of the state-blind first row.
-        mock.patch.object(app_module, "pick_token", lambda: 1),
+        mock.patch.object(app_module, "probe_token_mute", ok_probe),
         mock.patch.object(
             app_module,
-            "get_token",
-            lambda tid: {
-                "id": tid,
-                "alias": None,
-                "token": "secret-token-material",
-                "status": "ACTIVE",
-            },
+            "get_tokens",
+            lambda: [
+                {
+                    "id": 1,
+                    "alias": None,
+                    "token": "secret-token-material",
+                    "status": "ACTIVE",
+                }
+            ],
         ),
     ):
         payload = asyncio.run(app_module._deep_health_probe())
@@ -81,12 +80,13 @@ def test_deep_probe_failure_is_degraded_and_redacted():
         )
 
     with (
-        mock.patch.object(app_module, "probe_token", boom),
-        mock.patch.object(app_module, "pick_token", lambda: 1),
+        mock.patch.object(app_module, "probe_token_mute", boom),
         mock.patch.object(
             app_module,
-            "get_token",
-            lambda tid: {"id": tid, "alias": None, "token": "tok", "status": "ACTIVE"},
+            "get_tokens",
+            lambda: [
+                {"id": 1, "alias": None, "token": "tok", "status": "ACTIVE"},
+            ],
         ),
     ):
         payload = asyncio.run(app_module._deep_health_probe())
@@ -98,42 +98,47 @@ def test_deep_probe_failure_is_degraded_and_redacted():
 
 
 def test_deep_probe_without_pool_token_is_honest():
-    with mock.patch.object(app_module, "pick_token", lambda: None):
+    with mock.patch.object(app_module, "get_tokens", lambda: []):
         payload = asyncio.run(app_module._deep_health_probe())
     assert payload["upstream_reachable"] is False
-    assert payload["reason"] == "no ACTIVE token in pool"
+    assert "没有可用令牌" in payload["reason"]
 
 
 def test_deep_probe_skips_quarantined_pool():
-    """A pool whose only row is QUARANTINED must NOT be probed: pick_token()
-    returns None (quarantined rows are never candidates) and the probe
-    reports honestly instead of re-arming a known-dead credential."""
-    calls = {"create": 0}
+    """A pool whose only row is QUARANTINED must NOT be probed upstream.
+
+    探针只挑 ACTIVE 行；隔离行不会被重新武装成已知失效的凭据。"""
+    calls = {"create": 0, "probe": 0}
 
     async def fail_if_called(token):
         calls["create"] += 1
         return "chat-should-not-exist"
 
+    async def probe_if_called(token):
+        calls["probe"] += 1
+        return {"verdict": "ok", "detail": "", "mute_until": None}
+
     with (
         mock.patch.object(app_module, "create_new_chat", fail_if_called),
-        mock.patch.object(app_module, "pick_token", lambda: None),
-        # even a state-blind get_token would find this dead row — the probe
-        # must never reach it because pick_token already refused
+        mock.patch.object(app_module, "probe_token_mute", probe_if_called),
         mock.patch.object(
             app_module,
-            "get_token",
-            lambda tid: {
-                "id": tid,
-                "alias": None,
-                "token": "dead-credential",
-                "status": "QUARANTINED",
-            },
+            "get_tokens",
+            lambda: [
+                {
+                    "id": 1,
+                    "alias": None,
+                    "token": "dead-credential",
+                    "status": "QUARANTINED",
+                }
+            ],
         ),
     ):
         payload = asyncio.run(app_module._deep_health_probe())
     assert calls["create"] == 0, "a quarantined pool must not be probed upstream"
+    assert calls["probe"] == 0, "a quarantined pool must not be probed upstream"
     assert payload["upstream_reachable"] is False
-    assert payload["reason"] == "no ACTIVE token in pool"
+    assert "没有可用令牌" in payload["reason"]
 
 
 def test_health_route_refuses_unauthenticated_deep_before_upstream():

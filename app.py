@@ -75,6 +75,7 @@ from functions import (
     parse_tools,
     pick_token,
     probe_token,
+    probe_token_mute,
     purge_all_tokens_chats,
     purge_chats_for_token,
     record_file,
@@ -4720,9 +4721,17 @@ async def dashboard_probe(request: Request):
     results = []
     for tok in tokens:
         try:
-            res = await probe_token(tok["token"])
+            res = await probe_token_mute(tok["token"])
+            ok = res.get("verdict") in (
+                "ok",
+                "muted",
+                "banned",
+                "rate_limited",
+                "challenge_required",
+            )
+            res = {**res, "ok": ok}
         except Exception as e:
-            res = {"ok": False, "error": str(e)[:200]}
+            res = {"ok": False, "verdict": "error", "detail": str(e)[:200]}
         results.append({"id": tok["id"], "alias": tok.get("alias"), "probe": res})
     return JSONResponse({"tokens": results})
 
@@ -5029,28 +5038,24 @@ async def _deep_health_probe_guarded(authorized):
 
 
 async def _deep_health_probe():
-    """One end-to-end upstream round trip (read-only, zero session creation).
+    """一次只读的上游往返（不创建任何上游会话）。
 
-    Cost: read-only users/current check via probe_token, creating zero
-    upstream chat sessions. The previous implementation called create_new_chat
-    creating an empty upstream chat on each probe, which matches DeepSeek's
-    high-frequency empty-session detection heuristic and leads to 40003.
+    成本：通过 probe_token 走只读 users/current，创建零个上游 chat。旧实现
+    调用 create_new_chat，每次探测都在上游留下一个空会话，正好撞上
+    DeepSeek 的高频空会话判定（40003）。
     """
-    token_id = await _db(pick_token)
-    row = await _db(get_token, token_id) if token_id is not None else None
-    auth_token = row["token"] if row else None
-    if not auth_token:
+    started = time.perf_counter()
+    tokens = await _db(get_tokens)
+    active = [t for t in tokens if t.get("status") == "ACTIVE"]
+    if not active:
         return {
             "upstream_reachable": False,
             "pow_ok": False,
             "latency_ms": None,
-            "reason": "no ACTIVE token in pool",
+            "reason": "没有可用令牌（号池为空，或全部处于隔离/冷却）",
         }
-    started = time.perf_counter()
     try:
-        res = await probe_token(auth_token)
-        if res.get("status") not in ("valid", "muted"):
-            raise UpstreamError(401, res.get("msg") or "token check failed")
+        res = await probe_token_mute(active[0]["token"])
     except Exception as e:
         logger.warning("Deep health probe failed: %s", e)
         return {
@@ -5059,12 +5064,29 @@ async def _deep_health_probe():
             "latency_ms": round((time.perf_counter() - started) * 1000, 1),
             "reason": _redact_secret_material(str(e))[:200] or "upstream error",
         }
+    verdict = (res or {}).get("verdict")
     latency_ms = round((time.perf_counter() - started) * 1000, 1)
+    # muted / banned / rate_limited / challenge_required 都证明上游可达且账号
+    # 存在，只是账号本身受限；只有 invalid 与异常才算不可达。
+    if verdict not in (
+        "ok",
+        "muted",
+        "banned",
+        "rate_limited",
+        "challenge_required",
+    ):
+        return {
+            "upstream_reachable": False,
+            "pow_ok": False,
+            "latency_ms": latency_ms,
+            "reason": f"{verdict}: {(res or {}).get('detail') or ''}"[:200],
+        }
     return {
         "upstream_reachable": True,
         "pow_ok": True,
         "latency_ms": latency_ms,
         "chat_created": False,
+        "verdict": verdict,
     }
 
 
