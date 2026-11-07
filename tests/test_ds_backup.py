@@ -14,16 +14,11 @@ import functions
 
 @pytest.fixture()
 def pool(tmp_path, monkeypatch):
-    """在临时库里建立一个通过桥内登录加入的账号。"""
+    """在临时库里放一个令牌。"""
     db = str(tmp_path / "pool.db")
     monkeypatch.setattr(functions, "_db", db)
-    monkeypatch.setattr(
-        functions, "_ACCOUNT_KEY_FILE", str(tmp_path / "account_secret.key")
-    )
     functions.init_db()
-    functions.save_account_login(
-        "a@b.com", "alias-a", "tok-a", password="pw", device_id="fingerprint-a"
-    )
+    functions.add_token("tok-a", "alias-a")
     return db
 
 
@@ -34,24 +29,22 @@ def test_encrypt_decrypt_roundtrip():
     assert ds_backup.decrypt(payload, "wrong-secret") != plaintext
 
 
-def test_snapshot_covers_all_local_columns(pool):
+def test_snapshot_covers_local_token_columns(pool):
     snapshot = ds_backup.export_snapshot(pool)
     assert snapshot["v"] == 2
-    token_columns = snapshot["tables"]["tokens"]["columns"]
-    for name in ("account_id", "limited_until", "quarantine_reason", "mute_until"):
-        assert name in token_columns
-    account_columns = snapshot["tables"]["accounts"]["columns"]
-    for name in ("password_secret", "relogin_at", "relogin_disabled", "device_id"):
-        assert name in account_columns
+    columns = snapshot["tables"]["tokens"]["columns"]
+    for name in ("cookies", "shumei_id", "device_id", "park_reason"):
+        assert name in columns
+    # 当前基线没有 accounts 表，快照应自动跳过而不是报错
+    assert "accounts" not in snapshot["tables"]
 
 
-def test_restore_preserves_relogin_credentials(pool):
+def test_restore_preserves_token_rows(pool):
     snapshot = json.loads(
         json.dumps(ds_backup.export_snapshot(pool), ensure_ascii=False)
     )
     conn = functions.get_db()
     conn.execute("DELETE FROM tokens")
-    conn.execute("DELETE FROM accounts")
     conn.commit()
     conn.close()
 
@@ -59,10 +52,6 @@ def test_restore_preserves_relogin_credentials(pool):
     tokens = functions.get_tokens()
     assert len(tokens) == 1
     assert tokens[0]["token"] == "tok-a"
-    creds = functions.get_relogin_credentials(tokens[0]["id"])
-    assert creds is not None
-    assert creds["password"] == "pw"
-    assert creds["device_id"] == "fingerprint-a"
 
 
 def test_restore_skips_when_pool_is_not_empty(pool, monkeypatch):
@@ -95,10 +84,8 @@ def test_file_backend_roundtrip(pool, tmp_path, monkeypatch):
     assert "backup ok" in ds_backup.backup_now(pool)
     conn = functions.get_db()
     conn.execute("DELETE FROM tokens")
-    conn.execute("DELETE FROM accounts")
     conn.commit()
     conn.close()
 
     assert "restored" in ds_backup.restore_if_needed(pool)
     assert len(functions.get_tokens()) == 1
-    assert functions.get_account_device_id("a@b.com") == "fingerprint-a"

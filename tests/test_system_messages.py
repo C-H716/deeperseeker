@@ -83,7 +83,22 @@ def test_build_prompt_continuation_forwards_trailing_system():
     assert prompt.index("remember: be terse") < prompt.index("[USER]\nnext")
 
 
-def test_build_prompt_continuation_does_not_resend_earlier_system():
+def test_build_prompt_continuation_mirrors_earlier_system():
+    import plugin_helper
+
+    with mock.patch.object(plugin_helper, "MIRROR_SYSTEM_PROMPT", True):
+        messages = [
+            {"role": "system", "content": "SENTINEL"},
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "next"},
+        ]
+        prompt = run(build_prompt(messages, [], "v4.1flash", is_first_message=False))
+        assert "[SYSTEM]\nSENTINEL" in prompt
+        assert "[USER]\nnext" in prompt
+
+
+def test_build_prompt_continuation_opt_out_legacy_system():
     messages = [
         {"role": "system", "content": "SENTINEL"},
         {"role": "user", "content": "start"},
@@ -111,7 +126,6 @@ def test_chat_completions_merges_system_messages_in_upstream_prompt():
         thinking=False,
         search=False,
         file_ids=None,
-        search_sink=None,
     ):
         sent.append(prompt)
         yield "ok"

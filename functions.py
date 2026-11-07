@@ -2,7 +2,6 @@ import asyncio
 import base64
 import contextlib
 import contextvars
-import hashlib
 import json
 import logging
 import mimetypes
@@ -12,9 +11,9 @@ import re
 import sqlite3
 import string
 import time
+import urllib.parse
 import uuid
-from collections import OrderedDict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import aiohttp
 import deepseek_tokenizer
@@ -27,141 +26,21 @@ except ImportError:
 
 logger = logging.getLogger("deeperseeker.functions")
 
-# B12：所有运行时相对路径锚定到包目录。此前 app.py 在导入时执行全局
-# os.chdir(BASE_DIR)，把进程级状态改成了「依赖导入顺序」——内嵌、多 worker、
-# 测试与打包都会因此行为漂移。
+# B12 (Stage 1 audit): all relative runtime paths are anchored to the package
+# directory — the old global os.chdir(BASE_DIR) at import mutated process-wide
+# state (hostile to embedding, testing and PyPI packaging).
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 wasm_path = os.path.join(BASE_DIR, "wasm", "deepseek_pow_solver.wasm")
 _session = None
 _db = os.getenv("DB_PATH") or os.path.join(BASE_DIR, "deeperseeker.db")
 
-# any <...> token containing a fullwidth pipe U+FF5C, which never appears in
-# legitimate prose. ASCII '|' is deliberately NOT matched (tables, code).
-_FULLWIDTH_PIPE_TAG_RE = re.compile(r"<[^<>]*｜[^<>]*>")
-
 
 def data_dir():
-    """返回存放 SQLite 数据库的目录。
-
-    与数据库同级的运行时文件（如自动生成的 API key）也放在这里。
-    显式设置 DB_PATH 时以它为准；缺省锚定包目录，不依赖进程 CWD。
-    """
+    """Directory holding the SQLite database (and runtime files stored next to
+    it, e.g. the generated API key). Honors DB_PATH; anchored to the package
+    directory by default so nothing depends on the process CWD."""
     return os.path.dirname(os.path.abspath(_db))
-
-
-class DeepSeekRateLimitError(Exception):
-    """Upstream rate limiting reported inside an otherwise successful SSE response."""
-
-    def __init__(self, message="DeepSeek rate limit reached"):
-        super().__init__(f"HTTP 429: {message}")
-
-
-class UpstreamError(Exception):
-    """Upstream DeepSeek failure carrying the HTTP status and body.
-
-    取代早期以 Exception(f"HTTP {status}: ...") 传递状态码的字符串协议：
-    该协议要求调用方用正则解析消息文本，措辞一变就会失效。调用方改为直接
-    读取 .status；str() 仍保持 'HTTP <status>: <body>' 的形态，便于日志与
-    既有 app._upstream_http_code 解析兼容。
-    """
-
-    def __init__(self, status, body=""):
-        self.status = int(status)
-        self.body = str(body)
-        super().__init__(f"HTTP {self.status}: {self.body}")
-
-
-class UpstreamBizError(UpstreamError):
-    """HTTP 200 whose envelope carries a business-level error.
-
-    DeepSeek answers several endpoints with 200 + `{"code": N, "data": null}`
-    (or `data.biz_data: null`) when the account is flagged, its web session
-    was killed, or the per-account "messages too frequent" wall is hit. 直接
-    索引 biz_data 会抛 `'NoneType' object is not subscriptable`，那不是
-    UpstreamError，token 永远不会被轮换，死账号会一直留在池子里。
-
-    Subclassing UpstreamError means `_upstream_http_code()` already reads
-    `.status`, and handle_chat's rotation path (401/403/429) picks it up with
-    no changes there.
-    """
-
-
-def _format_mute_until(ts):
-    """把上游秒级解禁时间戳格式化为 UTC+8 的可读时间。
-
-    移植自 1515asd/rh-deeperseeker v89.7。容器时区通常不可控，故固定
-    UTC+8，避免面板显示的解禁日期随部署环境漂移。
-    """
-    try:
-        return datetime.fromtimestamp(float(ts), timezone(timedelta(hours=8))).strftime(
-            "%Y-%m-%d %H:%M"
-        )
-    except (TypeError, ValueError, OSError, OverflowError):
-        return "unknown"
-
-
-class UpstreamMutedError(UpstreamBizError):
-    """上游明确报告账号禁言（biz_data.is_muted == 1 的布尔硬证据）。
-
-    移植自 1515asd/rh-deeperseeker v89.7。与依赖报文措辞的软证据不同，
-    该字段由上游直接给出，不存在措辞巧合造成的误判，因此命中即隔离，
-    不设多击宽限；隔离后由管理员显式恢复。
-    """
-
-    def __init__(self, mute_until=None):
-        self.mute_until = mute_until
-        super().__init__(403, f"user is muted (until {_format_mute_until(mute_until)})")
-
-
-def _raise_if_muted_envelope(biz):
-    """在业务信封中检测禁言硬证据，命中即抛 UpstreamMutedError。
-
-    兼容两种形态：biz_data.is_muted 与 biz_data.chat.is_muted（后者由
-    /api/v0/users/current 返回）。
-    """
-    if not isinstance(biz, dict):
-        return
-    chat = biz.get("chat") if isinstance(biz.get("chat"), dict) else {}
-    if biz.get("is_muted") == 1 or chat.get("is_muted") == 1:
-        raise UpstreamMutedError(chat.get("mute_until") or biz.get("mute_until"))
-
-
-def _biz_data(payload, what="response"):
-    """Return `payload["data"]["biz_data"]` or raise UpstreamBizError.
-
-    Auth-shaped business messages map to 401 so the token is quarantined /
-    rotated; everything else maps to 429 so it cools down and rotates. Both
-    are statuses handle_chat already understands.
-    """
-    data = payload.get("data") if isinstance(payload, dict) else None
-    biz = data.get("biz_data") if isinstance(data, dict) else None
-    _raise_if_muted_envelope(biz)
-    if biz:
-        return biz
-    payload = payload if isinstance(payload, dict) else {}
-    code = payload.get("code")
-    msg = payload.get("msg") or payload.get("message") or "empty biz_data"
-    status = (
-        401 if re.search(r"login|auth|token|session|expire", str(msg), re.I) else 429
-    )
-    raise UpstreamBizError(status, f"{what}: code={code} msg={msg}")
-
-
-def _clean_tool_arg(value):
-    # Strip corrupted DSML markers that leaked INTO a tool-call argument
-    # value (e.g. a path parsed as "shell/core/Theme.qml</｜｜DSML｜｜ >").
-    # Only touches strings that actually contain a fullwidth pipe U+FF5C, so
-    # normal arguments are untouched. Recurses into dicts/lists.
-    if isinstance(value, str):
-        if "｜" in value:
-            value = _FULLWIDTH_PIPE_TAG_RE.sub("", value).strip()
-        return value
-    if isinstance(value, dict):
-        return {k: _clean_tool_arg(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_clean_tool_arg(v) for v in value]
-    return value
 
 
 def cookie_file_path():
@@ -210,21 +89,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             alias TEXT,
             token TEXT,
-            status TEXT DEFAULT 'ACTIVE',
-            last_checked_at TEXT,
-            last_check_error TEXT,
-            account_id INTEGER,
-            limited_until REAL
-        );
-        CREATE TABLE IF NOT EXISTS accounts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            alias TEXT,
-            token_id INTEGER,
-            status TEXT DEFAULT 'ACTIVE',
-            last_login_at TEXT,
-            last_error TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            status TEXT DEFAULT 'ACTIVE'
         );
         CREATE TABLE IF NOT EXISTS sessions (
             signature TEXT PRIMARY KEY,
@@ -243,107 +108,58 @@ def init_db():
             token_id INTEGER,
             created_at REAL
         );
-        -- 号池轮换记录：某会话因原 token 被限流而改由另一个 token 重建时
-        -- 写一行。控制台据此展示每个账号的「转出 / 转入」次数与最近一次
-        -- 转移。chat_id 是被放弃的上游会话 id（排障用，允许为空）。
-        CREATE TABLE IF NOT EXISTS token_rotations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            from_token_id INTEGER,
-            to_token_id INTEGER NOT NULL,
-            from_token_key TEXT,
-            to_token_key TEXT,
-            chat_id TEXT,
-            created_at REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_token_rotations_created
-            ON token_rotations(created_at);
-        -- Token usage samples. One row per (hour, model, token, api key):
-        -- hours, not days, because DeepSeek bills input and output at double
-        -- the rate inside its peak windows and those boundaries fall on whole
-        -- hours (see usage_stats.py) — a daily row cannot reconstruct the
-        -- tier of each call. token_id -1 and '' stand for "unknown" so the
-        -- primary key never sees a NULL (SQLite treats NULLs as distinct,
-        -- which would let the same bucket be inserted twice).
-        CREATE TABLE IF NOT EXISTS usage_hours (
-            hour TEXT NOT NULL,
-            model TEXT NOT NULL,
-            token_id INTEGER NOT NULL DEFAULT -1,
-            api_key TEXT NOT NULL DEFAULT '',
-            input_tokens INTEGER NOT NULL DEFAULT 0,
-            output_tokens INTEGER NOT NULL DEFAULT 0,
-            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-            cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-            requests INTEGER NOT NULL DEFAULT 0,
-            last_seen REAL NOT NULL DEFAULT 0,
-            PRIMARY KEY (hour, model, token_id, api_key)
-        );
-        CREATE INDEX IF NOT EXISTS idx_usage_hours_hour ON usage_hours(hour);
-        -- 管理员运行时设置（提示词增强总开关，移植自 rh v89.6）
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
     """)
-    # Keep existing Docker volumes compatible with the token health metadata.
-    token_columns = {
+    # B3 (Stage 1 audit) migration: pool cooldown + usage tracking. Older
+    # databases miss the columns; the ALTERs are idempotent behind the
+    # pragma check.
+    existing_cols = {
         row[1] for row in conn.execute("PRAGMA table_info(tokens)").fetchall()
     }
-    if "last_checked_at" not in token_columns:
-        conn.execute("ALTER TABLE tokens ADD COLUMN last_checked_at TEXT")
-    if "last_check_error" not in token_columns:
-        conn.execute("ALTER TABLE tokens ADD COLUMN last_check_error TEXT")
-    if "account_id" not in token_columns:
-        conn.execute("ALTER TABLE tokens ADD COLUMN account_id INTEGER")
-    if "limited_until" not in token_columns:
-        conn.execute("ALTER TABLE tokens ADD COLUMN limited_until REAL")
-    # 调度器并列时的「最久未用优先」需要记录 token 的上次选中时刻；
-    # 注意与 sessions.last_used（B13 的会话清理）分属两张表。
-    if "last_used" not in token_columns:
+    if "rate_limited_until" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN rate_limited_until REAL")
+    if "last_used" not in existing_cols:
         conn.execute("ALTER TABLE tokens ADD COLUMN last_used REAL")
-    # 禁言隔离：移植自 1515asd/rh-deeperseeker v89.7。隔离原因与解禁时间
-    # 仅供面板展示；QUARANTINED 状态由 pick_token 的状态白名单自然排除。
-    if "quarantine_reason" not in token_columns:
-        conn.execute("ALTER TABLE tokens ADD COLUMN quarantine_reason TEXT")
-    if "mute_until" not in token_columns:
-        conn.execute("ALTER TABLE tokens ADD COLUMN mute_until REAL")
-    # 人机验证停放（移植自 artyom08-dev 的 parking 设计）：PARKED 带计时器，
-    # 到期自动回到轮换；park_reason 供面板展示具体原因。
-    if "park_reason" not in token_columns:
-        conn.execute("ALTER TABLE tokens ADD COLUMN park_reason TEXT")
-    # 桥内登录自动重登凭据：移植自 v89.12。密码以本地密钥加密后存放，
-    # 从不写入日志或返回给页面；未添加账号时这些列保持为空。
-    account_columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()
-    }
-    if "password_secret" not in account_columns:
-        conn.execute("ALTER TABLE accounts ADD COLUMN password_secret TEXT")
-    if "relogin_at" not in account_columns:
-        conn.execute("ALTER TABLE accounts ADD COLUMN relogin_at REAL")
-    if "relogin_disabled" not in account_columns:
+    # P0-3 migration: how many 403s this token has seen with no successful
+    # turn in between. Reset by mark_active() and by restore_token().
+    if "consecutive_403" not in existing_cols:
         conn.execute(
-            "ALTER TABLE accounts ADD COLUMN relogin_disabled INTEGER DEFAULT 0"
+            "ALTER TABLE tokens ADD COLUMN consecutive_403 INTEGER NOT NULL DEFAULT 0"
         )
-    # 按账号持久化数美设备指纹：登录与自动重登复用同一指纹，避免每次
-    # 登录都被识别为新设备（移植自 rh v89.13）。
-    if "device_id" not in account_columns:
-        conn.execute("ALTER TABLE accounts ADD COLUMN device_id TEXT")
-    # B13: session pruning keys on real recency of USE, so older volumes need
-    # the column; the ALTER is idempotent behind the pragma check.
-    session_columns = {
+    if "cookies" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN cookies TEXT")
+    if "shumei_id" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN shumei_id TEXT")
+    if "device_id" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN device_id TEXT")
+    if "park_reason" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN park_reason TEXT")
+    existing_session_cols = {
         row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
     }
-    if "last_used" not in session_columns:
+    if "last_used" not in existing_session_cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN last_used REAL")
-    # 轮换统计按 token 字符串归属，而不是 tokens.id：id 只是槽位，删除
-    # 账号后 add_token() 会复用最小空位，新账号便会继承旧账号的转移历史。
-    # 旧行只有自增 id，无法还原当时是哪个 token，因此不参与统计（留 NULL）。
-    rotation_columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(token_rotations)").fetchall()
-    }
-    if "from_token_key" not in rotation_columns:
-        conn.execute("ALTER TABLE token_rotations ADD COLUMN from_token_key TEXT")
-    if "to_token_key" not in rotation_columns:
-        conn.execute("ALTER TABLE token_rotations ADD COLUMN to_token_key TEXT")
+    if "sent_prompt" not in existing_session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN sent_prompt TEXT")
+    # P0-6 (Day 29): usage stats — one row per COMPLETED turn (client-visible
+    # success), aggregated per day x per masked key at read time. Keeping raw
+    # rows instead of pre-aggregated counters makes the numbers auditable and
+    # the "streamed retries count once" rule structural: a failed attempt has
+    # nothing to record.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            day TEXT NOT NULL,
+            key_alias TEXT NOT NULL,
+            surface TEXT NOT NULL,
+            model TEXT,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_usage_day_key ON usage(day, key_alias)"
+    )
     conn.commit()
     conn.close()
     try:
@@ -368,11 +184,11 @@ async def get_session():
 
 
 async def close_session():
-    """关闭共享的 aiohttp ClientSession。
+    """Close the shared aiohttp ClientSession (Stage 1 minor list).
 
-    由应用 lifespan 关闭阶段调用。缺少该调用时，每次 uvicorn 重载或退出都会
-    泄漏会话的 connector 套接字，并产生 "Unclosed client session" 警告。
-    """
+    Called from app lifespan shutdown: without it, every uvicorn reload/exit
+    leaked the session's connector sockets and logged 'Unclosed client
+    session' warnings."""
     global _session
     if _session is not None and not _session.closed:
         await _session.close()
@@ -429,7 +245,7 @@ async def post_with_failover(path, *, headers, session=None, **kwargs):
         is_last = attempt == len(UPSTREAM_BASES) - 1
         try:
             resp = await session.post(base + path, headers=headers, **kwargs)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (TimeoutError, aiohttp.ClientError) as e:
             logger.warning("Upstream POST %s failed on %s: %s", path, base, e)
             last_exc = e
             if is_last:
@@ -438,7 +254,7 @@ async def post_with_failover(path, *, headers, session=None, **kwargs):
         if resp.status >= 500 and not is_last:
             try:
                 body = await resp.text()
-            except (aiohttp.ClientError, asyncio.TimeoutError):
+            except (TimeoutError, aiohttp.ClientError):
                 body = ""
             # PR #26 review fix (Medium): hand the failed connection back to
             # the pool. Without this, repeated failovers leak responses and
@@ -450,7 +266,7 @@ async def post_with_failover(path, *, headers, session=None, **kwargs):
                 resp.status,
                 base,
             )
-            last_exc = Exception(f"HTTP {resp.status}: {body[:200]}")
+            last_exc = UpstreamError(resp.status, body[:200])
             continue
         if attempt > 0:
             logger.info(
@@ -464,559 +280,200 @@ async def post_with_failover(path, *, headers, session=None, **kwargs):
     )
 
 
-# B11 (Stage 1 audit): the Android client identity used to be hardcoded to one
-# version for ALL tokens — when DeepSeek's app moves, a single stale string
-# degrades every account simultaneously, and identical fingerprints correlate
-# bans. The version is env-configurable now; per-token identity profiles
-# (rotating UA/version/locale) remain a P1.
-DEEPSEEKER_CLIENT_VERSION = os.getenv("DEEPSEEKER_CLIENT_VERSION", "2.4.5")
+# Desktop Chrome client identity sent as x-client-version (B11); bump it when
+# DeepSeek's web frontend updates.
+DEEPSEEKER_CLIENT_VERSION = os.getenv("DEEPSEEKER_CLIENT_VERSION", "2.7.1")
+DEEPSEEKER_CLIENT_LOCALE = os.getenv("DEEPSEEKER_CLIENT_LOCALE", "ru")
+DEEPSEEKER_BROWSER_PLATFORM_DEFAULT = "Linux"
+DEEPSEEKER_BROWSER_UA_DEFAULT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/157.0.0.0 Safari/537.36"
+)
 
 
-def get_headers(auth_token, pow=None):
+def get_browser_user_agent(platform_name: str | None = None) -> str:
+    ua_env = os.getenv("DEEPSEEKER_BROWSER_USER_AGENT")
+    if ua_env:
+        return ua_env
+    plat = platform_name or os.getenv(
+        "DEEPSEEKER_BROWSER_PLATFORM", DEEPSEEKER_BROWSER_PLATFORM_DEFAULT
+    )
+    plat_lower = str(plat).strip().lower()
+    if plat_lower == "windows":
+        return (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/157.0.0.0 Safari/537.36"
+        )
+    if plat_lower in ("macos", "darwin", "macintosh"):
+        return (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/157.0.0.0 Safari/537.36"
+        )
+    return (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/157.0.0.0 Safari/537.36"
+    )
+
+
+def extract_shumei_device_id(cookies: dict | None) -> str | None:
+    if not cookies or not isinstance(cookies, dict):
+        return os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID")
+    for k, v in cookies.items():
+        if k.startswith(".thumbcache_") and v:
+            unquoted = urllib.parse.unquote(str(v))
+            return unquoted if unquoted.startswith("B") else f"B{unquoted}"
+    return os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID")
+
+
+def is_browser_profile(*args, **kwargs) -> bool:
+    return True
+
+
+def resolve_client_profile(*args, **kwargs) -> str:
+    return "browser"
+
+
+def get_headers(auth_token, pow=None, *args, **kwargs):
+    browser_platform = os.getenv(
+        "DEEPSEEKER_BROWSER_PLATFORM", DEEPSEEKER_BROWSER_PLATFORM_DEFAULT
+    )
+    browser_ua = get_browser_user_agent(browser_platform)
+    locale = os.getenv("DEEPSEEKER_CLIENT_LOCALE", DEEPSEEKER_CLIENT_LOCALE)
+    client_version = os.getenv("DEEPSEEKER_CLIENT_VERSION", DEEPSEEKER_CLIENT_VERSION)
     headers = {
         "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9",
+        "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         "content-type": "application/json",
         "origin": "https://chat.deepseek.com",
         "referer": "https://chat.deepseek.com/",
-        "user-agent": "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 7)",
-        "x-client-platform": "android",
-        "x-client-version": DEEPSEEKER_CLIENT_VERSION,
-        "x-client-locale": "en_US",
+        "user-agent": browser_ua,
+        "sec-ch-ua": '"Not-A.Brand";v="99", "Google Chrome";v="157", "Chromium";v="157"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": f'"{browser_platform}"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
         "x-client-bundle-id": "com.deepseek.chat",
+        "x-client-locale": locale,
+        "x-client-platform": "web",
         "x-client-timezone-offset": _TZ_OFFSET,
+        "x-client-version": client_version,
     }
+    device_id = kwargs.get("device_id")
     if auth_token:
         headers["authorization"] = f"Bearer {auth_token}"
+        headers["x-device-id"] = device_id or str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f"deeperseeker:{auth_token}")
+        )
+        headers["x-device-model"] = ""
     if pow:
         headers["x-ds-pow-response"] = pow
     return headers
 
 
-def _extract_login_token(payload):
-    """Find a bearer token across the login response shapes used by DeepSeek."""
-    if isinstance(payload, str):
-        candidate = payload.strip()
-        if candidate.startswith("{") or candidate.startswith("["):
-            try:
-                return _extract_login_token(json.loads(candidate))
-            except json.JSONDecodeError:
-                return None
-        return None
-    if isinstance(payload, dict):
-        # Current web login shape: data.biz_data.user.token.
-        data_section = payload.get("data")
-        biz_data = (
-            data_section.get("biz_data") if isinstance(data_section, dict) else None
-        )
-        user = biz_data.get("user") if isinstance(biz_data, dict) else None
-        if (
-            isinstance(user, dict)
-            and isinstance(user.get("token"), str)
-            and user["token"].strip()
-        ):
-            return user["token"].strip()
-        for key in ("token", "access_token", "auth_token"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        for value in payload.values():
-            token = _extract_login_token(value)
-            if token:
-                return token
-    elif isinstance(payload, list):
-        for value in payload:
-            token = _extract_login_token(value)
-            if token:
-                return token
-    return None
+_HIF_LEIM_URL = os.getenv(
+    "DEEPSEEKER_HIF_URL",
+    os.getenv("DEEPSEEKER_HIF_LEIM_URL", "https://hif-leim.deepseek.com/query"),
+)
+_HIF_DLIQ_URL = os.getenv(
+    "DEEPSEEKER_HIF_DLIQ_URL", "https://hif-dliq.deepseek.com/query"
+)
+_HIF_URL = _HIF_LEIM_URL
 
-
-def _redact_login_response(value):
-    """Redact credentials before writing a DeepSeek login response to logs."""
-    # 设备指纹是可识别的设备标识，与凭据一样不写入日志。
-    sensitive_markers = (
-        "token",
-        "password",
-        "authorization",
-        "cookie",
-        "secret",
-        "device_id",
-        "device-id",
-    )
-    if isinstance(value, dict):
-        redacted = {}
-        for key, item in value.items():
-            key_text = str(key).lower()
-            redacted[key] = (
-                "[REDACTED]"
-                if any(marker in key_text for marker in sensitive_markers)
-                else _redact_login_response(item)
-            )
-        return redacted
-    if isinstance(value, list):
-        return [_redact_login_response(item) for item in value]
-    return value
-
-
-# The fingerprint SDK envelope submitted by the web client decodes to a JSON
-# object carrying appId/organization/ep/data and runs to several thousand
-# characters. The floor below only has to separate that shape from the storage
-# keys it is easily confused with (smidV2 is a short timestamp+hex token, and
-# deepseek-device-id:chat is a UUID), so it is deliberately far under the real
-# length rather than an exact match on a value the SDK may re-version.
-_DEVICE_ID_MIN_LENGTH = 200
-_DEVICE_ID_B64_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}\Z")
-
-
-def _decode_device_id_envelope(candidate):
-    """Return the JSON envelope carried by a device ID, or None when absent.
-
-    The fingerprint SDK prefixes the base64 payload with a single tag
-    character, so the encoded body is not aligned to the start of the string.
-    Both the whole value and the value past that tag are attempted; only a
-    body that decodes to an object carrying ``appId`` is accepted.
-    """
-    for offset in (0, 1):
-        body = candidate[offset:]
-        if not body or len(body) % 4 != 0:
-            continue
-        try:
-            decoded = base64.b64decode(body, validate=True)
-        except Exception:
-            continue
-        try:
-            parsed = json.loads(decoded.decode("utf-8"))
-        except Exception:
-            continue
-        if isinstance(parsed, dict) and "appId" in parsed:
-            return parsed
-    return None
-
-
-def _looks_like_device_id(value):
-    """Report whether a value has the structure the login endpoint expects.
-
-    The risk check correlates the submitted identifier with the fingerprint
-    SDK's envelope, so a value of the wrong shape leaves the request rejected
-    exactly as a missing one would. Storage keys under similar names are
-    rejected here to keep them from being cached and then reused indefinitely.
-    """
-    if not isinstance(value, str):
-        return False
-    candidate = value.strip()
-    if len(candidate) < _DEVICE_ID_MIN_LENGTH:
-        return False
-    if not _DEVICE_ID_B64_RE.match(candidate):
-        return False
-    return _decode_device_id_envelope(candidate) is not None
-
-
-def _generate_web_device_id():
-    """Generate a structurally valid placeholder device ID for the endpoint.
-
-    This keeps the request well formed when no real identifier can be obtained,
-    but it is not a fingerprint: the risk check rejects it, and callers must
-    treat rejection as the expected outcome rather than a transient failure.
-    """
-    envelope = json.dumps(
-        {
-            "appId": "default",
-            "organization": "",
-            "ep": "",
-            # Padded so the placeholder also satisfies _looks_like_device_id;
-            # the endpoint parses this field before the risk check runs.
-            "data": "0" * 400,
-        },
-        separators=(",", ":"),
-    )
-    return base64.b64encode(envelope.encode("utf-8")).decode("ascii")
-
-
-def device_id_file_path():
-    """Resolve where the harvested DeepSeek device ID is stored.
-
-    Mirrors cookie_file_path(): an explicit override wins, otherwise the file
-    is placed next to the database so it lands inside the persistent Docker
-    volume and survives container recreation.
-    """
-    p = os.getenv("DEEPSEEKER_DEVICE_ID_PATH")
-    if p:
-        return p
-    d = os.path.dirname(os.path.abspath(_db))
-    if d and os.path.abspath(d) != os.path.abspath(os.getcwd()):
-        return os.path.join(d, "deepseek_device_id")
-    return os.path.join(BASE_DIR, "deepseek_device_id")
-
-
-def _read_persisted_device_id():
-    """Return the stored device ID, or None when absent, unreadable or malformed.
-
-    A malformed value is treated as absent rather than returned: an earlier run
-    may have cached a storage key with a similar name, and reusing it would keep
-    every subsequent login failing the risk check with no path to recovery short
-    of deleting the file by hand.
-    """
-    try:
-        with open(device_id_file_path()) as f:
-            value = f.read().strip()
-    except Exception:
-        return None
-    if not _looks_like_device_id(value):
-        if value:
-            logger.warning(
-                "Discarding persisted DeepSeek device ID at %s: it does not have "
-                "the shape the login endpoint expects",
-                device_id_file_path(),
-            )
-        return None
-    return value
-
-
-def _persist_device_id(value):
-    """Store a harvested device ID so later logins reuse the same identity.
-
-    Identity reuse matters: the risk engine correlates logins by device, so a
-    new random ID per login looks like an unfamiliar device each time. Values
-    failing the structural check are refused here so a bad harvest cannot
-    poison every later login.
-    """
-    if not _looks_like_device_id(value):
-        logger.warning("Refusing to persist a malformed DeepSeek device ID")
-        return
-    target = device_id_file_path()
-    try:
-        target_dir = os.path.dirname(os.path.abspath(target))
-        os.makedirs(target_dir, exist_ok=True)
-        tmp_path = target + ".tmp"
-        with open(tmp_path, "w") as f:
-            f.write(value)
-        os.replace(tmp_path, target)
-        logger.info("DeepSeek device ID persisted to %s", target)
-    except Exception as e:
-        logger.warning("Could not persist DeepSeek device ID to %s: %s", target, e)
-
-
-# Runs in the page context. Only the SDK accessors are consulted: storage keys
-# with similar names (smidV2, deepseek-device-id:chat) hold a different kind of
-# identifier, and returning one would submit a value the risk check rejects.
-_DEVICE_ID_PROBE_JS = """
-async () => {
-  const sdk = window.SMSdk || window.smSdk || window.SMSDK;
-  if (!sdk) return "";
-  for (const name of ["getDeviceId", "getDeviceIdSync", "getDeviceIdAsync"]) {
-    try {
-      const fn = sdk[name];
-      if (typeof fn !== "function") continue;
-      const value = await fn.call(sdk);
-      if (typeof value === "string" && value) return value;
-    } catch (e) {}
-  }
-  return "";
+_hif_caches = {
+    "leim": {"value": None, "expire_at": 0.0, "retry_at": 0.0},
+    "dliq": {"value": None, "expire_at": 0.0, "retry_at": 0.0},
 }
-"""
+_hif_cache = _hif_caches["leim"]
+_hif_locks = {
+    "leim": asyncio.Lock(),
+    "dliq": asyncio.Lock(),
+}
+_hif_lock = _hif_locks["leim"]
 
 
-def device_id_harvest_timeout():
-    """Return the harvest budget, falling back when the setting is unusable.
-
-    Resolved per call rather than at import: the variable is documented in
-    .env.example, and a non-numeric value there must not abort module import
-    and take the whole service down over an unrelated feature.
-    """
-    raw = os.getenv("DEEPSEEKER_DEVICE_ID_TIMEOUT", "60")
-    try:
-        return max(1.0, float(raw))
-    except (TypeError, ValueError):
-        logger.warning(
-            "Ignoring invalid DEEPSEEKER_DEVICE_ID_TIMEOUT=%r; using 60 seconds", raw
-        )
-        return 60.0
-
-
-# Serializes harvesting so concurrent logins cannot launch several browsers.
-_device_id_lock = asyncio.Lock()
-
-
-async def _fetch_real_device_id():
-    """Harvest the device ID the browser fingerprint SDK reports for this host.
-
-    A random string does not satisfy the login risk check: the endpoint expects
-    the identifier produced by the fingerprint SDK the web client loads. This
-    opens the sign-in page in headless Chromium, waits for the SDK to publish
-    its ID, and returns it.
-    """
-    if async_playwright is None:
-        raise CookieGenerationError("playwright is not installed")
-    launch_kwargs = {"headless": True}
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        launch_kwargs["args"] = ["--no-sandbox", "--disable-dev-shm-usage"]
-    harvested = None
-    last_error = None
-    timeout = device_id_harvest_timeout()
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(**launch_kwargs)
-        try:
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                locale="zh-CN",
-                viewport={"width": 1280, "height": 720},
-            )
-            page = await context.new_page()
-            await page.goto(
-                "https://chat.deepseek.com/sign_in",
-                wait_until="domcontentloaded",
-                timeout=45000,
-            )
-            # The SDK loads asynchronously; a short settle wait avoids polling
-            # before its script has even been requested.
-            with contextlib.suppress(Exception):
-                await page.wait_for_load_state("networkidle", timeout=15000)
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                try:
-                    value = await page.evaluate(_DEVICE_ID_PROBE_JS)
-                except Exception as e:
-                    # Record rather than swallow: a renamed SDK global and a
-                    # failed navigation both surface here, and the timeout
-                    # message alone cannot distinguish them.
-                    last_error = e
-                    value = ""
-                if _looks_like_device_id(value):
-                    harvested = value.strip()
-                    break
-                await asyncio.sleep(1)
-        finally:
-            await browser.close()
-    if not harvested:
-        detail = f"; last page error: {last_error}" if last_error else ""
-        raise CookieGenerationError(
-            "the fingerprint SDK did not publish a device ID within "
-            f"{timeout:.0f}s{detail}"
-        )
-    return harvested
-
-
-async def _resolve_login_device_id(explicit_device_id=None):
-    """Resolve the device ID submitted to the login endpoint.
-
-    Precedence: explicit argument > DEEPSEEKER_DEVICE_ID > persisted file >
-    freshly harvested ID > random placeholder. The random placeholder keeps the
-    request well-formed but is known to be rejected by the risk check, so it is
-    used only after every real source fails.
-    """
-    if explicit_device_id and str(explicit_device_id).strip():
-        return str(explicit_device_id).strip()
-    env_device_id = os.getenv("DEEPSEEKER_DEVICE_ID", "").strip()
-    if env_device_id:
-        return env_device_id
-    persisted = _read_persisted_device_id()
-    if persisted:
-        return persisted
-    async with _device_id_lock:
-        # A concurrent caller may have harvested and cached it while we waited.
-        persisted = _read_persisted_device_id()
-        if persisted:
-            return persisted
-        try:
-            harvested = await asyncio.wait_for(
-                _fetch_real_device_id(), timeout=device_id_harvest_timeout() + 90
-            )
-        except Exception as e:
-            logger.warning("Could not harvest a browser device ID: %s", e)
-            harvested = None
-        # Persist while still holding the lock: releasing it first would let a
-        # concurrent caller read an empty file and launch a second browser,
-        # defeating the double-check above.
-        if harvested and _looks_like_device_id(harvested):
-            _persist_device_id(harvested)
-            return harvested
-    logger.warning(
-        "No device ID available; falling back to a placeholder that the risk "
-        "check will most likely reject"
+def _get_hif_attest_headers() -> dict[str, str]:
+    browser_platform = os.getenv(
+        "DEEPSEEKER_BROWSER_PLATFORM", DEEPSEEKER_BROWSER_PLATFORM_DEFAULT
     )
-    return _generate_web_device_id()
-
-
-class AccountLoginError(Exception):
-    """登录被上游业务拒绝，携带可判定的原因码。
-
-    移植自 1515asd/rh-deeperseeker v89.12 的错误分级：密码错误、封号与
-    风控设备属于终态，自动重登不应反复尝试；网络与意外失败可延后重试。
-    """
-
-    def __init__(self, reason, message):
-        self.reason = reason
-        super().__init__(message)
-
-
-def _login_device_uuid(account):
-    """按账号确定性派生 x-device-id（UUID），重启不变。
-
-    移植自 1515asd/rh-deeperseeker v89.12。该值只是请求头里的设备 UUID，
-    与请求体的数美设备指纹是两个不同的字段，真实客户端分别发送。
-    """
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, "deeperseeker-native:" + account))
-
-
-async def login_deepseek_account(account, password, device_id=None):
-    """按官方安卓 App 形态在桥内登录，返回结构化结果。
-
-    移植自 1515asd/rh-deeperseeker v89.12 / v89.13：会话出生与使用都在桥
-    内，绕开「浏览器出生令牌跨环境使用即整体吊销」的风控。请求头使用安卓
-    客户端头组并补 x-device-id（UUID）与空 x-device-model；请求体的
-    device_id 必须是数美 SDK 的真实指纹，随机或伪造 UUID 会被以
-    RISK_DEVICE_DETECTED（biz_code=11）拒绝。
-
-    device_id 优先级：调用方显式传入（面板填写或该账号已持久化的值） >
-    DEEPSEEKER_DEVICE_ID / 全局缓存 / 浏览器自动采集 > 结构化占位。
-    """
-    if not account or not password:
-        raise ValueError("账号和密码不能为空")
-    normalized_account = str(account).strip().replace("\\@", "@")
-    is_email = "@" in normalized_account
-    email = normalized_account if is_email else None
-    mobile = None if is_email else normalized_account
-    device_uuid = _login_device_uuid(normalized_account)
-    headers = {
-        **get_headers(None),
-        "referer": "https://chat.deepseek.com/sign_in",
-        "x-device-id": device_uuid,
-        "x-device-model": "",
-    }
-    explicit = str(device_id).strip() if device_id else ""
-    fingerprint = explicit or await _resolve_login_device_id()
-    payload = {
-        "email": email,
-        "mobile": mobile,
-        "password": password,
-        "area_code": "+86",
-        "device_id": fingerprint,
-        "os": "android",
-    }
-    # 记录出站契约以便诊断，密码与凭据一律经脱敏后再写入日志。
-    logger.info(
-        "DeepSeek login request path=%s headers=%s payload=%s",
-        "/api/v0/users/login",
-        json.dumps(
-            _redact_login_response(headers), ensure_ascii=False, separators=(",", ":")
-        ),
-        json.dumps(
-            _redact_login_response(payload), ensure_ascii=False, separators=(",", ":")
-        ),
-    )
-    response = await post_with_failover(
-        "/api/v0/users/login",
-        headers=headers,
-        json=payload,
-        timeout=aiohttp.ClientTimeout(total=30),
-    )
-    async with response:
-        raw = await response.text()
-        try:
-            response_for_log = (
-                json.dumps(
-                    _redact_login_response(json.loads(raw)),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-                if raw
-                else "<empty>"
-            )
-        except json.JSONDecodeError:
-            response_for_log = raw[:4000] or "<empty>"
-        logger.info(
-            "DeepSeek login response status=%s body=%s",
-            response.status,
-            response_for_log,
-        )
-        if response.status == 202:
-            # AWS WAF 按出口 IP 挑战登录端点：数据中心 IP 上返回 202 与空
-            # text/html，而对话端点（pow、users/current）仍正常。这是 IP
-            # 信誉判定，不是 TLS/UA/头部问题，服务端无法自行绕过。
-            raise AccountLoginError(
-                "waf_challenge",
-                "登录端点被 WAF 挑战（HTTP 202 空响应），当前出口 IP 被风控拦截；"
-                "请换用住宅网络，或在浏览器完整登录后粘贴令牌",
-            )
-        if response.status != 200:
-            detail = raw[:300] if raw else "empty response body"
-            raise Exception(f"HTTP {response.status}: {detail}")
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise Exception("DeepSeek 登录接口返回了无效 JSON") from e
-    token = _extract_login_token(data)
-    if not token:
-        if isinstance(data, dict):
-            response_data = (
-                data.get("data") if isinstance(data.get("data"), dict) else {}
-            )
-            biz_code = response_data.get("biz_code")
-            biz_msg = response_data.get("biz_msg")
-            logger.warning(
-                "DeepSeek login returned no token; biz_code=%s biz_msg=%s response keys=%s data keys=%s",
-                biz_code,
-                biz_msg,
-                sorted(data.keys()),
-                sorted(response_data.keys())
-                if response_data
-                else type(data.get("data")).__name__,
-            )
-            if biz_code or biz_msg:
-                # 40303 与验证码类措辞表示上游要求人机验证（图形验证码或
-                # 邮箱 OTP）。这类流程需要真实浏览器交互，服务端无法自动
-                # 完成，故归为终态：停止自动重登，避免反复触发风控。
-                verification = str(biz_code) == "40303" or bool(
-                    re.search(
-                        r"captcha|verify|verification|otp|验证码|验证",
-                        str(biz_msg or ""),
-                        re.I,
-                    )
-                )
-                reason_map = {
-                    "2": "bad_credentials",
-                    "10": "banned",
-                    "11": "risk_device",
-                }
-                if verification:
-                    raise AccountLoginError(
-                        "needs_verification",
-                        "上游要求人机验证（验证码 / 邮箱验证码），"
-                        "需在浏览器完成一次完整登录后再粘贴令牌",
-                    )
-                raise AccountLoginError(
-                    reason_map.get(str(biz_code), f"biz_{biz_code}"),
-                    f"DeepSeek 登录失败（{biz_code or 'unknown'}: {biz_msg or 'unknown'}）",
-                )
-        raise AccountLoginError("no_token", "DeepSeek 登录成功但响应中没有找到 Token")
-    biz_data = {}
-    if isinstance(data, dict) and isinstance(data.get("data"), dict):
-        candidate = data["data"].get("biz_data")
-        if isinstance(candidate, dict):
-            biz_data = candidate
-    user = biz_data.get("user") if isinstance(biz_data.get("user"), dict) else {}
-    chat = user.get("chat") if isinstance(user.get("chat"), dict) else {}
+    browser_ua = get_browser_user_agent(browser_platform)
+    client_version = os.getenv("DEEPSEEKER_CLIENT_VERSION", DEEPSEEKER_CLIENT_VERSION)
     return {
-        "ok": True,
-        "token": token,
-        "muted": chat.get("is_muted") == 1,
-        "mute_until": chat.get("mute_until"),
-        "device_id": fingerprint,
-        "account": normalized_account,
+        "accept": "*/*",
+        "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "origin": "https://chat.deepseek.com",
+        "referer": "https://chat.deepseek.com/",
+        "user-agent": browser_ua,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+        "x-client-platform": "web",
+        "x-client-version": client_version,
+        "x-client-bundle-id": "com.deepseek.chat",
     }
+
+
+async def get_hif_token(kind: str = "leim") -> str | None:
+    norm_kind = "dliq" if str(kind).lower() == "dliq" else "leim"
+    url = _HIF_DLIQ_URL if norm_kind == "dliq" else _HIF_LEIM_URL
+    cache = _hif_caches[norm_kind]
+    lock = _hif_locks[norm_kind]
+    now = time.time()
+    if cache["value"] and now < cache["expire_at"]:
+        return cache["value"]
+    if now < cache["retry_at"] and not cache["value"]:
+        return None
+
+    async with lock:
+        now = time.time()
+        if cache["value"] and now < cache["expire_at"]:
+            return cache["value"]
+        if now < cache["retry_at"] and not cache["value"]:
+            return None
+        try:
+            session = await get_session()
+            headers = _get_hif_attest_headers()
+            async with session.get(
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=5.0)
+            ) as resp:
+                if resp.status == 200:
+                    ttl_header = resp.headers.get("x-hif-ttl")
+                    ttl = (
+                        float(ttl_header)
+                        if ttl_header and ttl_header.isdigit()
+                        else 600.0
+                    )
+                    js = await resp.json()
+                    val = (
+                        ((js.get("data") or {}).get("biz_data") or {}).get("value")
+                        or (js.get("data") if isinstance(js.get("data"), str) else None)
+                        or (js.get("data") or {}).get("token")
+                        or js.get("token")
+                    )
+                    if val:
+                        cache["value"] = str(val)
+                        cache["expire_at"] = now + max(60.0, ttl - 30.0)
+                        return cache["value"]
+        except Exception:
+            pass
+        cache["retry_at"] = now + 60.0
+        return cache["value"]
+
+
+async def get_hif_dliq_token() -> str | None:
+    return await get_hif_token(kind="dliq")
 
 
 # ==============================================================================
-# BACKUP WAF COOKIE GENERATION (DEPRECATED IN FAVOR OF ANDROID CLIENT HEADERS)
+# WAF & SESSION COOKIE GENERATION
 #
-# DeepSeek's backend does not enforce AWS WAF on requests using Android client
-# headers. The Playwright/Chromium cookie generation below is retained as a backup
-# so that if DeepSeek ever tightens WAF rules in the future, it can easily be
-# re-enabled simply by uncommenting cookies=cookie in API calls.
+# DeepSeek's web frontend enforces AWS WAF and Shumei device fingerprinting.
+# The Playwright/Chromium cookie generation below obtains valid WAF and session
+# cookies so requests replicate an authentic desktop browser.
 # ==============================================================================
 
 _cookie_lock = asyncio.Lock()
@@ -1032,8 +489,102 @@ class CookieGenerationError(Exception):
     """Raised when the DeepSeek WAF cookie file cannot be produced."""
 
 
+class UpstreamError(Exception):
+    """Upstream DeepSeek failure carrying the HTTP status and body (B6).
+
+    Replaces the old Exception(f"HTTP {status}: ...") string protocol whose
+    'HTTP (\\d{3}):' regex parsing in app.py broke token rotation and error
+    mapping whenever a wording changed. Callers read .status directly; str()
+    keeps the familiar 'HTTP <status>: <body>' shape for logs."""
+
+    def __init__(self, status, body="", retry_after=None):
+        self.status = int(status)
+        self.body = str(body)
+        self.retry_after = retry_after
+        super().__init__(f"HTTP {self.status}: {self.body}")
+
+
+class UpstreamBizError(UpstreamError):
+    def __init__(self, status, body, biz_code=None, retry_after=None):
+        super().__init__(status, body, retry_after=retry_after)
+        self.biz_code = biz_code
+
+
+def _biz_data(payload, what="response"):
+    data = payload.get("data") if isinstance(payload, dict) else None
+    biz = data.get("biz_data") if isinstance(data, dict) else None
+    if biz:
+        if isinstance(biz, dict) and (biz.get("is_muted") == 1 or biz.get("biz_code") == 5):
+            mute_until = biz.get("mute_until") or biz.get("end_at")
+            retry_after = None
+            if mute_until:
+                with contextlib.suppress(Exception):
+                    retry_after = max(1, int(float(mute_until) - time.time()))
+            raise UpstreamBizError(429, f"{what}: account muted until {mute_until}", biz_code=5, retry_after=retry_after)
+        return biz
+    payload = payload if isinstance(payload, dict) else {}
+    code = payload.get("code")
+    msg = payload.get("msg") or payload.get("message") or "empty biz_data"
+    code_map = {
+        40002: 401,
+        40003: 401,
+        40012: 403,
+        40029: 429,
+        40303: 403,
+        50006: 429,
+        40006: 502,
+    }
+    retry_after = None
+    if code == 40012:
+        retry_after = 86400
+    elif code == 40303:
+        retry_after = 1800
+    elif code == 50006:
+        retry_after = 3600
+    elif code == 40029:
+        retry_after = TOKEN_COOLDOWN_SECONDS
+
+    if code in code_map:
+        status = code_map[code]
+    elif re.search(r"login|auth|token|session|expire", str(msg), re.I):
+        status = 401
+    else:
+        status = 429
+    raise UpstreamBizError(status, f"{what}: code={code} msg={msg}", biz_code=code, retry_after=retry_after)
+
+
+def _parse_cookie_env(val: str) -> dict | None:
+    if not val or not val.strip():
+        return None
+    val = val.strip()
+    if val.startswith("{") and val.endswith("}"):
+        with contextlib.suppress(Exception):
+            parsed = json.loads(val)
+            if isinstance(parsed, dict):
+                return parsed
+    res = {}
+    if ";" in val or "=" in val:
+        for part in val.split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if k:
+                    res[k] = v
+        if res:
+            return res
+    return {
+        "aws-waf-token": val,
+        "ds_cookie_preference": "%257B%2522level%2522%253A%2522all%2522%257D",
+    }
+
+
 def _read_cookie_file():
     """Return valid (unexpired) cookies, or None."""
+    env_c = _parse_cookie_env(
+        os.getenv("DEEPSEEKER_WAF_COOKIE") or os.getenv("DEEPSEEK_COOKIE") or ""
+    )
+    if env_c:
+        return env_c
     try:
         with open(cookie_file_path()) as f:
             c = json.load(f)
@@ -1120,16 +671,27 @@ async def get_cookies():
         raise CookieGenerationError(_cookie_fail["error"])
 
 
-async def _generate_cookies():
+async def _generate_isolated_cookies_payload():
     if async_playwright is None:
         raise CookieGenerationError("playwright is not installed")
-    launch_kwargs = {"headless": False}
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        launch_kwargs["args"] = ["--no-sandbox"]
+    headless = (
+        os.getenv("DEEPSEEKER_COOKIE_HEADLESS", "true").lower()
+        in ("1", "true", "yes")
+    )
+    launch_kwargs = {
+        "headless": headless,
+        "args": [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ],
+    }
     async with async_playwright() as p:
         browser = await p.chromium.launch(**launch_kwargs)
         try:
-            context = await browser.new_context()
+            ua = get_browser_user_agent()
+            context = await browser.new_context(user_agent=ua)
             page = await context.new_page()
             await page.goto(
                 "https://chat.deepseek.com/",
@@ -1137,9 +699,23 @@ async def _generate_cookies():
                 timeout=45000,
             )
             await page.wait_for_selector("body", timeout=30000)
+            cookies = []
+            for _ in range(25):
+                cookies = await context.cookies()
+                if any(c.get("name") == "aws-waf-token" for c in cookies):
+                    break
+                await asyncio.sleep(0.4)
+            ls_shumei = None
             with contextlib.suppress(Exception):
-                await page.wait_for_url("**/sign_in*", timeout=30000)
-            cookies = await context.cookies()
+                ls_shumei = await page.evaluate("""() => {
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const k = localStorage.key(i);
+                        if (k && (k.startsWith('.thumbcache') || k === '_sm_di')) {
+                            return localStorage.getItem(k);
+                        }
+                    }
+                    return null;
+                }""")
         finally:
             await browser.close()
     final_cookies = {}
@@ -1153,6 +729,15 @@ async def _generate_cookies():
     )
     if not expiry or expiry < 0:
         expiry = time.time() + 1800
+    shumei_id = extract_shumei_device_id(final_cookies)
+    if not shumei_id and ls_shumei:
+        unquoted = urllib.parse.unquote(str(ls_shumei))
+        shumei_id = unquoted if unquoted.startswith("B") else f"B{unquoted}"
+    return final_cookies, expiry, shumei_id
+
+
+async def _generate_cookies():
+    final_cookies, expiry, _ = await _generate_isolated_cookies_payload()
     target = cookie_file_path()
     target_dir = os.path.dirname(os.path.abspath(target))
     os.makedirs(target_dir, exist_ok=True)
@@ -1167,16 +752,300 @@ async def _generate_cookies():
     )
 
 
+_token_cookie_locks = {}
+_token_locks_guard = asyncio.Lock()
+
+
+async def _get_token_lock(auth_token: str) -> asyncio.Lock:
+    async with _token_locks_guard:
+        if auth_token not in _token_cookie_locks:
+            _token_cookie_locks[auth_token] = asyncio.Lock()
+        return _token_cookie_locks[auth_token]
+
+
+async def get_isolated_cookies_for_token(
+    auth_token: str | None = None,
+) -> tuple[dict | None, str | None, str | None]:
+    """Return (cookies_dict, shumei_device_id, device_id) isolated per account.
+
+    Guarantees account isolation: accounts in the pool never share cookies,
+    WAF tokens, Shumei risk control device tokens, or x-device-id headers,
+    preventing multi-account correlation and chain bans.
+    """
+    if not auth_token:
+        c = await get_cookies_safely()
+        return c, extract_shumei_device_id(c), None
+
+    now = time.time()
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id, cookies, shumei_id, device_id FROM tokens WHERE token = ?",
+        (auth_token,),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        c = await get_cookies_safely()
+        dev_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"deeperseeker:{auth_token}"))
+        return c, extract_shumei_device_id(c), dev_id
+
+    tid = row["id"]
+    cached_cookies = row["cookies"]
+    shumei_id = row["shumei_id"]
+    dev_id = row["device_id"] or str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"deeperseeker:{auth_token}")
+    )
+
+    if cached_cookies:
+        try:
+            data = json.loads(cached_cookies)
+            if isinstance(data, dict):
+                expiry = data.get("expiry", 0)
+                c_dict = data.get("cookie")
+                if c_dict and isinstance(c_dict, dict) and expiry - now > 120:
+                    return (
+                        c_dict,
+                        shumei_id or extract_shumei_device_id(c_dict),
+                        dev_id,
+                    )
+        except Exception:
+            pass
+
+    lock = await _get_token_lock(auth_token)
+    async with lock:
+        conn = get_db()
+        row2 = conn.execute(
+            "SELECT id, cookies, shumei_id, device_id FROM tokens WHERE token = ?",
+            (auth_token,),
+        ).fetchone()
+        conn.close()
+        if row2 and row2["cookies"]:
+            try:
+                data = json.loads(row2["cookies"])
+                if isinstance(data, dict):
+                    expiry = data.get("expiry", 0)
+                    c_dict = data.get("cookie")
+                    if c_dict and isinstance(c_dict, dict) and expiry - time.time() > 120:
+                        sh_id = row2["shumei_id"] or extract_shumei_device_id(c_dict)
+                        d_id = row2["device_id"] or dev_id
+                        return c_dict, sh_id, d_id
+            except Exception:
+                pass
+
+        if os.getenv("PYTEST_CURRENT_TEST"):
+            global_c = await get_cookies_safely()
+            return global_c, shumei_id or extract_shumei_device_id(global_c), dev_id
+
+        try:
+            final_cookies, expiry, generated_shumei = (
+                await _generate_isolated_cookies_payload()
+            )
+            resolved_shumei = generated_shumei or shumei_id
+            update_token_credentials(
+                tid,
+                cookies={"cookie": final_cookies, "expiry": expiry},
+                shumei_id=resolved_shumei,
+                device_id=dev_id,
+            )
+            return final_cookies, resolved_shumei, dev_id
+        except Exception as e:
+            logger.warning(
+                "Generating isolated cookies failed for token #%s: %s", tid, e
+            )
+            if row2 and row2["cookies"]:
+                with contextlib.suppress(Exception):
+                    stale_data = json.loads(row2["cookies"])
+                    if isinstance(stale_data, dict) and stale_data.get("cookie"):
+                        return (
+                            stale_data["cookie"],
+                            row2["shumei_id"]
+                            or extract_shumei_device_id(stale_data["cookie"]),
+                            dev_id,
+                        )
+            global_c = await get_cookies_safely()
+            return global_c, shumei_id or extract_shumei_device_id(global_c), dev_id
+
+
+async def warmup_all_tokens_cookies():
+    """Background startup warmup: ensure fallback and active tokens have fresh isolated cookies."""
+    if os.getenv("PYTEST_CURRENT_TEST") or os.getenv(
+        "DEEPSEEKER_DISABLE_WARMUP", ""
+    ).lower() in ("1", "true", "yes"):
+        return
+    if not _read_cookie_file():
+        logger.info("Startup: generating default DeepSeek cookies in background...")
+        with contextlib.suppress(Exception):
+            await get_cookies_safely()
+        logger.info("Startup: default DeepSeek cookies ready.")
+
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, token, cookies FROM tokens WHERE status != 'QUARANTINED'"
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return
+
+    now = time.time()
+    for row in rows:
+        tid = row["id"]
+        token_str = row["token"]
+        cookies_json = row["cookies"]
+        is_valid = False
+        if cookies_json:
+            try:
+                data = json.loads(cookies_json)
+                exp = data.get("expiry", 0)
+                if exp - now > 120 and data.get("cookie"):
+                    is_valid = True
+            except Exception:
+                pass
+        if not is_valid and token_str:
+            logger.info("Startup: generating isolated cookies for token id=%s...", tid)
+            try:
+                await get_isolated_cookies_for_token(token_str)
+                logger.info("Startup: token id=%s isolated cookies ready.", tid)
+            except Exception as e:
+                logger.warning(
+                    "Startup: failed to generate cookies for token id=%s: %s", tid, e
+                )
+
+
+async def solve_captcha_interactive(token_id: int) -> bool:
+    """Launch a real visible Playwright browser for the given token on chat.deepseek.com.
+
+    Injects the user's auth_token into localStorage and any existing cookies,
+    allowing the operator to solve any Cloudflare/Shumei captcha
+    interactively with their mouse. Once the window is closed or captcha is
+    solved, saves the updated cookies and restores the token to ACTIVE.
+    """
+    if async_playwright is None:
+        logger.error("Solve Captcha failed: playwright is not installed")
+        return False
+
+    tok = get_token(token_id)
+    if not tok:
+        logger.error("Solve Captcha failed: token id=%s not found", token_id)
+        return False
+
+    auth_token = tok["token"]
+    launch_kwargs = {
+        "headless": False,
+        "args": [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+        ],
+    }
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(**launch_kwargs)
+            try:
+                ua = get_browser_user_agent()
+                context = await browser.new_context(
+                    user_agent=ua,
+                    viewport={"width": 1280, "height": 840},
+                )
+
+                if tok.get("cookies"):
+                    with contextlib.suppress(Exception):
+                        data = json.loads(tok["cookies"])
+                        c_dict = data.get("cookie") if isinstance(data, dict) else None
+                        if c_dict and isinstance(c_dict, dict):
+                            playwright_cookies = [
+                                {
+                                    "name": k,
+                                    "value": str(v),
+                                    "domain": ".deepseek.com",
+                                    "path": "/",
+                                }
+                                for k, v in c_dict.items()
+                            ]
+                            await context.add_cookies(playwright_cookies)
+
+                await context.add_init_script(f"""
+                    try {{
+                        localStorage.setItem("userToken", JSON.stringify({{"value": {json.dumps(auth_token)}, "__version": "0"}}));
+                    }} catch(e) {{}}
+                """)
+
+                page = await context.new_page()
+                logger.info(
+                    "Solve Captcha: opened visible browser for token #%d on chat.deepseek.com",
+                    token_id,
+                )
+                await page.goto(
+                    "https://chat.deepseek.com/", wait_until="domcontentloaded"
+                )
+
+                deadline = time.time() + 600
+                last_cookies = []
+                while time.time() < deadline:
+                    with contextlib.suppress(Exception):
+                        last_cookies = await context.cookies()
+                    if page.is_closed() or not context.pages:
+                        break
+                    await asyncio.sleep(1.0)
+
+            finally:
+                with contextlib.suppress(Exception):
+                    await browser.close()
+
+            if last_cookies:
+                final_cookies = {}
+                expiry = None
+                for i in last_cookies:
+                    if i.get("name") == "aws-waf-token":
+                        expiry = i.get("expires")
+                    final_cookies[i["name"]] = i["value"]
+                final_cookies["ds_cookie_preference"] = (
+                    "%257B%2522level%2522%253A%2522all%2522%257D"
+                )
+                if not expiry or expiry < 0:
+                    expiry = time.time() + 1800
+                shumei_id = extract_shumei_device_id(final_cookies)
+                dev_id = tok.get("device_id") or str(
+                    uuid.uuid5(uuid.NAMESPACE_URL, f"deeperseeker:{auth_token}")
+                )
+                update_token_credentials(
+                    token_id,
+                    cookies={"cookie": final_cookies, "expiry": expiry},
+                    shumei_id=shumei_id,
+                    device_id=dev_id,
+                )
+                logger.info(
+                    "Solve Captcha: updated credentials for token #%d; awaiting operator Restore",
+                    token_id,
+                )
+
+            return True
+    except Exception as e:
+        logger.error("Solve Captcha error for token #%d: %s", token_id, e)
+        return False
+
+
+async def get_cookies_safely():
+    with contextlib.suppress(Exception):
+        return await get_cookies()
+    return None
+
+
 def get_auth_token():
     conn = get_db()
-    row = conn.execute("SELECT token FROM tokens LIMIT 1").fetchone()
+    row = conn.execute(
+        "SELECT token FROM tokens WHERE status = 'ACTIVE' ORDER BY id ASC LIMIT 1"
+    ).fetchone()
+    if not row:
+        row = conn.execute("SELECT token FROM tokens LIMIT 1").fetchone()
     conn.close()
     if row:
         return row[0]
     return None
 
 
-def add_token(token, alias=None, account_id=None):
+def add_token(token, alias=None, cookies=None, shumei_id=None, device_id=None):
     conn = get_db()
     if not conn.execute("SELECT 1 FROM tokens WHERE id = 1").fetchone():
         next_id = 1
@@ -1188,21 +1057,65 @@ def add_token(token, alias=None, account_id=None):
             WHERE t2.id IS NULL
         """).fetchone()
         next_id = row[0] if row and row[0] else 1
+    if not device_id and token:
+        device_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"deeperseeker:{token}"))
+    cookies_str = (
+        json.dumps(cookies)
+        if isinstance(cookies, dict)
+        else (cookies if isinstance(cookies, str) else None)
+    )
     conn.execute(
-        "INSERT INTO tokens (id, alias, token, status, account_id) VALUES (?, ?, ?, 'ACTIVE', ?)",
-        (next_id, alias, token, account_id),
+        "INSERT INTO tokens (id, alias, token, status, cookies, shumei_id, device_id) "
+        "VALUES (?, ?, ?, 'ACTIVE', ?, ?, ?)",
+        (next_id, alias, token, cookies_str, shumei_id, device_id),
     )
     conn.commit()
     conn.close()
-    return next_id
+
+
+def update_token_credentials(
+    token_id_or_token, cookies=None, shumei_id=None, device_id=None
+):
+    conn = get_db()
+    clause = "id = ?" if isinstance(token_id_or_token, int) else "token = ?"
+    updates = []
+    params = []
+    if cookies is not None:
+        updates.append("cookies = ?")
+        params.append(
+            json.dumps(cookies) if isinstance(cookies, dict) else str(cookies)
+        )
+    if shumei_id is not None:
+        updates.append("shumei_id = ?")
+        params.append(str(shumei_id))
+    if device_id is not None:
+        updates.append("device_id = ?")
+        params.append(str(device_id))
+    if updates:
+        params.append(token_id_or_token)
+        conn.execute(f"UPDATE tokens SET {', '.join(updates)} WHERE {clause}", params)
+        conn.commit()
+    conn.close()
+
+
+def invalidate_token_cookies(token_id_or_token):
+    if not token_id_or_token:
+        return
+    with contextlib.suppress(Exception):
+        conn = get_db()
+        clause = "id = ?" if isinstance(token_id_or_token, int) else "token = ?"
+        conn.execute(
+            f"UPDATE tokens SET cookies = NULL WHERE {clause}",
+            (token_id_or_token,),
+        )
+        conn.commit()
+        conn.close()
 
 
 def get_tokens():
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, alias, token, status, last_checked_at, last_check_error, "
-        "account_id, last_used, limited_until, quarantine_reason, mute_until, "
-        "park_reason FROM tokens ORDER BY id"
+        "SELECT id, alias, token, status, cookies, shumei_id, device_id, park_reason FROM tokens"
     ).fetchall()
     conn.close()
     return [
@@ -1211,57 +1124,19 @@ def get_tokens():
             "alias": r[1],
             "token": r[2],
             "status": r[3],
-            "last_checked_at": r[4],
-            "last_check_error": r[5],
-            "account_id": r[6],
-            "last_used": r[7],
-            "limited_until": r[8],
-            "quarantine_reason": r[9],
-            "mute_until": r[10],
-            "park_reason": r[11],
+            "cookies": r[4],
+            "shumei_id": r[5],
+            "device_id": r[6],
+            "park_reason": r[7],
         }
         for r in rows
     ]
 
 
-def pool_state_note(tok):
-    """把号池状态翻译成五态说明（移植自 1515asd/rh-deeperseeker v89.6）。
-
-    返回 (分类键, 说明文本)。分类是纯读侧字符串判断，不新增任何写路径；
-    隔离原因由 mark_quarantined() 落库，说明文本供面板直接渲染。
-    """
-    status = tok.get("status")
-    reason = str(tok.get("quarantine_reason") or "")
-    lowered = reason.lower()
-    if status == "MUTED":
-        return "muted", "上游确认禁言，解禁后点「恢复」即可使用"
-    if status == "PARKED":
-        return (
-            "captcha",
-            "上游要求人机验证（40303）：请在自己电脑的浏览器登录该账号、"
-            "发一条消息解掉验证码，再点「恢复」",
-        )
-    if status == "QUARANTINED":
-        if "muted" in lowered or "禁言" in reason:
-            return "muted", "上游确认禁言，解禁后点「恢复」即可使用"
-        if "auth" in lowered or "401" in reason:
-            return "expired", "疑似过期，需重新添加账号或令牌；点「恢复」通常无效"
-        if "403" in reason:
-            return "restricted", "疑似被临时限制发言，解封后点「恢复」"
-        return "other", "其他隔离，具体原因见悬停提示；确认正常后点「恢复」"
-    if status == "RATE_LIMITED":
-        return "cooling", "限流冷却中，到期自动回到轮换"
-    if status == "INVALID":
-        return "expired", "令牌已失效，需重新添加账号或令牌"
-    if status == "CHECK_ERROR":
-        return "other", "检查失败，见「最近检查」列的具体报错"
-    return "ok", "轮换中，能正常干活"
-
-
 def get_token(token_id):
     conn = get_db()
     row = conn.execute(
-        "SELECT id, alias, token, status, last_checked_at, last_check_error, account_id FROM tokens WHERE id = ?",
+        "SELECT id, alias, token, status, cookies, shumei_id, device_id, park_reason FROM tokens WHERE id = ?",
         (token_id,),
     ).fetchone()
     conn.close()
@@ -1271,9 +1146,10 @@ def get_token(token_id):
             "alias": row[1],
             "token": row[2],
             "status": row[3],
-            "last_checked_at": row[4],
-            "last_check_error": row[5],
-            "account_id": row[6],
+            "cookies": row[4],
+            "shumei_id": row[5],
+            "device_id": row[6],
+            "park_reason": row[7],
         }
     return None
 
@@ -1285,842 +1161,580 @@ def delete_token(token_id):
     conn.close()
 
 
-def _token_key(token):
-    """轮换统计的归属键：token 字符串的短哈希，不落明文 Token。
+# ==============================================================================
+# B3 (Stage 1 audit) — token pool scheduler v2
+#
+# The old pool selected ACTIVE tokens with ORDER BY RANDOM() and, when every
+# token was RATE_LIMITED, fell back to the FIRST token by id. Consequences
+# (root cause of issue #32): a limited token never recovered while any other
+# token stayed ACTIVE, a single-token pool had no backoff at all, and
+# concurrent requests stampeded onto one account — uneven wear and a
+# ban-ladder accelerator. The scheduler now provides:
+#   * a rate_limited_until cooldown with automatic RATE_LIMITED -> ACTIVE
+#     recovery once the cooldown expires (flipped back on the next pick),
+#   * least-in-flight selection (spreads load instead of RANDOM()),
+#   * an idle-oldest tie-break (the never/least-recently-used token leads),
+#   * a soft per-token concurrency cap: capped tokens are only used when
+#     nothing else is free,
+#   * a soonest-to-recover fallback when every token is still cooling down.
+#
+# P0-3 adds the third state on top of this scheduler: QUARANTINED. Selection
+# logic below is untouched — a quarantined token is simply never a candidate.
+# ==============================================================================
 
-    用 token 值而不是 tokens.id，是因为 id 会被 add_token() 回收复用，
-    统计会跟着槽位而不是账号走。哈希只用于本地比对，16 位足够区分。
-    """
-    if not token:
-        return None
-    return hashlib.sha1(token.encode("utf-8", errors="replace")).hexdigest()[:16]
+TOKEN_COOLDOWN_SECONDS = max(1, int(os.getenv("DEEPSEEKER_RATE_LIMIT_COOLDOWN", "60")))
+TOKEN_CONCURRENCY_CAP = max(1, int(os.getenv("DEEPSEEKER_TOKEN_CONCURRENCY", "8")))
 
+# P0-3: a 403 seen this many times in a row (no successful turn in between) is
+# not a transient refusal — it is the ban ladder, so the token leaves rotation
+# until an operator restores it. 0 disables escalation and keeps today's
+# cooldown-everything behavior; a 401 quarantines unconditionally.
+QUARANTINE_AFTER_403 = max(0, int(os.getenv("DEEPSEEKER_QUARANTINE_AFTER_403", "3")))
 
-def record_rotation(from_token_id, to_token_id, chat_id=None):
-    """记录一次号池轮换：会话因原 token 不可用而改由另一个 token 重建。
-
-    控制台的「转移」列据此展示每个账号的转出 / 转入次数与最近一次时间。
-    from_token_id 允许为空（会话首次建立时就没有旧账号）。同时落两侧
-    token 的哈希键，统计按它归属，删除后复用同一 id 的新账号不会继承。
-    """
-    conn = get_db()
-    keys = {}
-    for token_id in {from_token_id, to_token_id}:
-        if token_id is None:
-            continue
-        row = conn.execute(
-            "SELECT token FROM tokens WHERE id = ?", (token_id,)
-        ).fetchone()
-        if row:
-            keys[token_id] = _token_key(row[0])
-    conn.execute(
-        "INSERT INTO token_rotations (from_token_id, to_token_id, "
-        "from_token_key, to_token_key, chat_id, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (
-            from_token_id,
-            to_token_id,
-            keys.get(from_token_id),
-            keys.get(to_token_id),
-            chat_id,
-            time.time(),
-        ),
-    )
-    conn.commit()
-    conn.close()
+# Per-token in-flight refcounts (per process; single event-loop worker). Every
+# send reserves one slot via acquire_token_slot() and releases it when the
+# request ends — success, upstream failure or client abort — mirroring the
+# ownership-transfer pattern of the per-chat locks.
+_in_flight = {}
 
 
-def get_rotation_stats():
-    """按 token 汇总轮换次数与最近一次转移时间。
-
-    返回 {token_id: {out, in, last_at}}；last_at 为 epoch 秒，从未转移时为 None。
-    已删除 token 的历史行仍保留，因此另一侧的计数不会因删除对端而丢失。
-    这里保留 epoch 秒而不预格式化：控制台既要显示时间，也要据此判断
-    「最近一次是转出还是转入」，格式化交给模板过滤器 _fmt_ts。
-    """
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT token_key, SUM(out_n), SUM(in_n), MAX(last_at) FROM ("
-        "  SELECT from_token_key AS token_key, COUNT(*) AS out_n, 0 AS in_n, "
-        "         MAX(created_at) AS last_at "
-        "  FROM token_rotations WHERE from_token_key IS NOT NULL "
-        "  GROUP BY from_token_key"
-        "  UNION ALL"
-        "  SELECT to_token_key, 0, COUNT(*), MAX(created_at) "
-        "  FROM token_rotations WHERE to_token_key IS NOT NULL "
-        "  GROUP BY to_token_key"
-        ") GROUP BY token_key"
-    ).fetchall()
-    tokens = conn.execute("SELECT id, token FROM tokens").fetchall()
-    conn.close()
-    by_key = {
-        key: {"out": out_n or 0, "in": in_n or 0, "last_at": last_at or None}
-        for key, out_n, in_n, last_at in rows
-    }
-    # 只在当前仍存在的 token 上展示；已删除账号的历史行保留在库里，
-    # 但不归属到占用同一 id 的新账号。
-    stats = {}
-    for token_id, token in tokens:
-        entry = by_key.get(_token_key(token))
-        if entry:
-            stats[token_id] = entry
-    return stats
-
-
-RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("DEEPSEEKER_RATE_LIMIT_COOLDOWN", "60"))
-
-# 单 token 软并发上限：在途数达到上限的 token 仅在无其它可用账号时才被
-# 选中。账号数少而并发高时，纯「最少在途优先」仍会把多出来的请求压向
-# 同一账号，软上限把这部分请求导向其它尚未打满的账号。
-TOKEN_CONCURRENCY_CAP = int(os.getenv("DEEPSEEKER_TOKEN_CONCURRENCY", "8"))
-
-# 各 token 当前在途的上游请求数，供 pick_token() 做负载均衡。
-# 仅由事件循环线程读写：token_acquire/token_release 与 pick_token() 之间不存在
-# await 边界，dict 的单项读写本身是原子的，因此无需额外加锁。
-_inflight = {}
-
-
-def token_acquire(token_id):
-    """登记一个在途上游请求（对应一次 handle_chat 的完整生命周期）。"""
-    if token_id is None:
-        return
-    _inflight[token_id] = _inflight.get(token_id, 0) + 1
-
-
-def token_release(token_id):
-    """注销一个在途上游请求；计数归零时删除键，避免字典随历史无限增长。"""
-    if token_id is None:
-        return
-    remaining = _inflight.get(token_id, 0) - 1
-    if remaining > 0:
-        _inflight[token_id] = remaining
+def _bump_in_flight(token_id, delta):
+    n = _in_flight.get(token_id, 0) + delta
+    if n > 0:
+        _in_flight[token_id] = n
     else:
-        _inflight.pop(token_id, None)
+        _in_flight.pop(token_id, None)
 
 
-def inflight_snapshot():
-    """当前在途计数的快照（排障用，不参与分配决策）。"""
-    return dict(_inflight)
+class _TokenSlot:
+    """One in-flight reservation against a token. release() is once-only, so
+    transferring the slot to a streaming generator (exactly like the per-chat
+    lock owner) is safe by construction."""
 
+    __slots__ = ("token_id", "_held")
 
-class TokenLease:
-    """一次上游请求对某个 token 的在途占用凭证。
-
-    与 _OwnedChatLock 同构：release() 幂等，只注销自己登记的那一份计数，
-    因此可以在流式响应里把所有权转移给生成器、也可以在重试递归前提前
-    释放。rebind() 支持 token 轮换：旧账号被限流而请求改由新账号承载时，
-    把占用从旧 token 转移过去，避免旧计数泄漏。
-    """
-
-    __slots__ = ("_token_id",)
-
-    def __init__(self, token_id=None):
-        self._token_id = None
-        if token_id is not None:
-            token_acquire(token_id)
-            self._token_id = token_id
-
-    def rebind(self, token_id):
-        if token_id == self._token_id:
-            return
-        self.release()
-        if token_id is not None:
-            token_acquire(token_id)
-            self._token_id = token_id
+    def __init__(self, token_id):
+        self.token_id = token_id
+        self._held = True
+        _bump_in_flight(token_id, +1)
 
     def release(self):
-        if self._token_id is None:
+        if not self._held:
             return
-        token_release(self._token_id)
-        self._token_id = None
+        self._held = False
+        gap = float(os.getenv("DEEPSEEKER_CALL_GAP_SECONDS", "0.0"))
+        if gap > 0:
+            delay = (gap / 2.0) + random.uniform(0.0, gap / 2.0)
+            try:
+                loop = asyncio.get_running_loop()
+                loop.call_later(delay, _bump_in_flight, self.token_id, -1)
+                return
+            except RuntimeError:
+                pass
+        _bump_in_flight(self.token_id, -1)
 
-    @property
-    def token_id(self):
-        return self._token_id
+
+def acquire_token_slot(token_id):
+    """Reserve one in-flight slot for token_id; pair it with slot.release()."""
+    return _TokenSlot(token_id)
+
+
+def token_in_flight(token_id):
+    """Current in-flight request count for a token (selection signal)."""
+    return _in_flight.get(token_id, 0)
 
 
 def pick_token(exclude=None):
-    """选出当前最空闲的可用 token。
+    """Select the best available token (scheduler v2 — block comment above).
 
-    改为「最少在途优先」而非无状态随机：账号数少而并发新会话多时，
-    ORDER BY RANDOM() 的方差会让某个账号同时吸收多个请求、先撞上游的
-    按账号限流，而其它账号仍然空闲。并列时依次按「最久未用」与 id 升序
-    定序，保证同等空闲的账号之间继续均摊且结果确定。
+    `exclude` (optional, B10) lists token ids the caller just saw fail: they
+    are avoided while ANY other token is available, so an empty-SSE retry
+    cannot land on the same poisoned token.
 
-    limited_until 冷却过滤：刚返回 429 的账号在冷却窗口内不进入候选集；
-    冷却一旦到期即重新参与分配，并在本次选中时把状态翻回 ACTIVE，不再
-    只依赖间隔长得多（默认 300s）的定时健康检查来恢复。永久性故障状态
-    （INVALID / CHECK_ERROR）始终排除，只有限流这一种可自愈的状态享受
-    冷却到期即恢复。
-
-    在途数达到 TOKEN_CONCURRENCY_CAP 的账号排序靠后，仅在无其它可用账号
-    时才被选中——软上限不会饿死任何账号，但能抑制并发向单一账号堆积。
-
-    `exclude` 供重试轮换使用：列出刚失败过的 token id，只要还有其它可用
-    账号就不回落到它们，避免重试再次命中被污染的账号。
-
-    全部账号仍在冷却时返回最先恢复者（有界等待），而非 id 最小者；池中
-    无任何 token 时返回 None。
+    QUARANTINED tokens (P0-3) are never a candidate here, not even through the
+    all-cooling fallback: a token rejected on auth would otherwise be handed
+    straight back to the caller as the "soonest to recover" one.
     """
+    now = time.time()
     conn = get_db()
-    try:
-        now = time.time()
-        rows = conn.execute(
-            "SELECT id, status, limited_until, last_used FROM tokens"
-        ).fetchall()
-        if not rows:
-            return None
+    rows = conn.execute(
+        "SELECT id, status, rate_limited_until, last_used FROM tokens"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return None
 
-        excluded = set(exclude or ())
-        available = []  # (token_id, last_used)：冷却已过、可参与分配
-        recovered = []  # 冷却到期、本次翻回 ACTIVE 的 token
-        cooling = []  # (token_id, 恢复时刻)：仍在冷却，用于全冷却兜底
-        for tid, status, until, last_used in rows:
-            if status not in ("ACTIVE", "RATE_LIMITED", "PARKED"):
-                continue  # INVALID / CHECK_ERROR 属永久性故障，始终排除
-            if status == "PARKED" and until and until > now:
-                # 人机验证需人工处理，不参与「全冷却兜底」等待。
-                continue
-            if status == "RATE_LIMITED" and until and until > now:
-                cooling.append((tid, until))
-                continue
-            if status in ("RATE_LIMITED", "PARKED"):
-                recovered.append(tid)
-            available.append((tid, last_used or 0.0))
+    excluded = set(exclude or ())
+    available = []
+    recovered = []
+    for tid, status, until, last_used in rows:
+        if status == "QUARANTINED":
+            continue  # terminal: only restore_token() puts it back (P0-3)
+        if status in ("RATE_LIMITED", "PARKED") and until is not None and until > now:
+            continue
+        if status in ("RATE_LIMITED", "PARKED"):
+            recovered.append(tid)
+        available.append((tid, last_used or 0.0))
 
-        pickable = [e for e in available if e[0] not in excluded] or available
-        if pickable:
-            if recovered:
-                conn.executemany(
-                    "UPDATE tokens SET status = 'ACTIVE', limited_until = NULL, "
-                    "park_reason = NULL WHERE id = ?",
-                    [(tid,) for tid in recovered],
-                )
-                logger.info(
-                    "Token pool: cooldown expired, auto-recovered token(s) %s",
-                    recovered,
-                )
-            chosen = min(
-                pickable,
-                key=lambda e: (
-                    1 if _inflight.get(e[0], 0) >= TOKEN_CONCURRENCY_CAP else 0,
-                    _inflight.get(e[0], 0),
-                    e[1],
-                    e[0],
-                ),
-            )[0]
-            # 刷新上次选中时刻，使「最久未用」在从未被限流的账号上同样成立。
-            conn.execute("UPDATE tokens SET last_used = ? WHERE id = ?", (now, chosen))
+    pickable = [entry for entry in available if entry[0] not in excluded] or available
+    if pickable:
+        if recovered:
+            conn = get_db()
+            conn.executemany(
+                "UPDATE tokens SET status = 'ACTIVE', rate_limited_until = NULL WHERE id = ?",
+                [(tid,) for tid in recovered],
+            )
             conn.commit()
-            return chosen
+            conn.close()
+            logger.info(
+                "Token pool: cooldown expired, auto-recovered token(s) %s", recovered
+            )
 
-        if cooling:
-            return min(cooling, key=lambda e: (e[1], e[0]))[0]
+        def _sort_key(entry):
+            tid, last_used = entry
+            in_flight = _in_flight.get(tid, 0)
+            # Soft cap: over-cap tokens sort behind every under-cap one.
+            over_cap = 1 if in_flight >= TOKEN_CONCURRENCY_CAP else 0
+            return (over_cap, in_flight, last_used, tid)
 
-        # 禁言隔离行不得作为「无可用账号」时的兜底被选中，否则会继续用
-        # 死号发请求；其余状态沿用既有兜底语义（v89.7 的隔离约束）。
+        return min(pickable, key=_sort_key)[0]
+
+    # Every token is rate-limited and still cooling: pick the one that
+    # recovers first (bounded wait) instead of stampeding onto the lowest id
+    # with no backoff at all. Quarantined rows stay out of the race — with a
+    # pool of nothing but dead credentials this returns None, and the callers
+    # already treat "no token" as the not-configured case.
+    conn = get_db()
+    row = None
+    if excluded:
+        placeholders = ",".join("?" for _ in excluded)
+        row = conn.execute(
+            f"SELECT id FROM tokens WHERE status NOT IN ('QUARANTINED', 'PARKED') AND id NOT IN ({placeholders}) "
+            "ORDER BY COALESCE(rate_limited_until, 0) ASC, id ASC LIMIT 1",
+            list(excluded),
+        ).fetchone()
+    if not row:
         row = conn.execute(
             "SELECT id FROM tokens WHERE status NOT IN ('QUARANTINED', 'PARKED') "
-            "ORDER BY id LIMIT 1"
+            "ORDER BY COALESCE(rate_limited_until, 0) ASC, id ASC LIMIT 1"
         ).fetchone()
-        return row[0] if row else None
-    finally:
-        conn.close()
-
-
-def mark_limited(token_id):
-    """将 token 标记为限流并进入冷却期。
-
-    limited_until 让 pick_token() 在冷却窗口内绕开该账号；冷却到期后该账号
-    重新进入候选集（见 pick_token），无需等待定时健康检查。健康检查探活
-    成功仍会把状态正式恢复为 ACTIVE（见 update_token_check）。
-    """
-    logger.warning("Token #%d marked RATE_LIMITED", token_id)
-    conn = get_db()
-    conn.execute(
-        "UPDATE tokens SET status = ?, limited_until = ? WHERE id = ?",
-        ("RATE_LIMITED", time.time() + RATE_LIMIT_COOLDOWN_SEC, token_id),
-    )
-    conn.commit()
     conn.close()
+    return row[0] if row else None
 
 
-def mark_active(token_id):
-    """恢复账号为 ACTIVE，清除冷却截止时间并刷新上次选中时刻。
+def mark_quarantined(token_id, reason):
+    """Take a token out of rotation until an operator restores it (P0-3).
 
-    last_used 在此同步刷新，使调度器的「最久未用」并列定序在限流恢复后
-    不会把该账号立刻当成最旧候选。
-    """
-    conn = get_db()
-    conn.execute(
-        "UPDATE tokens SET status = ?, limited_until = NULL, last_used = ? WHERE id = ?",
-        ("ACTIVE", time.time(), token_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def mark_parked(token_id, reason, seconds=1800):
-    """账号临时停放：退出轮换，到期自动回到候选集。
-
-    移植自 artyom08-dev 的 parking 设计。与 QUARANTINED 的区别是有计时器：
-    适合「人机验证 / 短暂封禁」这类过一段时间会自行缓解的状态；到期由
-    pick_token 翻回 ACTIVE，也可由管理员提前恢复。
-    """
-    hold = max(60, min(int(seconds or 1800), 7 * 86400))
-    logger.warning("Token #%d PARKED for %ds: %s", token_id, hold, reason)
-    conn = get_db()
-    conn.execute(
-        "UPDATE tokens SET status = 'PARKED', limited_until = ?, "
-        "park_reason = ? WHERE id = ?",
-        (time.time() + hold, str(reason or ""), token_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def mark_quarantined(token_id, reason, mute_until=None):
-    """账号退出轮换，直到管理员显式恢复。
-
-    移植自 1515asd/rh-deeperseeker v89.7。与 RATE_LIMITED 不同，隔离没有
-    计时器：pick_token 只接纳 ACTIVE / RATE_LIMITED，故隔离行不会被冷却
-    到期逻辑误恢复。reason 与 mute_until 同步落库供面板展示。
+    Unlike RATE_LIMITED there is no timer on this state: rate_limited_until is
+    cleared so pick_token()'s auto-recovery can never mistake a quarantined row
+    for a cooled-down one. The reason is logged for whoever is watching the
+    pool.
     """
     logger.warning(
         "Token #%d QUARANTINED (manual return required): %s", token_id, reason
     )
     conn = get_db()
     conn.execute(
-        "UPDATE tokens SET status = 'QUARANTINED', limited_until = NULL, "
-        "quarantine_reason = ?, mute_until = ? WHERE id = ?",
-        (str(reason or ""), mute_until, token_id),
+        "UPDATE tokens SET status = ?, rate_limited_until = NULL WHERE id = ?",
+        ("QUARANTINED", token_id),
     )
     conn.commit()
     conn.close()
+
+
+def mark_parked(token_id, reason, duration=86400):
+    secs = int(duration) if duration and duration > 0 else 86400
+    secs = min(secs, 7 * 86400)
+    until = time.time() + secs
+    logger.warning(
+        "Token #%d PARKED for %ds (%s)",
+        token_id,
+        secs,
+        reason,
+    )
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET status = ?, rate_limited_until = ?, park_reason = ? WHERE id = ?",
+        ("PARKED", until, str(reason or ""), token_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+CAPTCHA_PARK_REASON = (
+    "Upstream captcha challenge (40303): account parked until verification"
+)
+
+
+def captcha_park_token(token_id, penalty_duration=1800):
+    park_seconds = (
+        int(penalty_duration) if penalty_duration and penalty_duration > 0 else 1800
+    )
+    mark_parked(token_id, CAPTCHA_PARK_REASON, park_seconds)
 
 
 def restore_token(token_id):
-    """隔离的唯一出口：清空原因并回到 ACTIVE。
+    """The only exit from quarantine (P0-3): an explicit operator action.
 
-    移植自 1515asd/rh-deeperseeker v89.7。last_used 刻意不动，使恢复的
-    账号按「最久未用」温和回到轮换，而非立刻承接突发流量。
+    last_used is deliberately left alone, so a restored token carries the
+    oldest usage stamp and the landed idle-oldest tie-break eases it back into
+    rotation instead of dumping a burst onto it.
     """
     conn = get_db()
     conn.execute(
-        "UPDATE tokens SET status = 'ACTIVE', limited_until = NULL, "
-        "quarantine_reason = NULL, mute_until = NULL, park_reason = NULL "
-        "WHERE id = ?",
+        "UPDATE tokens SET status = ?, rate_limited_until = NULL, "
+        "consecutive_403 = 0, park_reason = NULL WHERE id = ?",
+        ("ACTIVE", token_id),
+    )
+    conn.commit()
+    conn.close()
+    logger.info("Token #%d restored to ACTIVE by operator", token_id)
+
+
+def _bump_403_streak(token_id):
+    """Increment and return this token's consecutive-403 counter."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET consecutive_403 = consecutive_403 + 1 WHERE id = ?",
         (token_id,),
     )
+    row = conn.execute(
+        "SELECT consecutive_403 FROM tokens WHERE id = ?", (token_id,)
+    ).fetchone()
     conn.commit()
     conn.close()
-    logger.info("Token #%d restored to ACTIVE", token_id)
+    return row[0] if row else 0
 
 
-# ── 桥内登录自动重登（移植自 1515asd/rh-deeperseeker v89.12）──────────────
-# 红线：
-#   * 未通过账号登录加入的令牌没有凭据，模块保持惰性（零上游请求）
-#   * 自动重登保守节流，默认 6 小时；宁可不自愈，绝不形成异常登录节奏
-#   * 密码以本机密钥加密后落库，不写入日志、不返回给页面
-#   * 登录请求形态对齐 rh 的 android 形态；请求体的数美设备指纹按账号
-#     持久化并复用，避免同一账号每次重登都被识别为新设备
-_RELOGIN_MIN_INTERVAL = float(os.getenv("DEEPSEEKER_RELOGIN_MIN_INTERVAL", "21600"))
-_relogin_inflight: set = set()
-_ACCOUNT_KEY_FILE = os.path.join(data_dir(), "account_secret.key")
-
-
-def _account_key():
-    """读取或生成本地密钥，用于加密账号密码。
-
-    与数据库同目录，随持久卷保留；文件权限尽力限制为仅属主可读。
-    """
-    try:
-        with open(_ACCOUNT_KEY_FILE, "rb") as f:
-            key = f.read()
-        if len(key) >= 32:
-            return key
-    except OSError:
-        pass
-    key = os.urandom(32)
-    try:
-        os.makedirs(os.path.dirname(_ACCOUNT_KEY_FILE) or ".", exist_ok=True)
-        with open(_ACCOUNT_KEY_FILE, "wb") as f:
-            f.write(key)
-        os.chmod(_ACCOUNT_KEY_FILE, 0o600)
-    except OSError:
-        logger.warning("账号密钥持久化失败，凭据加密在本次进程内仍可用")
-    return key
-
-
-def _seal_password(password):
-    """用本地密钥与随机 nonce 派生流密钥，加密密码后作 base64 编码。"""
-    nonce = os.urandom(16)
-    stream = hashlib.pbkdf2_hmac(
-        "sha256", _account_key() + nonce, b"deeperseeker-account", 100_000
-    )
-    raw = str(password).encode("utf-8")
-    cipher = bytes(b ^ stream[i % len(stream)] for i, b in enumerate(raw))
-    return base64.b64encode(nonce + cipher).decode("ascii")
-
-
-def _unseal_password(blob):
-    """解密 _seal_password 的产物；格式非法时返回 None。"""
-    try:
-        packed = base64.b64decode(blob)
-        nonce, cipher = packed[:16], packed[16:]
-        stream = hashlib.pbkdf2_hmac(
-            "sha256", _account_key() + nonce, b"deeperseeker-account", 100_000
-        )
-        raw = bytes(b ^ stream[i % len(stream)] for i, b in enumerate(cipher))
-        return raw.decode("utf-8")
-    except (ValueError, TypeError, OSError, UnicodeDecodeError):
-        return None
-
-
-def get_relogin_credentials(token_id):
-    """读取令牌所属账号的重登凭据；非账号登录的令牌返回 None。"""
-    conn = get_db()
-    try:
-        row = conn.execute(
-            "SELECT a.email, a.password_secret, a.relogin_at, "
-            "a.relogin_disabled, a.device_id "
-            "FROM accounts a JOIN tokens t ON t.account_id = a.id WHERE t.id = ?",
-            (token_id,),
-        ).fetchone()
-    except sqlite3.Error:
-        # 旧数据卷尚未执行 init_db 的幂等 ALTER 时凭据列不存在；此时保持
-        # 惰性即可，不应影响正常请求链路。
-        conn.close()
-        return None
-    conn.close()
-    if not row or not row[1] or row[3]:
-        return None
-    password = _unseal_password(row[1])
-    if not password:
-        return None
-    return {
-        "email": row[0],
-        "password": password,
-        "relogin_at": row[2] or 0.0,
-        "device_id": row[4],
-    }
-
-
-def update_relogin_token(token_id, new_token):
-    """重登成功后原地替换令牌材料并复位轮换状态。"""
-    conn = get_db()
-    conn.execute(
-        "UPDATE tokens SET token = ?, status = 'ACTIVE', limited_until = NULL, "
-        "quarantine_reason = NULL, mute_until = NULL WHERE id = ?",
-        (new_token, token_id),
-    )
-    conn.execute(
-        "UPDATE accounts SET relogin_at = ?, last_error = NULL, status = 'ACTIVE' "
-        "WHERE id = (SELECT account_id FROM tokens WHERE id = ?)",
-        (time.time(), token_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def _disable_relogin(token_id, reason):
-    """密码错误 / 封号 / 风控设备属终态，停止该账号的自动重登。"""
-    conn = get_db()
-    conn.execute(
-        "UPDATE accounts SET relogin_disabled = 1, last_error = ? "
-        "WHERE id = (SELECT account_id FROM tokens WHERE id = ?)",
-        (str(reason)[:300], token_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-async def relogin_account(token_id):
-    """保守自动重登：节流内绝不尝试；结果如实入库。
-
-    移植自 1515asd/rh-deeperseeker v89.12，登录链路复用本项目已有的
-    login_deepseek_account（安卓形态，并复用按账号持久化的设备指纹）。
-    并发去重保证同一令牌同一时刻只跑一个重登任务。
-    """
-    if token_id in _relogin_inflight:
+def mark_limited(token_id, code=None, cooldown=None):
+    if code in (401, 40001, 40002, 40003):
+        mark_quarantined(token_id, f"upstream {code} (auth rejected)")
         return
-    _relogin_inflight.add(token_id)
-    try:
-        creds = await asyncio.to_thread(get_relogin_credentials, token_id)
-        if not creds:
-            return
-        now = time.time()
-        if now - creds["relogin_at"] < _RELOGIN_MIN_INTERVAL:
-            logger.info(
-                "[relogin] token #%s 距上次登录不足 %.0fs，跳过自动重登",
+    if code in (40012, "40012"):
+        mark_parked(token_id, "upstream 40012 (banned)", 86400)
+        return
+    if code in (40303, "40303"):
+        captcha_park_token(token_id, cooldown or 1800)
+        return
+    if code in (50006, "50006"):
+        secs = int(cooldown) if cooldown and cooldown > 0 else 3600
+        mark_parked(token_id, "upstream 50006 (muted)", secs)
+        return
+    if code == 403:
+        streak = _bump_403_streak(token_id)
+        threshold = QUARANTINE_AFTER_403
+        if threshold and streak >= threshold:
+            mark_quarantined(
                 token_id,
-                _RELOGIN_MIN_INTERVAL,
-            )
-            return
-        try:
-            result = await login_deepseek_account(
-                creds["email"], creds["password"], creds.get("device_id")
-            )
-        except AccountLoginError as exc:
-            if exc.reason in (
-                "banned",
-                "risk_device",
-                "bad_credentials",
-                "no_token",
-                "waf_challenge",
-                "needs_verification",
-            ):
-                await asyncio.to_thread(_disable_relogin, token_id, str(exc))
-            logger.warning(
-                "[relogin] token #%s 桥内登录被拒（%s），停止自动重试",
-                token_id,
-                exc.reason,
+                f"{streak} consecutive upstream 403s (threshold {threshold})",
             )
             return
-        except Exception as exc:
-            logger.warning(
-                "[relogin] token #%s 桥内登录失败，按节流重试：%s",
-                token_id,
-                str(exc)[:200],
-            )
-            return
-        await asyncio.to_thread(update_relogin_token, token_id, result["token"])
-        if result["muted"]:
-            until = _format_mute_until(result["mute_until"])
-            await asyncio.to_thread(
-                mark_quarantined,
-                token_id,
-                f"user is muted (until {until}) — bridge login",
-                result["mute_until"],
-            )
-            logger.warning(
-                "[relogin] token #%s 的新会话处于禁言期（至 %s），已隔离",
-                token_id,
-                until,
-            )
-        else:
-            logger.info("[relogin] token #%s 已通过桥内登录自愈", token_id)
-    finally:
-        _relogin_inflight.discard(token_id)
+    secs = int(cooldown) if cooldown and cooldown > 0 else TOKEN_COOLDOWN_SECONDS
+    secs = min(secs, 7 * 86400)
+    until = time.time() + secs
+    logger.warning(
+        "Token #%d marked RATE_LIMITED for %ds (recovers automatically)",
+        token_id,
+        secs,
+    )
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET status = ?, rate_limited_until = ? WHERE id = ?",
+        ("RATE_LIMITED", until, token_id),
+    )
+    conn.commit()
+    conn.close()
 
 
-def get_accounts():
+def mark_active(token_id):
+    """Stamp a successful turn: back in rotation, streak cleared.
+
+    A QUARANTINED row is deliberately left alone (P0-3). Requests overlap, so a
+    send that started before the pull can land its success afterwards; letting
+    that flip the status would let a stale response launder an operator-
+    controlled state, and only restore_token() ends a quarantine.
+    """
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET status = ?, rate_limited_until = NULL, last_used = ?, "
+        "consecutive_403 = 0 WHERE id = ? AND status NOT IN ('QUARANTINED', 'PARKED')",
+        ("ACTIVE", time.time(), token_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _format_span(seconds):
+    """Compact elapsed time for the pool view: 42s, 7m, 3h, 2d."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+# ==============================================================================
+# P0-6 (Days 28-30) — usage stats
+#
+# One row per COMPLETED turn (the client saw a real answer). Failed attempts
+# record nothing, so a turn retried across the pool lands exactly once — the
+# counting rule is structural, not a dedup heuristic. Tokens are billed on the
+# CLEANED completion (B7 semantics) by the callers, matching the usage chunk
+# clients already receive. Cost is derived from the flat tariff table and is
+# labeled as such everywhere it renders: it is an estimate against the shipped
+# rates, not upstream metering.
+# ==============================================================================
+
+
+def mask_api_key(key):
+    """Masked key alias for display: last 4 characters only.
+
+    The dashboard and every aggregate render this — a screenshot of the page
+    must not carry usable key material. Short keys (<= 8 chars, e.g. someone's
+    one-word key) are fully masked."""
+    key = str(key or "").strip()
+    if not key:
+        return "unknown"
+    if len(key) <= 8:
+        return "…"
+    return "…" + key[-4:]
+
+
+def record_usage(key_alias, surface, model, in_tokens, out_tokens, ts=None):
+    """Record one completed turn. `key_alias` is expected PRE-MASKED — pass
+    mask_api_key(raw_key) at the call site; this function never stores raw
+    key material as a defense against future callers forgetting."""
+    alias = (
+        mask_api_key(key_alias)
+        if key_alias and not str(key_alias).startswith("…")
+        else str(key_alias or "unknown")
+    )
+    when = time.time() if ts is None else float(ts)
+    day = time.strftime("%Y-%m-%d", time.gmtime(when))
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO usage (ts, day, key_alias, surface, model, input_tokens, output_tokens) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            when,
+            day,
+            alias,
+            str(surface or "unknown"),
+            str(model or ""),
+            max(0, int(in_tokens or 0)),
+            max(0, int(out_tokens or 0)),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def usage_by_day_key(since_ts=0.0):
+    """Aggregate usage per day x per masked key alias.
+
+    Returns ready-to-render rows (day, key, surfaces, requests, input_tokens,
+    output_tokens, cost, pricing_source) — the template computes nothing, the
+    same rule the pool view follows. An empty store is an empty list, never an
+    error; an unused key simply has no rows for that day. Performance: the
+    (day, key_alias) index covers the GROUP BY, so a month of data stays a
+    few milliseconds of SQLite work — no pre-aggregation table needed."""
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, email, alias, token_id, status, last_login_at, last_error, "
-        "created_at, device_id FROM accounts ORDER BY id"
+        "SELECT day, key_alias, "
+        "GROUP_CONCAT(DISTINCT surface), COUNT(*), "
+        "SUM(input_tokens), SUM(output_tokens) "
+        "FROM usage WHERE ts >= ? "
+        "GROUP BY day, key_alias ORDER BY day DESC, key_alias ASC",
+        (float(since_ts or 0.0),),
     ).fetchall()
     conn.close()
-    return [dict(row) for row in rows]
+
+    tariff = DEEPSEEK_TARIFFS["deepseek-v4.1-flash"]
+    out = []
+    for day, alias, surfaces, requests, in_tok, out_tok in rows:
+        in_tok = in_tok or 0
+        out_tok = out_tok or 0
+        cost = (in_tok / 1_000_000 * tariff["cache_miss_input"]) + (
+            out_tok / 1_000_000 * tariff["output_generation"]
+        )
+        out.append(
+            {
+                "day": day,
+                "key": alias,
+                "surfaces": surfaces or "unknown",
+                "requests": requests,
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "cost": round(cost, 6),
+                "pricing_source": "flat tariff table (not metered upstream usage)",
+            }
+        )
+    return out
 
 
-def get_account_device_id(account):
-    """读取账号已持久化的数美设备指纹；未绑定或旧库缺列时返回 None。"""
-    conn = get_db()
-    try:
-        row = conn.execute(
-            "SELECT device_id FROM accounts WHERE email = ?", (account,)
-        ).fetchone()
-    except sqlite3.Error:
-        row = None
-    finally:
-        conn.close()
-    return row[0] if row and row[0] else None
+def get_pool_view():
+    """Per-token operator view of the pool (P0-3).
 
-
-def delete_account(account_id):
-    conn = get_db()
-    row = conn.execute(
-        "SELECT token_id FROM accounts WHERE id = ?", (account_id,)
-    ).fetchone()
-    if row and row[0]:
-        conn.execute("DELETE FROM tokens WHERE id = ?", (row[0],))
-    conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
-    conn.commit()
-    conn.close()
-
-
-def _set_account_result(account_id, status, error=None, token_id=None):
-    conn = get_db()
-    conn.execute(
-        "UPDATE accounts SET status = ?, last_login_at = ?, last_error = ?, token_id = COALESCE(?, token_id) WHERE id = ?",
-        (status, datetime.now(timezone.utc).isoformat(), error, token_id, account_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def save_account_login(email, alias, auth_token, password=None, device_id=None):
-    """Create or replace an account and its corresponding pool token.
-
-    password 仅在通过面板添加账号时传入，经本地密钥加密后落库，供令牌
-    失效时的自动重登使用；device_id 是按账号持久化的数美设备指纹，登录
-    与自动重登复用同一值。手动粘贴的令牌不携带凭据，重登保持惰性。
+    State, load and timers as ready-to-render strings, and no credential field
+    at all: the token column is deliberately absent, because this output goes
+    straight into HTML a browser caches and a screenshot carries away.
+    Formatting happens here so templates/dashboard.html renders state without
+    computing any — a template that computes is one that can grow a secret.
     """
-    conn = get_db()
-    existing = conn.execute(
-        "SELECT id, token_id FROM accounts WHERE email = ?", (email,)
-    ).fetchone()
-    if existing:
-        account_id, token_id = existing[0], existing[1]
-        if token_id:
-            conn.execute(
-                "UPDATE tokens SET alias = ?, token = ?, status = 'ACTIVE', last_check_error = NULL, account_id = ? WHERE id = ?",
-                (alias or email, auth_token, account_id, token_id),
-            )
-        else:
-            token_id = None
-    else:
-        account_id = None
-        token_id = None
-
-    if token_id is None:
-        conn.commit()
-        conn.close()
-        token_id = add_token(auth_token, alias or email, account_id=None)
-        conn = get_db()
-        if account_id is None:
-            cur = conn.execute(
-                "INSERT INTO accounts (email, alias, token_id, status, last_login_at, last_error) VALUES (?, ?, ?, 'ACTIVE', ?, NULL)",
-                (email, alias, token_id, datetime.now(timezone.utc).isoformat()),
-            )
-            account_id = cur.lastrowid
-        else:
-            conn.execute(
-                "UPDATE accounts SET alias = ?, token_id = ?, status = 'ACTIVE', last_login_at = ?, last_error = NULL WHERE id = ?",
-                (alias, token_id, datetime.now(timezone.utc).isoformat(), account_id),
-            )
-        conn.execute(
-            "UPDATE tokens SET account_id = ? WHERE id = ?", (account_id, token_id)
-        )
-    else:
-        conn.execute(
-            "UPDATE accounts SET alias = ?, status = 'ACTIVE', last_login_at = ?, last_error = NULL WHERE id = ?",
-            (alias, datetime.now(timezone.utc).isoformat(), account_id),
-        )
-    if password is not None:
-        conn.execute(
-            "UPDATE accounts SET password_secret = ?, relogin_at = ?, "
-            "relogin_disabled = 0, device_id = COALESCE(?, device_id) WHERE id = ?",
-            (_seal_password(password), time.time(), device_id, account_id),
-        )
-    conn.commit()
-    conn.close()
-    return account_id
-
-
-def update_token_check(token_id, status, error=None):
-    """Persist the latest periodic/manual token check result."""
-    conn = get_db()
-    conn.execute(
-        "UPDATE tokens SET status = ?, last_checked_at = ?, last_check_error = ?, "
-        "limited_until = CASE WHEN ? = 'ACTIVE' THEN NULL ELSE limited_until END "
-        "WHERE id = ?",
-        (status, datetime.now(timezone.utc).isoformat(), error, status, token_id),
-    )
-    conn.execute(
-        "UPDATE accounts SET status = ?, last_error = ? WHERE id = "
-        "(SELECT account_id FROM tokens WHERE id = ? AND account_id IS NOT NULL)",
-        (status, error, token_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-# ── 只读令牌探测（移植自 1515asd/rh-deeperseeker v89.7）──────────────────
-# GET /api/v0/users/current 是官方客户端的个人信息接口：免 PoW、只读、
-# 禁言账号照常应答，返回 biz_data.chat.is_muted / mute_until；已作废令牌
-# 返回 code=40003。探测本身不写状态，由调用方按证据等级决定后续动作。
-async def probe_token_mute(auth_token):
-    """主动探测令牌在上游的真实状态，返回结构化判定（不含任何凭据）。"""
-    session = await get_session()
-    try:
-        async with session.get(
-            UPSTREAM_BASES[0] + "/api/v0/users/current",
-            headers=get_headers(auth_token),
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            body = await resp.json(content_type=None)
-    except Exception as exc:
-        return {
-            "verdict": "error",
-            "detail": f"probe failed: {exc}",
-            "mute_until": None,
-        }
-    if not isinstance(body, dict):
-        return {
-            "verdict": "error",
-            "detail": "unexpected non-JSON body",
-            "mute_until": None,
-        }
-    data = body.get("data") if isinstance(body.get("data"), dict) else None
-    biz = data.get("biz_data") if isinstance(data, dict) else None
-    chat = biz.get("chat") if isinstance(biz, dict) else None
-    if isinstance(chat, dict) and chat.get("is_muted") == 1:
-        return {
-            "verdict": "muted",
-            "detail": "user is muted",
-            "mute_until": chat.get("mute_until"),
-        }
-    if body.get("code") == 40003:
-        return {
-            "verdict": "invalid",
-            "detail": str(body.get("msg") or "upstream 40003"),
-            "mute_until": None,
-        }
-    if body.get("code") == 0 and isinstance(biz, dict):
-        return {"verdict": "ok", "detail": "", "mute_until": None}
-    return {
-        "verdict": "error",
-        "detail": f"unexpected envelope: code={body.get('code')}",
-        "mute_until": None,
-    }
-
-
-# ── x-hif-leim 风控令牌（移植自 1515asd/rh-deeperseeker v89.8 / v89.11）──
-# 官方网页客户端在对话请求上携带该短期令牌；rh 在 v89.11 依据抓包把默认值
-# 改为关闭，理由是安卓客户端从不发送该头，安卓形态携带网页专属头反而构成
-# 混合身份信号。本桥默认使用安卓请求头，故同样默认关闭。
-_HIF_QUERY_URL = os.getenv("DEEPSEEKER_HIF_URL", "https://hif-leim.deepseek.com/query")
-_HIF_ENABLED = os.getenv("DEEPSEEKER_HIF_ENABLED", "0").strip().lower() not in (
-    "0",
-    "false",
-    "off",
-)
-_HIF_DEFAULT_TTL = 600.0
-_HIF_REFRESH_MARGIN = 30.0
-_HIF_FAIL_BACKOFF = 60.0
-_HIF_FETCH_TIMEOUT = 5.0
-_hif_cache: dict = {"value": None, "expire_at": 0.0, "retry_at": 0.0}
-_hif_lock = asyncio.Lock()
-
-
-async def get_hif_token():
-    """取 x-hif-leim 风控令牌；任何失败返回 None，调用方降级为不带该头。
-
-    按 x-hif-ttl 缓存并提前 30s 过期，失败退避 60s；绝不发送过期令牌，
-    绝不阻断对话请求。缓存命中时零网络、零等待。
-    """
-    if not _HIF_ENABLED:
-        return None
     now = time.time()
-    if _hif_cache["value"] and now < _hif_cache["expire_at"]:
-        return _hif_cache["value"]
-    if now < _hif_cache["retry_at"]:
-        return None
-    async with _hif_lock:
-        now = time.time()
-        if _hif_cache["value"] and now < _hif_cache["expire_at"]:
-            return _hif_cache["value"]
-        if now < _hif_cache["retry_at"]:
-            return None
-        try:
-            session = await get_session()
-            async with session.get(
-                _HIF_QUERY_URL,
-                timeout=aiohttp.ClientTimeout(total=_HIF_FETCH_TIMEOUT),
-            ) as resp:
-                try:
-                    ttl = float(resp.headers.get("x-hif-ttl"))
-                except (TypeError, ValueError):
-                    ttl = _HIF_DEFAULT_TTL
-                js = await resp.json(content_type=None)
-            value = ((js.get("data") or {}).get("biz_data") or {}).get("value")
-            if value:
-                _hif_cache["value"] = value
-                _hif_cache["expire_at"] = now + max(ttl - _HIF_REFRESH_MARGIN, 1.0)
-                _hif_cache["retry_at"] = 0.0
-                return value
-            logger.warning("[hif] 风控令牌端点应答异常（缺 value），60s 后重试")
-        except Exception as exc:
-            logger.warning("[hif] 取风控令牌失败（降级为不带该头）: %s", exc)
-        _hif_cache["retry_at"] = time.time() + _HIF_FAIL_BACKOFF
-        return None
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, alias, status, rate_limited_until, last_used, consecutive_403, park_reason "
+        "FROM tokens ORDER BY id"
+    ).fetchall()
+    conn.close()
 
-
-async def check_token_status(token_id):
-    """探测令牌在上游的真实状态（禁言 / 作废 / 正常），不创建会话。
-
-    移植自 1515asd/rh-deeperseeker v89.7：优先用只读的 users/current
-    识别禁言硬证据；探测失败或无法下结论时回退到原有的 PoW 认证挑战
-    逻辑，保证行为不劣于移植前。
-    """
-    token = get_token(token_id)
-    if not token:
-        return {"id": token_id, "status": "NOT_FOUND", "error": "Token 不存在"}
-
-    probe = await probe_token_mute(token["token"])
-    verdict = probe["verdict"]
-    if verdict == "muted":
-        until = _format_mute_until(probe.get("mute_until"))
-        mark_quarantined(
-            token_id, f"user is muted (until {until})", probe.get("mute_until")
+    view = []
+    for tid, alias, status, until, last_used, streak, park_reason in rows:
+        streak = streak or 0
+        is_captcha = status == "PARKED" and (
+            "captcha" in str(park_reason or "").lower()
+            or (until and (until - now) <= 1805 and (until - now) > 0)
         )
-        return {
-            "id": token_id,
-            "status": "MUTED",
-            "error": f"上游确认禁言，解禁时间 {until}；已自动隔离",
-            "mute_until": probe.get("mute_until"),
-        }
-    if verdict == "ok":
-        # 上游确认账号已解禁时解除此前的禁言隔离，无需管理员另行操作。
-        current = get_token(token_id)
-        if current and current.get("status") == "QUARANTINED":
-            restore_token(token_id)
-        update_token_check(token_id, "ACTIVE")
-        return {"id": token_id, "status": "ACTIVE", "error": None}
-    if verdict == "invalid":
-        error = "令牌已被上游作废（过期或被登出），需重新添加账号或令牌"
-        update_token_check(token_id, "INVALID", error)
-        return {"id": token_id, "status": "INVALID", "error": error}
+        if status == "QUARANTINED":
+            state_class, cooldown = "err", "—"
+            note = "quarantined — manual return required"
+        elif status == "PARKED" and until and until > now:
+            state_class = "warn"
+            cooldown = f"{_format_span(until - now)} left"
+            note = (
+                f"parked ({park_reason})"
+                if park_reason
+                else "parked — auto or manual return"
+            )
+        elif status == "PARKED":
+            state_class, cooldown = "warn", "expired"
+            note = (
+                f"parking expired ({park_reason}) — rejoins rotation on next pick"
+                if park_reason
+                else "parking expired — rejoins rotation on next pick"
+            )
+        elif status == "RATE_LIMITED" and until and until > now:
+            state_class = "warn"
+            cooldown = f"{_format_span(until - now)} left"
+            note = "cooling down, recovers automatically"
+        elif status == "RATE_LIMITED":
+            state_class, cooldown = "warn", "expired"
+            note = "rejoins rotation on the next pick"
+        else:
+            state_class, cooldown = "ok", "—"
+            note = "in rotation"
+        if streak and status not in ("QUARANTINED", "PARKED"):
+            note = f"{note}, 403 streak {streak}"
+        age = "never" if not last_used else f"{_format_span(now - last_used)} ago"
+        view.append(
+            {
+                "id": tid,
+                "label": alias if alias else f"untagged #{tid}",
+                "status": status,
+                "state_class": state_class,
+                "state_note": note,
+                "in_flight": _in_flight.get(tid, 0),
+                "last_used": age,
+                "cooldown": cooldown,
+                "can_restore": status in ("QUARANTINED", "PARKED"),
+                "can_solve_captcha": bool(is_captcha),
+                "park_reason": park_reason or "",
+            }
+        )
+    return view
 
+
+async def probe_token(auth_token: str) -> dict:
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
     try:
-        # The challenge endpoint authenticates the bearer token and has no model
-        # side effect, unlike chat_session/create or chat/completion.
-        challenge = await create_challange_pow(
-            "/api/v0/chat/completion", token["token"]
-        )
-        if isinstance(challenge, dict) and challenge.get("challenge"):
-            update_token_check(token_id, "ACTIVE")
-            return {"id": token_id, "status": "ACTIVE", "error": None}
-        error = "上游返回了无效的认证挑战"
-        update_token_check(token_id, "CHECK_ERROR", error)
-        return {"id": token_id, "status": "CHECK_ERROR", "error": error}
+        session = await get_session()
+        get_kwargs = {"timeout": aiohttp.ClientTimeout(total=10.0)}
+        if cookie:
+            get_kwargs["cookies"] = cookie
+        async with session.get(
+            f"{UPSTREAM_BASES[0]}/api/v0/users/current",
+            headers=headers,
+            **get_kwargs,
+        ) as resp:
+            if resp.status == 200:
+                js = await resp.json()
+                code = js.get("code")
+                biz = (js.get("data") or {}).get("biz_data") or {}
+                if code == 0:
+                    if biz.get("is_muted") == 1 or biz.get("biz_code") == 5:
+                        mute_until = biz.get("mute_until") or biz.get("end_at")
+                        return {"status": "muted", "mute_until": mute_until, "msg": "account muted"}
+                    return {"status": "valid", "msg": "ok"}
+                if code in (40001, 40002, 40003):
+                    return {"status": "invalid", "code": code, "msg": js.get("msg") or "invalid token"}
+                if code == 40012:
+                    return {"status": "banned", "code": code, "msg": js.get("msg") or "user banned"}
+                if code == 40029:
+                    return {"status": "rate_limited", "code": code, "msg": js.get("msg") or "too many requests"}
+                if code == 40303:
+                    return {
+                        "status": "challenge_required",
+                        "code": code,
+                        "msg": CAPTCHA_PARK_REASON,
+                    }
+                return {"status": "unknown", "code": code, "msg": js.get("msg") or "unknown error"}
+            if resp.status == 202:
+                return {"status": "unknown", "msg": "WAF challenge (202)"}
+            if resp.status == 401:
+                return {"status": "invalid", "msg": "auth rejected (401)"}
+            return {"status": "unknown", "msg": f"upstream status {resp.status}"}
     except Exception as e:
-        message = str(e)[:300]
-        match = re.match(r"HTTP (\d{3}):", message)
-        code = int(match.group(1)) if match else None
-        status = (
-            "INVALID"
-            if code in (401, 403)
-            else "RATE_LIMITED"
-            if code == 429
-            else "CHECK_ERROR"
-        )
-        update_token_check(token_id, status, message)
-        logger.warning(
-            "Token #%s health check failed (%s): %s", token_id, status, message
-        )
-        return {"id": token_id, "status": status, "error": message}
+        return {"status": "unknown", "msg": str(e)}
+
+
+_memory_sessions: dict[str, dict] = {}
+_memory_session_map: dict[str, dict] = {}
+
+
+def is_sessions_persistence_enabled() -> bool:
+    return os.getenv("DEEPSEEKER_PERSIST_SESSIONS", "true").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
 
 
 def find_session(sig):
+    if not is_sessions_persistence_enabled():
+        sess = _memory_sessions.get(sig)
+        if sess:
+            sess["last_used"] = time.time()
+            return {
+                "token_id": sess["token_id"],
+                "session_id": sess["session_id"],
+                "parent_message_id": sess["parent_message_id"],
+                "sent_prompt": sess.get("sent_prompt"),
+            }
+        return None
+
     conn = get_db()
     row = conn.execute(
-        "SELECT token_id, deepseek_session_id, parent_message_id FROM sessions WHERE signature = ?",
+        "SELECT token_id, deepseek_session_id, parent_message_id, sent_prompt FROM sessions WHERE signature = ?",
         (sig,),
     ).fetchone()
     if row:
-        # B13: touch on read so pruning evicts by real recency of USE, not by
-        # insertion order — long-running chats get older rows every turn, and
-        # they are precisely the sessions pruning must protect.
         conn.execute(
             "UPDATE sessions SET last_used = ? WHERE signature = ?", (time.time(), sig)
         )
         conn.commit()
     conn.close()
     if row:
-        return {"token_id": row[0], "session_id": row[1], "parent_message_id": row[2]}
+        return {
+            "token_id": row[0],
+            "session_id": row[1],
+            "parent_message_id": row[2],
+            "sent_prompt": row[3] if len(row) > 3 else None,
+        }
     return None
 
 
@@ -2137,6 +1751,17 @@ _save_counter = {"n": 0}
 
 
 def prune_sessions():
+    if not is_sessions_persistence_enabled():
+        if len(_memory_sessions) > MAX_SESSIONS:
+            sorted_items = sorted(
+                _memory_sessions.items(),
+                key=lambda item: item[1].get("last_used") or 0.0,
+            )
+            excess = len(_memory_sessions) - MAX_SESSIONS
+            for k, _ in sorted_items[:excess]:
+                _memory_sessions.pop(k, None)
+        return
+
     conn = get_db()
     try:
         total = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
@@ -2163,15 +1788,26 @@ def prune_sessions():
         conn.close()
 
 
-def save_session(sig, token_id, session_id, parent_message_id=0):
-    if parent_message_id is None:
-        # 本轮没有真实编号广播：上游是否入库未知，保留原映射、不推进链路。
+def save_session(sig, token_id, session_id, parent_message_id=0, sent_prompt=None):
+    if not is_sessions_persistence_enabled():
+        _memory_sessions[sig] = {
+            "token_id": token_id,
+            "session_id": session_id,
+            "parent_message_id": parent_message_id,
+            "sent_prompt": sent_prompt,
+            "last_used": time.time(),
+        }
+        _save_counter["n"] += 1
+        if _save_counter["n"] >= PRUNE_EVERY:
+            _save_counter["n"] = 0
+            prune_sessions()
         return
+
     conn = get_db()
     conn.execute(
-        """INSERT OR REPLACE INTO sessions (signature, token_id, deepseek_session_id, parent_message_id)
-           VALUES (?, ?, ?, ?)""",
-        (sig, token_id, session_id, parent_message_id),
+        """INSERT OR REPLACE INTO sessions (signature, token_id, deepseek_session_id, parent_message_id, sent_prompt)
+           VALUES (?, ?, ?, ?, ?)""",
+        (sig, token_id, session_id, parent_message_id, sent_prompt),
     )
     conn.commit()
     conn.close()
@@ -2185,63 +1821,17 @@ def save_session(sig, token_id, session_id, parent_message_id=0):
 
 
 def delete_session(sig):
+    if not is_sessions_persistence_enabled():
+        _memory_sessions.pop(sig, None)
+        return
     conn = get_db()
     conn.execute("DELETE FROM sessions WHERE signature = ?", (sig,))
     conn.commit()
     conn.close()
 
 
-# ── 真实回复编号（移植自 1515asd/rh-deeperseeker v85）────────────────────
-# 2026-10-31 起上游在流首 ready 事件广播真实消息编号（request_message_id /
-# response_message_id）。协议变更后 parent 链必须只认真实编号：+2 猜测会把
-# 链路推进到确定无效的编号，引发 biz_code 26 的连环失败。
-_REAL_PARENT_ENABLED = os.getenv("DEEPSEEKER_REAL_PARENT", "1").strip().lower() not in (
-    "0",
-    "false",
-    "off",
-)
-_LAST_REAL_PARENT: OrderedDict = OrderedDict()
-_MAX_REAL_PARENT = 4096
-
-
-def remember_real_parent(chat_id, response_message_id):
-    """记录上游广播的真实回复编号；有界字典防止长跑进程无限增长。"""
-    if not chat_id or not isinstance(response_message_id, int):
-        return
-    _LAST_REAL_PARENT[chat_id] = response_message_id
-    _LAST_REAL_PARENT.move_to_end(chat_id)
-    while len(_LAST_REAL_PARENT) > _MAX_REAL_PARENT:
-        _LAST_REAL_PARENT.popitem(last=False)
-
-
-def saved_parent(chat_id, prev_parent=None):
-    """返回上游广播的真实回复编号；本轮无广播时返回 None。
-
-    无广播意味着上游未入库、链路状态未知，调用方必须跳过 save_session
-    保留原映射，绝不能写入猜测值。prev_parent 仅用于兼容调用点签名；在
-    DEEPSEEKER_REAL_PARENT=0 的应急回退模式下按旧语义返回 prev_parent + 2。
-    """
-    if not _REAL_PARENT_ENABLED:
-        return (prev_parent or 0) + 2
-    return _LAST_REAL_PARENT.get(chat_id)
-
-
-def _extract_response_message_id(payload):
-    """从上游 SSE 事件中取真实回复编号，兼容顶层与 data / v 包裹。"""
-    if not isinstance(payload, dict):
-        return None
-    for candidate in (payload, payload.get("data"), payload.get("v")):
-        if isinstance(candidate, dict):
-            value = candidate.get("response_message_id")
-            if isinstance(value, int) and value > 0:
-                return value
-    return None
-
-
 def next_parent(parent_message_id):
-    """[已废弃] 旧协议的 +2 猜测；仅为兼容既有导入保留，不应再被调用。
-
-    Compute the parent_message_id to use for the next turn on a chat session.
+    """Compute the parent_message_id to use for the next turn on a chat session.
 
     Invariant: each successful /chat/completion request appends exactly one user
     message and one assistant message to the DeepSeek chat session, so if the
@@ -2257,6 +1847,15 @@ def next_parent(parent_message_id):
 
 
 def delete_sessions_for_chat(token_id, session_id):
+    if not is_sessions_persistence_enabled():
+        to_del = [
+            k
+            for k, v in _memory_sessions.items()
+            if v.get("token_id") == token_id and v.get("session_id") == session_id
+        ]
+        for k in to_del:
+            _memory_sessions.pop(k, None)
+        return
     conn = get_db()
     conn.execute(
         "DELETE FROM sessions WHERE token_id = ? AND deepseek_session_id = ?",
@@ -2266,23 +1865,45 @@ def delete_sessions_for_chat(token_id, session_id):
     conn.close()
 
 
+def delete_sessions_for_token(token_id):
+    if not is_sessions_persistence_enabled():
+        to_del = [
+            k for k, v in _memory_sessions.items() if v.get("token_id") == token_id
+        ]
+        for k in to_del:
+            _memory_sessions.pop(k, None)
+        return
+    conn = get_db()
+    conn.execute("DELETE FROM sessions WHERE token_id = ?", (token_id,))
+    conn.commit()
+    conn.close()
+
+
+def delete_all_sessions():
+    _memory_sessions.clear()
+    if is_sessions_persistence_enabled():
+        conn = get_db()
+        conn.execute("DELETE FROM sessions")
+        conn.commit()
+        conn.close()
+
+
 # ==============================================================================
-# B4（Stage 1 审计）—— 文件归属注册表
+# B4 (Stage 1 audit) — file ownership registry
 #
-# /v1/files 上传此前随机挑选 token，而上游的文件按账号隔离，因此后续
-# /v1/chat/completions 引用该 file_id 时可能落到另一个账号并收到上游的
-# “file not found”——OpenAI 风格的「上传后引用」流程（Claude Code / Cline
-# 的文件流程）因此在设计上就是坏的。现在上传会钉在当时的 token 上；聊天
-# 处理器首轮优先使用文件属主 token，后续轮次则把异主引用改挂到本会话自己
-# 的 token 上。
+# /v1/files uploads picked a RANDOM token and upstream files are
+# account-scoped, so a later /v1/chat/completions referencing that file_id
+# could pick a different token and get "file not found" — the OpenAI-style
+# upload->reference flow (Claude Code / Cline file flows) was broken by
+# design. Uploads are now pinned to their token; chat handlers prefer the
+# file-owner token on the first turn and re-home foreign references onto the
+# chat's own token on later turns.
 # ==============================================================================
 
 
 def record_file(file_id, token_id):
-    """把上游 file_id 钉在拥有它的 token（账号）上。
-
-    先到者胜：INSERT OR IGNORE 保证最初的映射不会被后来的上传改写。
-    """
+    """Pin an upstream file_id to the token (account) that owns it.
+    First owner wins: INSERT OR IGNORE keeps the original mapping stable."""
     conn = get_db()
     conn.execute(
         "INSERT OR IGNORE INTO files (file_id, token_id, created_at) VALUES (?, ?, ?)",
@@ -2293,7 +1914,7 @@ def record_file(file_id, token_id):
 
 
 def get_file_token(file_id):
-    """返回拥有该 file_id 的 token id；未登记（历史遗留）时返回 None。"""
+    """Return the token id that owns an uploaded file_id, or None."""
     conn = get_db()
     row = conn.execute(
         "SELECT token_id FROM files WHERE file_id = ?", (file_id,)
@@ -2308,148 +1929,18 @@ def get_file_token(file_id):
 # for v4.1flash, this constant is the single place to set it.
 DEFAULT_MODEL_TYPE = None
 
-# 单价表已迁至 usage_stats.PRICING：按「缓存命中 / 缓存未命中 / 输出」三档、
-# 高峰与低峰两档计价，由 format_response 的成本字段与 /stats 面板共用同一份
-# 定义，避免两处价格表各自漂移。
+# Flat peak-hour rates (per 1M tokens) for the single default model,
+# per https://api-docs.deepseek.com/quick_start/pricing
+DEEPSEEK_TARIFFS = {
+    "deepseek-v4.1-flash": {
+        "cache_miss_input": 0.44,
+        "output_generation": 1.32,
+    },
+}
 
 
 def count_tokens(text, model="deepseek-v4.1-flash"):
     return len(deepseek_tokenizer.ds_token.encode(text))
-
-
-# --- tokenizer 结果缓存 ------------------------------------------------------
-# ds_token.encode() 实测只有约 0.6 MB/s，是全链路最慢的纯 CPU 操作，而同一段
-# 文本在一次请求里会被统计多次（上下文估算、usage 上报、成本计算）。按内容摘要
-# 缓存可以把它收敛为一次分词。
-#
-# key 用 sha1 摘要而非原文：单条工具结果可达几十 KB，拿原文当 key 会在长会话里
-# 累积出可观的常驻内存；sha1 约 1 GB/s，比分词快三个数量级，开销可忽略。
-_TOKEN_CACHE = OrderedDict()
-_TOKEN_CACHE_MAX = int(os.getenv("DEEPSEEKER_TOKEN_CACHE_MAX", "4096"))
-
-
-def count_tokens_cached(text):
-    """带内容缓存的 count_tokens，返回值与 count_tokens 完全一致。
-
-    纯同步实现，不含 await 点，因此在事件循环里不会被打断；未命中时的开销与
-    直接调用 count_tokens 相同，命中时省下整次分词。
-    """
-    if not text:
-        return 0
-    key = hashlib.sha1(text.encode("utf-8", errors="replace")).digest()
-    hit = _TOKEN_CACHE.get(key)
-    if hit is not None:
-        _TOKEN_CACHE.move_to_end(key)
-        return hit
-    n = count_tokens(text)
-    _TOKEN_CACHE[key] = n
-    while len(_TOKEN_CACHE) > _TOKEN_CACHE_MAX:
-        _TOKEN_CACHE.popitem(last=False)
-    return n
-
-
-# --- Prompt-cache accounting ------------------------------------------------
-# The DeepSeek web endpoint returns no token metadata, so the usage this bridge
-# reports is computed locally and an upstream cache hit can never be read back.
-# Caching still applies upstream, but on a different axis than the one the
-# reported figure describes. The upstream chat is a stateful conversation that
-# already holds every earlier turn, so the history a client resends is not
-# reprocessed; only the new suffix is. The reported usage, however, describes
-# the client's own full prompt (count_tok over the whole message list), so the
-# cache figure must share that basis to mean anything to the caller.
-#
-# The two agree because the client resends the whole conversation every turn:
-# the previous turn's prompt is exactly the reusable prefix of this turn's, and
-# the difference is the genuinely new material. Remembering that size per
-# conversation signature reproduces the figure DeepSeek's own API reports as
-# `prompt_cache_hit_tokens` — for a session that has not been rebuilt.
-# reset_cached_input() drops the entry whenever a rollover rewrites history,
-# because then the previous prompt is no longer a prefix of the current one.
-_CACHED_INPUT_HISTORY = OrderedDict()
-_CACHED_INPUT_HISTORY_MAX = 512
-
-
-def peek_cached_input(sig):
-    """Prompt tokens this conversation can reuse from its previous turn."""
-    return _CACHED_INPUT_HISTORY.get(sig, 0)
-
-
-def record_cached_input(sig, input_tokens):
-    """Remember this turn's input size as the next turn's cached prefix."""
-    if not sig:
-        return
-    _CACHED_INPUT_HISTORY.pop(sig, None)
-    _CACHED_INPUT_HISTORY[sig] = max(0, input_tokens)
-    while len(_CACHED_INPUT_HISTORY) > _CACHED_INPUT_HISTORY_MAX:
-        _CACHED_INPUT_HISTORY.popitem(last=False)
-
-
-def reset_cached_input(sig):
-    """Forget the remembered prefix after a rollover rebuilds the history."""
-    _CACHED_INPUT_HISTORY.pop(sig, None)
-
-
-# 工具调用的包装标签名。格式漂移时，DSML 提取分支无法匹配工具名，会把包装
-# 标签名或其片段（如 "_call"、"|calls"）当作工具名外传，上层据此抛出
-# unknown tool。此集合用于在工具名的唯一出口处拦截并丢弃。
-_WRAPPER_TAG_NAMES = frozenset(
-    {
-        "calls",
-        "call",
-        "tool",
-        "toolcall",
-        "toolcalls",
-        "functioncall",
-        "invoke",
-        "parameter",
-        "param",
-    }
-)
-
-
-# 双重嵌套的 arguments 解包时认可的包装键。模型偶尔把整个参数对象当成单个
-# arguments 参数发出，解码后就会多出一层。
-_NESTED_ARG_KEYS = frozenset({"arguments", "parameters", "input", "args", "params"})
-
-
-def _unwrap_nested_arguments(args):
-    """Collapse the double-wrapped ``{"arguments": {...}}`` shape.
-
-    DeepSeek V4 occasionally emits the whole argument object as a single
-    ``arguments`` parameter (or as the value of a JSON ``arguments`` field),
-    so the decoded payload carries one extra level. Unwrap only when the
-    wrapper is the sole key and its value is itself an object, which leaves
-    genuine single-key tools untouched.
-    """
-    for _ in range(2):
-        if isinstance(args, str):
-            try:
-                decoded = json.loads(args)
-            except Exception:
-                return args
-            if not isinstance(decoded, (dict, list)):
-                return args
-            args = decoded
-        if not isinstance(args, dict) or len(args) != 1:
-            return args
-        key = next(iter(args))
-        if key.lower() not in _NESTED_ARG_KEYS:
-            return args
-        inner = args[key]
-        # 内层也可能是序列化后的 JSON 字符串（XML parameter 的 string="true"
-        # 语义会把整个对象当字符串发出），必须先解码才能继续判断层级。
-        if isinstance(inner, str):
-            try:
-                decoded_inner = json.loads(inner)
-            except Exception:
-                return args
-            if not isinstance(decoded_inner, (dict, list)):
-                return args
-            inner = decoded_inner
-        if not isinstance(inner, (dict, list)):
-            return args
-        args = inner
-    return args
 
 
 def normalize_tool_call(tool_data_or_name, args_if_name=None):
@@ -2493,19 +1984,6 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
     if not name or not isinstance(name, str):
         return None
     args = _clean_tool_arg(args)
-
-    # 黑名单拦截：包装标签名不是真实工具调用，直接丢弃，由调用方继续查找
-    # invoke 的真实 name= 属性。判定前先剥离分隔符，与 _WRAPPER_TAG_NAMES
-    # 的存储形态保持一致，避免分隔符被剔除后漏判。
-    probe = re.sub(r"[<>|｜_\-\s]", "", name).lower()
-    if probe.startswith("dsml"):
-        probe = probe[4:]
-    if not probe or probe in _WRAPPER_TAG_NAMES:
-        return None
-
-    # 官方补丁（vllm-ascend 2026-04-26）修复的正是 function call 双重嵌套
-    # arguments 字段导致的解析失败；这里在唯一的出口处统一拆层。
-    args = _unwrap_nested_arguments(args)
     if isinstance(args, (dict, list)):
         args_str = json.dumps(args)
     elif isinstance(args, str):
@@ -2552,80 +2030,21 @@ def _code_fence_spans(text):
     ]
 
 
-# 开启思考时该请求的推理强度（"high"、"max" 等），由各对话端点写入；
-# build_prompt 据此追加「更充分推理」的指令。
-request_effort = contextvars.ContextVar("request_effort", default=None)
-
-# ── 提示词增强总开关（移植自 1515asd/rh-deeperseeker v89.6）──────────────
-_effort_enhance_cache = None
-
-
-def get_effort_enhance():
-    """提示词增强是否开启。settings 表持久化，进程内缓存；缺省开启。
-
-    关闭后 plugin_helper._with_effort 不再附加强化指令，行为与开关加入
-    前逐字节一致。旧数据卷尚未建立 settings 表时按缺省开启处理。
-    """
-    global _effort_enhance_cache
-    if _effort_enhance_cache is None:
-        try:
-            conn = get_db()
-            row = conn.execute(
-                "SELECT value FROM settings WHERE key = 'effort_enhance'"
-            ).fetchone()
-            conn.close()
-            _effort_enhance_cache = (row[0] != "off") if row else True
-        except sqlite3.Error:
-            _effort_enhance_cache = True
-    return _effort_enhance_cache
-
-
-def set_effort_enhance(enabled):
-    """写入开关并立即刷新内存缓存，下一个请求即时生效。"""
-    global _effort_enhance_cache
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO settings (key, value) VALUES ('effort_enhance', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        ("on" if enabled else "off",),
-    )
-    conn.commit()
-    conn.close()
-    _effort_enhance_cache = bool(enabled)
-    return _effort_enhance_cache
-
-
-def effort_level(body):
-    """从各协议方言中取出客户端的 effort 字符串。"""
-    cands = [body.get("reasoning_effort"), body.get("effort")]
-    for key in ("reasoning", "output_config", "thinking"):
-        v = body.get(key)
-        if isinstance(v, dict):
-            cands += [v.get("effort"), v.get("reasoning_effort"), v.get("level")]
-        elif key == "thinking" and isinstance(v, str):
-            cands.append(v)
-    for c in cands:
-        if isinstance(c, str) and c.strip():
-            return c.strip().lower()
-    return None
-
-
-# 参数开标签存在多种畸形写法：闭标签误当开标签（``</…parameter name=…>``）、
-# 缺 ``name`` 只留 ``parameter="x"``、以及完全省略 ``parameter name=`` 而直接写成
-# ``<…command" string="true">``。参数值的结束位置同样不确定：可能是规范闭标签、
-# 下一个参数开标签，或任意 DSML 标记（裸 ``</…>``、被截断的 ``</…``、
-# ``</… calls>``、缺 ``<`` 的 ``｜｜DSML｜｜parameter>``）。标记本身不属于参数值，
-# 故一律作为值终止符处理。
+# Openers may come as "</｜｜DSML｜｜ parameter name=...>" (the model mixes up
+# open/close), as 'parameter="x"' without name, or without "parameter name=" at all
+# ('<｜｜DSML｜｜command" string=...>', '<｜｜DSML｜｜ old_string="true">') ("<｜｜DSML｜｜command" string=...>),
+# and a value ends at the proper closer, the next parameter, or ANY DSML marker
+# (bare "</｜｜DSML｜｜>", truncated "</｜｜DSML｜｜ ", "</｜｜DSML｜｜ calls>",
+# "<"-less "｜｜DSML｜｜parameter>"): markers never belong in a value.
 _DSML_PARAM_RE = re.compile(
     r"(?:</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)(?:\s+name\s*=|\s*=)\s*[\x27\x22]([^\x27\x22]+)[\x27\x22]"
-    r"|</?[｜\|]{1,2}DSML[｜\|]{1,2}\s*([A-Za-z_][\w\-]*)[\x27\x22])([^>]*)>"
+    r"|</?[｜\|]{1,2}DSML[｜\|]{1,2}\s*(?!(?:parameter|invoke|function_calls?|tool_calls?|calls)\b)([A-Za-z_][\w\-]*)(?=[\x27\x22]|\s*=\s*[\x27\x22](?:true|false)[\x27\x22]))([^>]*)>"
     r"(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)>|(?=</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=)|(?=(?:</?)?[｜\|]{1,2}DSML|</?[｜\|]{0,2}DSML[｜\|])|$)",
     re.DOTALL | re.IGNORECASE,
 )
 
 
 def _dsml_params(body):
-    """按畸形容忍规则解析一个 invoke 块内的参数表。"""
     args = {}
     for pm in _DSML_PARAM_RE.finditer(body):
         p_name = (pm.group(1) or pm.group(2)).strip()
@@ -2636,8 +2055,9 @@ def _dsml_params(body):
             p_val,
             flags=re.IGNORECASE,
         ).strip()
-        # string="true" 表示字面字符串，不得把 "42"/"true" 解析成 JSON 标量。
-        if re.search(r"string=[\x27\x22]true", pm.group(3), re.IGNORECASE):
+        # string="true" marks a literal string; don't turn "42"/"true" into JSON.
+        # ('<｜｜DSML｜｜old_string="true">' puts the type right after the name.)
+        if re.search(r"(?:string\s*=|^\s*=)\s*[\x27\x22]true", pm.group(3), re.IGNORECASE):
             args[p_name] = p_val
             continue
         try:
@@ -2647,13 +2067,46 @@ def _dsml_params(body):
     return args
 
 
-# 本次请求的工具清单，由 handle_chat 写入，供 parse_tools 在模型漏写工具名时
-# 反推调用（如只有 function_calls 包裹块而没有 invoke 的情形）。
+# The request's tool list, set by handle_chat, so parse_tools can recover a call
+# whose tool name the model dropped (a function_calls block without an invoke).
 request_tools = contextvars.ContextVar("request_tools", default=None)
+
+# The id DeepSeek gave the reply of the last send_message in this request (from
+# the first SSE event). Ids are chat-global, so a reply sent from a fork point is
+# not at parent + 2.
+reply_id = contextvars.ContextVar("reply_id", default=None)
+
+
+def _extract_upstream_message_id(data):
+    if not isinstance(data, dict):
+        return None
+    for k in ("response_message_id", "message_id"):
+        v = data.get(k)
+        if isinstance(v, int) or (isinstance(v, str) and v):
+            return v
+    for parent in ("response", "v"):
+        nested = data.get(parent)
+        if isinstance(nested, dict):
+            for k in ("response_message_id", "message_id"):
+                v = nested.get(k)
+                if isinstance(v, int) or (isinstance(v, str) and v):
+                    return v
+            v_nested = nested.get("response")
+            if isinstance(v_nested, dict):
+                for k in ("response_message_id", "message_id"):
+                    v = v_nested.get(k)
+                    if isinstance(v, int) or (isinstance(v, str) and v):
+                        return v
+    if data.get("o") == "BATCH" and isinstance(data.get("v"), list):
+        for op in data["v"]:
+            if isinstance(op, dict):
+                mid = _extract_upstream_message_id(op)
+                if mid is not None:
+                    return mid
+    return None
 
 
 def _tool_schemas():
-    """把本次请求的工具定义整理成 {工具名: JSON Schema}。"""
     schemas = {}
     for t in request_tools.get() or []:
         if not isinstance(t, dict):
@@ -2667,76 +2120,202 @@ def _tool_schemas():
 
 
 def _infer_tool_name(args, schemas):
-    """返回参数名恰好匹配的唯一工具；存在并列候选时返回 None。"""
-    fits = []
-    for name, params in schemas.items():
-        props = set(params.get("properties") or {})
-        required = set(params.get("required") or [])
-        if set(args) <= props and required <= set(args):
-            fits.append((len(props - set(args)), name))
-    fits.sort()
-    if fits and (len(fits) == 1 or fits[0][0] < fits[1][0]):
-        return fits[0][1]
+    """The one tool whose schema accepts exactly these argument names."""
+    # First require every required field; if the model also dropped one of those,
+    # still name the one tool that accepts these arguments, so the client reports
+    # the missing field instead of an unknown tool.
+    for need_required in (True, False):
+        fits = []
+        for name, params in schemas.items():
+            props = set(params.get("properties") or {})
+            required = set(params.get("required") or [])
+            if set(args) <= props and (not need_required or required <= set(args)):
+                fits.append((len(props - set(args)), name))
+        fits.sort()
+        if fits and (len(fits) == 1 or fits[0][0] < fits[1][0]):
+            return fits[0][1]
     return None
 
 
+def _repair_truncated_json(s: str) -> str:
+    s = s.strip()
+    if not s:
+        return s
+    stack = []
+    in_string = False
+    escape = False
+    for c in s:
+        if escape:
+            escape = False
+            continue
+        if c == "\\":
+            if in_string:
+                escape = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if not in_string:
+            if c in ("{", "["):
+                stack.append("}" if c == "{" else "]")
+            elif c in ("}", "]") and stack and stack[-1] == c:
+                stack.pop()
+    if in_string:
+        s += '"'
+    s = s.rstrip()
+    if s.endswith(":"):
+        s += ' ""'
+    while s.endswith(","):
+        s = s[:-1].rstrip()
+    if stack:
+        s += "".join(reversed(stack))
+    return s
+
+
+def _match_or_predict_tool_name(raw_name, args, schemas):
+    if not schemas:
+        return raw_name
+    if raw_name in schemas:
+        return raw_name
+    raw_lower = (raw_name or "").lower().strip()
+    if raw_lower:
+        for s in schemas:
+            if s.lower() == raw_lower:
+                return s
+        clean_name = (
+            raw_name.split(".")[-1]
+            .split(":")[-1]
+            .rstrip("()")
+            .removesuffix("_tool")
+            .removesuffix("-tool")
+            .strip()
+        )
+        if clean_name:
+            clean_lower = clean_name.lower()
+            for s in schemas:
+                if s.lower() == clean_lower:
+                    return s
+        for s in schemas:
+            s_low = s.lower()
+            if s_low in raw_lower or (len(raw_lower) >= 3 and raw_lower in s_low):
+                return s
+    if isinstance(args, dict):
+        inferred = _infer_tool_name(args, schemas)
+        if inferred:
+            return inferred
+    if not raw_name and len(schemas) == 1 and isinstance(args, dict):
+        s_name = next(iter(schemas.keys()))
+        s_props = set(schemas[s_name].get("properties") or {})
+        if set(args.keys()) & s_props:
+            return s_name
+    return raw_name
+
+
 def _repair_tool_names(tools):
-    """对不在本次工具清单中的调用名，按参数集合反推真实工具名。"""
     schemas = _tool_schemas()
     if not schemas:
         return tools
     for t in tools:
         fn = t["function"]
-        if fn["name"] in schemas:
-            continue
-        try:
+        args = {}
+        with contextlib.suppress(Exception):
             args = json.loads(fn["arguments"])
-        except Exception:
-            continue
-        if isinstance(args, dict):
-            fn["name"] = _infer_tool_name(args, schemas) or fn["name"]
+        fn["name"] = _match_or_predict_tool_name(fn.get("name"), args, schemas)
     return tools
 
 
-# 逗号形态的入口：``<…invoke name="Edit", "arguments": {…}``。模型把
-# JSON 当成标签头的续写，合法 XML 不会出现，需要单独识别（见 parse_tools）。
-_COMMA_FORM_ENTRY_RE = re.compile(
-    r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*"
-    r"(?:invoke|tool_call|function_call)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22]\s*,"
-    r"\s*[\x27\x22](?:arguments|parameters|input|args|params)[\x27\x22]\s*:\s*",
-    re.IGNORECASE,
-)
 
-# 裸 parameter 标签：模型有时不写外层 invoke，直接把
-# ``<…parameter name="old_string" string="true">…`` 连同 JSON 残片写出来。
-# 这种片段没有工具名，构不成调用；留着只会把参数值漏进正文。
-_BARE_PARAM_ENTRY_RE = re.compile(
-    r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*"
-    r"(?:parameter|param)\b[^>]*>",
-    re.IGNORECASE,
-)
 
-# 裸 parameter 块的结束位置：自己的闭标签，或一个工具族闭标签（模型常常
-# 只写开标签就接 JSON 残片，后面跟的是 </tool> 之类）。
-_BARE_PARAM_END_RE = re.compile(
-    r"</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*"
-    r"(?:param(?:eter)?|tool[\s_]*calls?|tool|calls|invoke|function_call)"
-    r"\s*[｜\|]{0,2}\s*>",
-    re.IGNORECASE,
-)
+# The request's reasoning effort ("high", "max", ...) when thinking is on, set by
+# the chat endpoints; build_prompt turns it into a think-harder instruction.
+request_effort = contextvars.ContextVar("request_effort", default=None)
+request_response_format = contextvars.ContextVar("request_response_format", default=None)
 
-# 裸 parameter 块之后常跟着 JSON 残片（``, "new_string": "..."}}``），
-# 以及一串闭标签。两者都要吃掉，否则参数值会当作正文漏给客户端。
-_BARE_PARAM_TAIL_RE = re.compile(
-    r"(?:\s*,\s*[\x27\x22][A-Za-z0-9_\-]+[\x27\x22]\s*:\s*(?:\{[^{}]*\}|\[[^\[\]]*\]|\"[^\"]*\"|[^,}\]]+))+\s*\}*"
-)
 
-# JSON 负载之后可能紧跟一串闭合标签（</…> 连写），一并吞掉避免残片外泄。
-_CLOSER_RUN_RE = re.compile(
-    r"(?:\s*</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*"
-    r"(?:tool[\s_]*calls?|tool|calls|invoke|function_call|param(?:eter)?)\s*[｜\|]{0,2}\s*>)+",
-    re.IGNORECASE,
-)
+def is_json_object_format(fmt):
+    if not fmt:
+        return False
+    if isinstance(fmt, str):
+        return fmt.strip().lower() in ("json_object", "json")
+    if isinstance(fmt, dict):
+        t = str(fmt.get("type", "")).strip().lower()
+        return t in ("json_object", "json_schema")
+    return False
+
+
+def json_mode_coerce(text: str) -> str:
+    if not text:
+        return "{}"
+    trimmed = text.strip()
+    if trimmed.startswith("```"):
+        lines = trimmed.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        trimmed = "\n".join(lines).strip()
+
+    try:
+        parsed = json.loads(trimmed)
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(parsed, ensure_ascii=False)
+    except Exception:
+        pass
+
+    first_brace = trimmed.find("{")
+    last_brace = trimmed.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        candidate = trimmed[first_brace : last_brace + 1]
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, (dict, list)):
+                return json.dumps(parsed, ensure_ascii=False)
+        except Exception:
+            pass
+        repaired = _repair_truncated_json(candidate)
+        try:
+            parsed = json.loads(repaired)
+            if isinstance(parsed, (dict, list)):
+                return json.dumps(parsed, ensure_ascii=False)
+        except Exception:
+            pass
+
+    repaired = _repair_truncated_json(trimmed)
+    try:
+        parsed = json.loads(repaired)
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(parsed, ensure_ascii=False)
+    except Exception:
+        pass
+
+    return json.dumps({"response": text.strip()}, ensure_ascii=False)
+
+
+def effort_level(body):
+    """The client's effort string, wherever the dialect puts it."""
+    cands = [body.get("reasoning_effort"), body.get("effort")]
+    for key in ("reasoning", "output_config", "thinking"):
+        v = body.get(key)
+        if isinstance(v, dict):
+            cands += [v.get("effort"), v.get("reasoning_effort"), v.get("level")]
+        elif key == "thinking" and isinstance(v, str):
+            cands.append(v)
+    for c in cands:
+        if isinstance(c, str) and c.strip():
+            return c.strip().lower()
+    return None
+
+
+# Structural DSML tag names: a lone wrapper tag is never a call to a tool of
+# that name (unless the client really defines one).
+_DSML_WRAPPER_NAMES = {
+    "function_calls", "function_call", "tool_calls", "tool_call",
+    "calls", "invoke", "parameter", "param",
+}
+
+
+def _is_wrapper_name(name, args):
+    return not args and name.lower() in _DSML_WRAPPER_NAMES and name not in _tool_schemas()
 
 
 def parse_tools(text):
@@ -2746,52 +2325,6 @@ def parse_tools(text):
 
     def fenced(pos):
         return any(s <= pos < e for s, e in fence_spans)
-
-    # 逗号形态：模型偶尔把 invoke 的属性写成
-    # ``<…invoke name="Edit", "arguments": {...}``，JSON 直接悬在标签头里。
-    # 合法 XML 不会这样写，现成的 [^>]*> 会把整段 JSON 吞进标签头，导致
-    # 产出一个没有参数的调用（客户端随后报 file_path 缺失）。这里先把这种
-    # 形态整段吃出来并从文本中移除，避免后续分支再把它当空调用处理。
-    comma_spans = []
-    decoder = json.JSONDecoder()
-    for m in _COMMA_FORM_ENTRY_RE.finditer(text):
-        if fenced(m.start()):
-            continue
-        brace = m.end()
-        if brace >= len(text) or text[brace] != "{":
-            continue
-        try:
-            data, consumed = decoder.raw_decode(text[brace:])
-        except Exception:
-            continue
-        if not isinstance(data, dict):
-            continue
-        if isinstance(data.get("arguments"), (dict, list)):
-            args = data["arguments"]
-        elif isinstance(data.get("parameters"), (dict, list)):
-            args = data["parameters"]
-        else:
-            args = {
-                k: v for k, v in data.items() if k not in ("name", "tool", "function")
-            }
-        norm = normalize_tool_call(m.group(1).strip(), args)
-        if not norm:
-            continue
-        tools.append(norm)
-        end = brace + consumed
-        tail = _CLOSER_RUN_RE.match(text, end)
-        if tail:
-            end = tail.end()
-        comma_spans.append((m.start(), end))
-    if comma_spans:
-        pieces, cursor = [], 0
-        for start, end in comma_spans:
-            pieces.append(text[cursor:start])
-            cursor = end
-        pieces.append(text[cursor:])
-        text = "".join(pieces)
-        clean_text = text
-        fence_spans = _code_fence_spans(text)
 
     param_names = {
         "command",
@@ -2807,9 +2340,10 @@ def parse_tools(text):
         "url",
         "input",
     }
-    # 调用起点有两类：invoke 开标签（含模型把开闭标签写反的
-    # ``</…invoke name=…>``），以及完全没有 invoke 的 DSML function_calls
-    # 包裹块——后者的工具名由参数集合反推。
+    # Call starts: invoke openers (also "</…invoke name=…>", the model mixes up
+    # open/close), DSML function_calls blocks with no invoke at all, and a bare
+    # "<｜｜DSML｜｜invoke>" without a name; their tool name is inferred from the
+    # parameters.
     starts = [
         (m, m.group(1).strip())
         for m in re.finditer(
@@ -2820,7 +2354,7 @@ def parse_tools(text):
     ] + [
         (m, None)
         for m in re.finditer(
-            r"<[｜\|]{0,2}DSML[｜\|]{0,2}\s*(?:function_calls?|tool_calls?|calls)\s*>",
+            r"<[｜\|]{0,2}DSML[｜\|]{0,2}\s*(?:function_calls?|tool_calls?|calls|invoke)\s*>",
             text,
             re.IGNORECASE,
         )
@@ -2833,9 +2367,8 @@ def parse_tools(text):
         schemas = _tool_schemas()
         for i, (tm, candidate_name) in enumerate(real_tool_matches):
             start_idx = tm.end()
-            # ``invoke name="i" string="true">…``：模型把 invoke 与首个参数连成
-            # 一体。此时该名字是参数名而非工具名，需从标签头开始读作参数，
-            # 工具名改由参数集合反推。
+            # 'invoke name="i" string="true">…': the model fused the invoke with its
+            # first parameter; read it as a parameter and infer the tool name.
             if (
                 candidate_name
                 and "string=" in tm.group(0)
@@ -2850,6 +2383,7 @@ def parse_tools(text):
                 else len(text)
             )
             body = text[start_idx:end_idx]
+            args = {}
             args = _dsml_params(body)
             tag_param_matches = re.finditer(
                 r"<([A-Za-z0-9_\-]+)>(.*?)(?:</\1>|$)",
@@ -2871,21 +2405,22 @@ def parse_tools(text):
                     except Exception:
                         args[t_name] = t_val
             if candidate_name or args:
-                # 只有包裹块、没有 invoke 的调用：工具名由参数集合反推，
-                # 此处先用占位名占位，_repair_tool_names 再按工具清单修正。
+                # A wrapper with no parameters just precedes its invoke; skip it.
                 norm = normalize_tool_call(candidate_name or "function_calls", args)
                 if norm:
                     tools.append(norm)
 
     if tools:
         clean_text = re.sub(
-            r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|calls)[^>]*>.*?(?:</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|calls|tool)>|$)",
+            r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls)>|$)",
             "",
             clean_text,
             flags=re.DOTALL | re.IGNORECASE,
         ).strip()
         clean_text = re.sub(
-            r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:invoke|function_call)[^>]*>.*?(?:</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:invoke|function_call)>|$)",
+            # Also "</…invoke name=…>": the model mixes up open/close for an opener.
+            r"(?:<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)[^>]*>|</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*invoke\s+name\s*=[^>]*>)"
+            r".*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)>|$)",
             "",
             clean_text,
             flags=re.DOTALL | re.IGNORECASE,
@@ -2893,11 +2428,11 @@ def parse_tools(text):
 
     if not tools and "DSML" in text:
         dsml_block_pattern = re.compile(
-            r"<[｜\|]{0,2}DSML[｜\|]{0,2}\s*([A-Za-z0-9_]+)>(.*?)(?:</[｜\|]{0,2}DSML[｜\|]{0,2}\s*\1>|$)",
+            r"<[｜\|]{2}DSML[｜\|]{2}([A-Za-z0-9_]+)>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}\1>|$)",
             re.DOTALL | re.IGNORECASE,
         )
         param_pattern_b = re.compile(
-            r"<[｜\|]{0,2}DSML[｜\|]{0,2}\s*B([A-Za-z0-9_]+)[^>]*>(.*?)(?:</[｜\|]{0,2}DSML[｜\|]{0,2}\s*B.*?>|$)",
+            r"<[｜\|]{2}DSML[｜\|]{2}B([A-Za-z0-9_]+)[^>]*>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}B.*?>|$)",
             re.DOTALL | re.IGNORECASE,
         )
         for m in dsml_block_pattern.finditer(text):
@@ -2913,12 +2448,12 @@ def parse_tools(text):
                     args[p_name] = json.loads(p_val)
                 except Exception:
                     args[p_name] = p_val
-            norm = normalize_tool_call(tool_name, args)
+            norm = None if _is_wrapper_name(tool_name, args) else normalize_tool_call(tool_name, args)
             if norm:
                 tools.append(norm)
         if not tools:
             tool_match = re.search(
-                r"[｜\|]{0,2}DSML[｜\|]{0,2}\s*(Bash|Read|Write|Edit|Agent|TaskList|TaskCreate|WebSearch|[A-Za-z0-9_]+)",
+                r"[｜\|]{2}DSML[｜\|]{2}(Bash|Read|Write|Edit|Agent|TaskList|TaskCreate|WebSearch|[A-Za-z0-9_]+)",
                 text,
                 re.IGNORECASE,
             )
@@ -2943,33 +2478,26 @@ def parse_tools(text):
                 )
                 if cmd_match:
                     clean_cmd = re.sub(
-                        r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*[^>]*>",
-                        "",
-                        cmd_match.group(1),
+                        r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", cmd_match.group(1)
                     ).strip("\x22\x27() ")
                     args["command"] = clean_cmd
                 if desc_match:
                     clean_desc = re.sub(
-                        r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*[^>]*>",
-                        "",
-                        desc_match.group(1),
+                        r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", desc_match.group(1)
                     ).strip("\x22\x27() ")
                     args["description"] = clean_desc
-                norm = normalize_tool_call(tool_name, args)
+                norm = None if _is_wrapper_name(tool_name, args) else normalize_tool_call(tool_name, args)
                 if norm:
                     tools.append(norm)
         if tools:
             clean_text = re.sub(
-                r"<[｜\|]{0,2}DSML[｜\|]{0,2}\s*[^>]*>.*?(?:</[｜\|]{0,2}DSML[｜\|]{0,2}\s*[^>]*>|$)",
+                r"<[｜\|]{2}DSML[｜\|]{2}[^>]*>.*?(?:</[｜\|]{2}DSML[｜\|]{2}[^>]*>|$)",
                 "",
                 clean_text,
                 flags=re.DOTALL | re.IGNORECASE,
             ).strip()
             clean_text = re.sub(
-                r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*[^>]*>",
-                "",
-                clean_text,
-                flags=re.IGNORECASE,
+                r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", clean_text, flags=re.IGNORECASE
             ).strip()
 
     if not tools:
@@ -2998,36 +2526,25 @@ def parse_tools(text):
             ).strip()
 
     if not tools:
-        # 标签名内部的空格/下划线可漂移："tool_call" / "tool call" /
-        # "tool calls" 都可能出现，统一用 tool[\s_]*calls? 覆盖。
         tag_regex = re.compile(
-            r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|function_call)(?:\s+(?:name|tool|function)=[\x27\x22]([^\x27\x22]+)[\x27\x22])?\s*>",
+            r"<(?:tool_call|function_call)(?:\s+(?:name|tool|function)=[\x27\x22]([^\x27\x22]+)[\x27\x22])?\s*>",
             re.IGNORECASE,
         )
         decoder = json.JSONDecoder()
         matches = [m for m in tag_regex.finditer(text) if not fenced(m.start())]
         if matches:
-            # 外层包裹标签会重复指向同一段 JSON："<tool calls> <tool call>{...}"
-            # 中两个开标签的 after_tag 都以同一个 '{' 开头，不去重会把同一次调用
-            # 解析两遍。consumed_upto 记录已消费到的绝对偏移，命中过的 JSON 不再
-            # 由后续标签重复解析。
-            consumed_upto = -1
             for m in matches:
                 tag_name = m.group(1)
                 after_tag = text[m.end() :]
                 brace_pos = after_tag.find("{")
-                abs_brace = m.end() + brace_pos if brace_pos != -1 else -1
-                if brace_pos == -1 or abs_brace < consumed_upto:
-                    continue
                 if brace_pos != -1:
                     json_substr = after_tag[brace_pos:]
                     data = None
-                    payload_len = 0
                     with contextlib.suppress(Exception):
-                        data, payload_len = decoder.raw_decode(json_substr)
+                        data, _ = decoder.raw_decode(json_substr)
                     if not data:
                         cleaned_json = re.sub(
-                            r"</?(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool_call|function_call|tool_calls|invoke)[^>]*>.*",
+                            r"</?(?:tool_call|function_call|tool_calls|invoke)[^>]*>.*",
                             "",
                             json_substr,
                             flags=re.DOTALL,
@@ -3080,14 +2597,11 @@ def parse_tools(text):
                             norm = normalize_tool_call(name, args)
                             if norm:
                                 tools.append(norm)
-                                # 外层包裹标签（"<tool calls> <tool call>{...}"）
-                                # 与内层标签指向同一个 '{'，只消费一次。
-                                consumed_upto = abs_brace + max(payload_len, 1)
             clean_text = re.sub(
-                r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|function_call|tool)[^>]*>.*?(?:</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|function_call|tool)>|$)",
+                r"<(?:tool_call|function_call)[^>]*>.*?(?:</(?:tool_call|function_call)>|$)",
                 "",
                 text,
-                flags=re.DOTALL | re.IGNORECASE,
+                flags=re.DOTALL,
             ).strip()
 
     if not tools:
@@ -3151,28 +2665,103 @@ def parse_tools(text):
                 pass
         if tools:
             clean_text = re.sub(json_pattern, "", clean_text, flags=re.DOTALL).strip()
+
+    if not tools:
+        schemas = _tool_schemas()
+        if schemas:
+            decoder = json.JSONDecoder()
+            spans_to_remove = []
+            pos = 0
+            while pos < len(clean_text):
+                if fenced(pos):
+                    pos += 1
+                    continue
+                ch = clean_text[pos]
+                if ch in ("{", "["):
+                    sub = clean_text[pos:]
+                    parsed_obj = None
+                    end_idx = None
+                    try:
+                        parsed_obj, consumed = decoder.raw_decode(sub)
+                        end_idx = pos + consumed
+                    except Exception:
+                        repaired = _repair_truncated_json(sub)
+                        try:
+                            parsed_obj = json.loads(repaired)
+                            end_idx = len(clean_text)
+                        except Exception:
+                            parsed_obj = None
+                    if parsed_obj is not None:
+                        items = (
+                            parsed_obj
+                            if isinstance(parsed_obj, list)
+                            else [parsed_obj]
+                        )
+                        if isinstance(parsed_obj, dict) and isinstance(
+                            parsed_obj.get("tool_calls") or parsed_obj.get("calls"),
+                            list,
+                        ):
+                            items = parsed_obj.get("tool_calls") or parsed_obj.get(
+                                "calls"
+                            )
+                        recognized = []
+                        for it in items:
+                            if not isinstance(it, dict):
+                                continue
+                            c_name = (
+                                it.get("name")
+                                or it.get("tool")
+                                or it.get("tool_name")
+                                or it.get("function")
+                                or it.get("action")
+                            )
+                            c_args = (
+                                it.get("arguments")
+                                or it.get("parameters")
+                                or it.get("input")
+                                or it.get("args")
+                                or it.get("params")
+                            )
+                            if c_args is None and c_name:
+                                c_args = {
+                                    k: v
+                                    for k, v in it.items()
+                                    if k
+                                    not in (
+                                        "name",
+                                        "tool",
+                                        "tool_name",
+                                        "function",
+                                        "action",
+                                    )
+                                }
+                            if not c_name:
+                                c_args = it
+                                c_name = _match_or_predict_tool_name(
+                                    None, c_args, schemas
+                                )
+                            else:
+                                c_name = _match_or_predict_tool_name(
+                                    c_name, c_args, schemas
+                                )
+                            if c_name and (c_name in schemas or len(schemas) == 1):
+                                norm = normalize_tool_call(c_name, c_args or {})
+                                if norm:
+                                    recognized.append(norm)
+                        if recognized:
+                            tools.extend(recognized)
+                            spans_to_remove.append((pos, end_idx))
+                            pos = end_idx
+                            continue
+                pos += 1
+            if spans_to_remove:
+                spans_to_remove.sort(reverse=True, key=lambda s: s[0])
+                for start_s, end_s in spans_to_remove:
+                    clean_text = clean_text[:start_s] + clean_text[end_s:]
+                clean_text = clean_text.strip()
     # Keep companion text: the tool-call blocks themselves were already removed
     # from clean_text above; only leftover bare tags are stripped here.
-    clean_text = re.sub(
-        # 第二个分支覆盖「只有 DSML 标记、没有标签名」的纯装饰标签，例如
-        # ``</ | | DSML | | >``；首个分支要求带标签名，匹配不到时模型收尾
-        # 成串吐出的装饰标签会原样留在正文里（截图即此形态）。
-        # 收尾的 ``>`` 必须可选：模型常常整串都不写 ``>``（形如
-        # ``</ | | DSML | | `` 反复出现）。缺 ``>`` 时用 lookahead 限定只
-        # 吃到下一个 ``<`` 或文本末尾为止，避免把后续正文一并吞掉。
-        r"</?(?:\s*[｜\|]){0,2}\s*(?:"
-        # 标签名后必须是不属于标识符的字符：否则正文里的 ``</tool_x`` 会被
-        # 当成 ``tool`` 标签并吞掉 ``_x``（缺 ``>`` 的分支尤其容易误伤）。
-        r"(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|invoke|function_call|parameter)(?![A-Za-z0-9_])[^<>]*"
-        r"\s*[｜\|]{0,2}\s*(?:>|(?=<|\Z))"
-        # 无标签名的纯装饰分支：``DSML`` 标记本身已是足够强的信号，``>`` 直接
-        # 可选，否则最后一个装饰串后面跟正文时仍会残留。
-        r"|DSML\s*(?:\s*[｜\|]){0,2}\s*>?"
-        r")",
-        "",
-        clean_text,
-        flags=re.IGNORECASE,
-    ).strip()
+    clean_text = _strip_wrapper_tags(clean_text).strip()
     tools = _repair_tool_names(tools)
     return tools, clean_text
 
@@ -3181,12 +2770,8 @@ def parse_tools(text):
 # the |/｜-decorated variants that parse_tools accepts. Used by
 # StreamToolParser so a mismatched closer closes the open block instead of
 # hanging until flush(). [FIX 3]
-# 标签名内部的空格/下划线属于可漂移部分：模型会把 "tool_call" 写成
-# "tool call"，甚至只把开标签写成 "<tool calls>"，闭标签退化为 "</tool>"。
-# 因此族内统一用 tool[\s_]*calls? 覆盖 tool_call / toolcalls / tool call(s)，
-# 并额外接受裸的 tool 作为闭标签。
 _TOOL_END_TAG_RE = re.compile(
-    r"</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|invoke|function_call)\s*>",
+    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_calls?)\s*>",
     re.IGNORECASE,
 )
 
@@ -3195,211 +2780,122 @@ _TOOL_END_TAG_RE = re.compile(
 # "<｜｜DSML｜｜ invoke name=...>". Entry detection cannot rely on plain
 # substring start tags; this regex accepts bars, the DSML marker and the
 # space in any combination.
+# Also enters on "</…invoke name=…>": the model opens an invoke with a closing
+# tag. Only with name=, so a real "</invoke>" closer never opens a block.
 _STREAM_ENTRY_RE = re.compile(
-    r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(tool[\s_]*calls?|calls|function_calls?|invoke)\b[^>]*>",
+    r"<(?:/(?=[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*invoke\s+name\s*=))?"
+    r"[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_calls?|invoke)\b[^>]*>",
     re.IGNORECASE,
 )
 
 # Orphan closers trailing a block already closed by the per-tag or family
 # fallback (e.g. "</｜｜DSML｜｜ calls>" after the inner invoke was flushed).
-# NOTE: parameter/param MUST be listed here. The model can emit a bare
-# closing parameter tag with no matching opener (e.g. when an invoke block was
-# already consumed), and anything this regex misses is dumped to the client as
-# prose. parse_tools() already strips parameter via its own regex (line ~1132),
-# which is why the persisted history is clean and a page refresh looks correct
-# while the live stream is polluted.
-# Do NOT add parameter to _TOOL_END_TAG_RE: that pattern closes an OPEN tool
-# block, and a parameter closer sits inside the block, so matching it would cut
-# the block short before </invoke> arrives.
 _ORPHAN_CLOSER_RE = re.compile(
-    # 第二分支覆盖「只有 DSML 标记、没有标签名」的纯装饰闭标签，例如
-    # ``</ | | DSML | | >``。模型收尾时会成串吐这种标签；第一分支要求带
-    # 标签名，匹配不到时整串会作为正文漏给客户端。
-    # 收尾的 ``>`` 可选：模型收尾的装饰串常整段不带 ``>``（形如
-    # ``</ | | DSML | | `` 反复出现）。缺 ``>`` 时只吃到下一个 ``<`` 或
-    # 文本末尾，避免把后续正文一并吞掉。
-    r"</(?:\s*[｜\|]){0,2}\s*(?:"
-    # 标签名后必须是非标识符字符，避免正文 ``</tool_x`` 被误吞（同 parse_tools）。
-    r"(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|function_calls?|invoke|param(?:eter)?)(?![A-Za-z0-9_])[^<>]*"
-    r"\s*[｜\|]{0,2}\s*(?:>|(?=<|\Z))"
-    # 无标签名的纯装饰分支：``>`` 可选（同 parse_tools 处说明）。
-    r"|DSML\s*(?:\s*[｜\|]){0,2}\s*>?"
-    r")",
+    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|function_calls?|invoke)\s*[｜\|]{0,2}>",
+    re.IGNORECASE,
+)
+
+# [FIX 5] Bare DSML marker: a "<｜｜DSML｜｜>" / "</｜｜DSML｜｜>" whose tag-name
+# slot is empty (nothing between the DSML marker and ">"). Every other cleanup
+# regex in this module requires an actual tag name (tool_calls/calls/invoke/
+# function_call/parameter), so these bare markers used to slip through and get
+# streamed to the client as literal text. Note the tag-name slot is required to
+# be EMPTY: "<｜｜DSML｜｜ invoke ...>" does not match and is left for the entry
+# regex.
+# The ">" is optional: the model also leaks truncated markers like
+# "<｜｜DSML｜｜ </｜｜DSML｜｜ " as prose.
+_BARE_DSML_MARKER_RE = re.compile(
+    r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*(?![A-Za-z_])[>＞]?",
     re.IGNORECASE,
 )
 
 
-def _strip_stray_markers(text):
-    """清理正文中的残损标记、裸装饰串和孤立闭标签。"""
+# Full wrapper-tag family (open or close, with an optional tag name). Used on
+# the non-streaming path and on flush() to strip wrapper noise; unlike
+# _ORPHAN_CLOSER_RE it also removes stray OPEN tags.
+_WRAPPER_TAG_RE = re.compile(
+    r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|function_calls?|invoke|parameter)[^>]*>",
+    re.IGNORECASE,
+)
+
+
+# Catch-all for corrupted/degenerate DSML markers that the structured
+# regexes miss (e.g. a stray char between the bars: "<\uff5c\u89e6\uff5cDSML\uff5c\uff5c calls>"):
+# any <...> token containing a fullwidth pipe U+FF5C, which never appears in
+# legitimate prose. ASCII '|' is deliberately NOT matched (tables, code).
+_FULLWIDTH_PIPE_TAG_RE = re.compile(r"<[^<>]*\uff5c[^<>]*>")
+
+
+def _clean_tool_arg(value):
+    # Strip corrupted DSML markers that leaked INTO a tool-call argument
+    # value (e.g. a path parsed as "shell/core/Theme.qml</\uff5c\uff5cDSML\uff5c\uff5c >").
+    # Only touches strings that actually contain a fullwidth pipe U+FF5C, so
+    # normal arguments are untouched. Recurses into dicts/lists.
+    if isinstance(value, str):
+        if "\uff5c" in value:
+            value = _FULLWIDTH_PIPE_TAG_RE.sub("", value).strip()
+        return value
+    if isinstance(value, dict):
+        return {k: _clean_tool_arg(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clean_tool_arg(v) for v in value]
+    return value
+
+
+def _strip_stray_markers(text: str) -> str:
+    """Prose path: drop bare DSML markers + orphan closers only.
+
+    Open tags are left untouched here so literal prose mentioning e.g.
+    "" is not silently deleted mid-stream.
+    """
     if not text:
         return text
     text = _FULLWIDTH_PIPE_TAG_RE.sub("", text)
-    text = re.sub(
-        r"</?[｜\|]{0,2}DSML(?![｜\|\s]*[A-Za-z_])[｜\|]{0,2}\s*[>＞]?",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
+    text = _BARE_DSML_MARKER_RE.sub("", text)
     return _ORPHAN_CLOSER_RE.sub("", text)
 
 
+def _strip_wrapper_tags(text: str) -> str:
+    """Wrapper path: drop the whole tag family (open or close) + bare markers."""
+    if not text:
+        return text
+    text = _FULLWIDTH_PIPE_TAG_RE.sub("", text)
+    text = _BARE_DSML_MARKER_RE.sub("", text)
+    return _WRAPPER_TAG_RE.sub("", text)
+
+
+def _append_clean_text(results, text: str) -> None:
+    """Append cleaned prose, skipping empty deltas after marker stripping."""
+    cleaned = _strip_stray_markers(text)
+    if cleaned:
+        results.append({"text": cleaned})
+
+
+# Tag names _STREAM_ENTRY_RE can open on.
 _STREAM_ENTRY_TAGS = (
     "tool_calls",
     "tool_call",
-    "tool calls",
-    "tool call",
-    "function_call",
     "function_calls",
+    "function_call",
     "invoke",
     "calls",
 )
 
-# 孤立闭合标签的候选标签名，比入口标签多出 param/parameter。模型可能发出
-# 没有配对开标签的 parameter 闭合标签，分片途中这种片段必须被 hold 住，
-# 否则会被当成正文漏给客户端（见 _ORPHAN_CLOSER_RE 的说明）。
-_STREAM_CLOSER_TAGS = _STREAM_ENTRY_TAGS + ("param", "parameter", "tool")
-
-# 推理(reasoning)通道的标记入口。比工具入口多出 param/parameter：模型在思考
-# 中直接书写参数标签时不会有外层 invoke 包裹，漏掉这两个名字会让参数标签
-# 原样透传（app.py 的 reasoning 分支只做净化，不产出工具调用）。
-_REASONING_MARKUP_RE = re.compile(
-    r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*"
-    r"(tool[\s_]*calls?|tool|calls|function_calls?|invoke|param(?:eter)?)\b[^>]*>",
-    re.IGNORECASE,
-)
-
-
-# 未闭合块的缓冲上限。闭标签始终不到时按此上限丢弃并复位，避免异常流让
-# 缓冲无界增长；正常工具块远小于该值。
-_MAX_REASONING_BLOCK = 1 << 20
-
-
-def _markup_closer_re(tag_name):
-    """构造与 tag_name 配对的闭标签正则，容忍竖线与 DSML 装饰。"""
-    return re.compile(
-        r"</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*"
-        + re.escape(tag_name)
-        + r"\s*[｜\|]{0,2}>",
-        re.IGNORECASE,
-    )
-
-
-class ReasoningMarkupFilter:
-    """从推理(reasoning)分片中移除 DSML 工具标记。
-
-    parse_tools() 只作用于正文，因此推理通道会把模型在思考中写出的工具标记
-    原样透传给客户端，表现为思考内容里出现 ``｜｜DSML｜｜`` 一类的协议残留。
-    本过滤器复用正文同一套标签文法做净化，并处理两类分片边界：
-
-    ① 标签本身被切断——可能是标签前缀的尾部暂存到下一片再判定，判定依据
-       与 StreamToolParser 相同（_is_plausible_stream_entry_prefix 等）；
-    ② 开标签已到、闭标签未到——此时整段内容都属于待丢弃的块，必须一并丢弃。
-       若只删标签而保留内容，参数值会作为思考文本漏出，等于把泄漏换了个形态。
-
-    闭标签始终不到时缓冲按 _MAX_REASONING_BLOCK 上限丢弃并复位，避免异常流
-    造成无界增长；flush() 负责在流结束时释放残余。
-    """
-
-    def __init__(self):
-        self._buffer = ""
-        self._in_block = False
-        self._closer_re = None
-
-    def feed(self, chunk):
-        self._buffer += chunk
-        out = []
-        while True:
-            if self._in_block:
-                match = (
-                    self._closer_re.search(self._buffer) if self._closer_re else None
-                )
-                if match is None:
-                    # 只接受工具族闭标签：parameter/param 位于块内部，若在此
-                    # 收束，块内参数值会落到块外被当作思考文本输出。
-                    match = _TOOL_END_TAG_RE.search(self._buffer)
-                if match is None:
-                    if len(self._buffer) > _MAX_REASONING_BLOCK:
-                        # 闭标签始终未到：丢弃整块并复位，避免缓冲无限增长。
-                        self._buffer = ""
-                        self._in_block = False
-                        self._closer_re = None
-                    return "".join(out)
-                self._buffer = self._buffer[match.end() :]
-                self._in_block = False
-                self._closer_re = None
-                continue
-            match = _REASONING_MARKUP_RE.search(self._buffer)
-            if match:
-                out.append(_strip_stray_markers(self._buffer[: match.start()]))
-                self._buffer = self._buffer[match.end() :]
-                self._in_block = True
-                self._closer_re = _markup_closer_re(match.group(1))
-                continue
-            last_lt = self._buffer.rfind("<")
-            if last_lt != -1:
-                tail = self._buffer[last_lt:]
-                if ">" not in tail and (
-                    _is_plausible_stream_entry_prefix(tail, _STREAM_CLOSER_TAGS)
-                    or _is_plausible_stream_closer_prefix(tail)
-                ):
-                    out.append(_strip_stray_markers(self._buffer[:last_lt]))
-                    self._buffer = tail
-                    return "".join(out)
-            out.append(_strip_stray_markers(self._buffer))
-            self._buffer = ""
-            return "".join(out)
-
-    def flush(self):
-        """释放流结束时的残余缓冲；未闭合的块内容一并丢弃。"""
-        buffered = self._buffer
-        was_in_block = self._in_block
-        self._buffer = ""
-        self._in_block = False
-        self._closer_re = None
-        if was_in_block:
-            # 块未闭合即流结束：缓冲内容属于待丢弃的工具标记，整体丢弃。
-            return ""
-        return _strip_stray_markers(buffered)
-
 
 def _skip_bars(text, pos):
-    """跳过 DSML 装饰 "(?:\\s*[|｜]){0,2}" 及其后的空白。
-
-    模型输出装饰时竖线之间常夹空格（如 "</ | | DSML | | >"），只跳裸竖线会
-    让前缀判定提前失败，缓冲内容被当成正文泄漏出去。
-    """
-    length = len(text)
-    groups = 0
-    while groups < 2:
-        probe = pos
-        while probe < length and text[probe].isspace():
-            probe += 1
-        if probe < length and text[probe] in "|｜":
-            pos = probe + 1
-            groups += 1
-            continue
-        break
-    while pos < length and text[pos].isspace():
-        pos += 1
+    for _ in range(2):
+        if pos < len(text) and text[pos] in "|｜":
+            pos += 1
     return pos
 
 
-def _is_plausible_stream_entry_prefix(segment: str, tags=None) -> bool:
-    """segment 是否为某标签名的前缀（容忍 DSML 装饰、竖线、空格）。
-
-    tags 省略时按工具入口标签判断；判断闭合标签前缀时由
-    _is_plausible_stream_closer_prefix 传入 _STREAM_CLOSER_TAGS。
-    """
+def _is_plausible_stream_entry_prefix(segment: str) -> bool:
     if not segment.startswith("<") or ">" in segment:
         return False
     body = segment[1:]
     pos = _skip_bars(body, 0)
     length = len(body)
     if pos < length and body[pos] in "Dd":
-        # 裸 "< D" / "< DSML" 不是 DSML 前缀：模型在正文里写到 "< D..." 这类
-        # 内容时不能让缓冲无限挂起。装饰竖线必须成对出现（"<||DSML"）。
-        if sum(1 for c in body[:pos] if c in "|｜") < 2:
-            return False
         matched = 0
         while matched < 4 and pos < length and body[pos].upper() == "DSML"[matched]:
             pos += 1
@@ -3413,7 +2909,7 @@ def _is_plausible_stream_entry_prefix(segment: str, tags=None) -> bool:
         return True
     remainder = body[pos:]
     remainder_lower = remainder.lower()
-    for tag in tags or _STREAM_ENTRY_TAGS:
+    for tag in _STREAM_ENTRY_TAGS:
         if tag.startswith(remainder_lower):
             return True
         if remainder_lower.startswith(tag):
@@ -3424,9 +2920,9 @@ def _is_plausible_stream_entry_prefix(segment: str, tags=None) -> bool:
 
 
 def _is_plausible_stream_closer_prefix(segment: str) -> bool:
-    if not segment.startswith("</"):
-        return False
-    return _is_plausible_stream_entry_prefix("<" + segment[2:], _STREAM_CLOSER_TAGS)
+    return segment.startswith("</") and _is_plausible_stream_entry_prefix(
+        "<" + segment[2:]
+    )
 
 
 class StreamToolParser:
@@ -3435,7 +2931,6 @@ class StreamToolParser:
         self.in_tool = False
         self.has_tool = False
         self.json_done = False
-        self.in_bare = False
         self._end_re = None
 
     def feed(self, chunk):
@@ -3486,13 +2981,11 @@ class StreamToolParser:
                 if m:
                     start = m.start()
                     if start > 0:
-                        results.append(
-                            {"text": _strip_stray_markers(self.buffer[:start])}
-                        )
+                        _append_clean_text(results, self.buffer[:start])
                     self.buffer = self.buffer[start:]
                     tag_name = m.group(1).lower()
                     self._end_re = re.compile(
-                        r"</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*"
+                        r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*"
                         + re.escape(tag_name)
                         + r"[｜\|]{0,2}\s*>",
                         re.IGNORECASE,
@@ -3508,19 +3001,15 @@ class StreamToolParser:
                 hold = ">" not in tail and (
                     _is_plausible_stream_entry_prefix(tail)
                     or _is_plausible_stream_closer_prefix(tail)
-                    # 残损标记可能被 SSE 分片切断，未闭合的 < 尾段里只要已经
-                    # 出现全角竖线就先别吐，等兜底正则能整段清掉。
-                    or "｜" in tail
+                    or "\uff5c" in tail
                 )
                 if last_lt != -1 and hold:
                     if last_lt > 0:
-                        results.append(
-                            {"text": _strip_stray_markers(self.buffer[:last_lt])}
-                        )
+                        _append_clean_text(results, self.buffer[:last_lt])
                     self.buffer = tail
                     break
                 if self.buffer:
-                    results.append({"text": _strip_stray_markers(self.buffer)})
+                    _append_clean_text(results, self.buffer)
                 self.buffer = ""
                 break
         return results
@@ -3528,12 +3017,7 @@ class StreamToolParser:
     def flush(self):
         out = []
         if self.buffer and not self.in_tool:
-            # 流结束时缓冲里可能只剩模型收尾吐出的装饰闭标签串（例如
-            # ``</ | | DSML | | `` 反复出现，且整串不带 ``>``）。原样透传会
-            # 让协议残留出现在正文里，因此这里同样走孤立闭标签清理。
-            text = _strip_stray_markers(self.buffer)
-            if text:
-                out.append({"text": text})
+            _append_clean_text(out, self.buffer)
         elif self.in_tool:
             # [FIX 1] Recover the tool before stripping: if the stream was cut
             # off before the closing tag arrived but the payload itself is
@@ -3544,12 +3028,7 @@ class StreamToolParser:
                 for item in parsed:
                     out.append({"tool": item})
             elif not self.json_done:
-                stripped = re.sub(
-                    r"</?(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|invoke|function_call|parameter)[^>]*>",
-                    "",
-                    self.buffer,
-                    flags=re.IGNORECASE,
-                ).strip()
+                stripped = _strip_wrapper_tags(self.buffer).strip()
                 if stripped:
                     out.append({"text": stripped})
             # With json_done set, whatever is left after the consumed JSON
@@ -3623,19 +3102,46 @@ def _find_pow_answer_blocking(challange_data):
     return result if result != 0xFFFFFFFFFFFFFFFF else None
 
 
+async def _safe_json(response, context="upstream", auth_token=None):
+    ct = (getattr(response, "headers", None) or {}).get("Content-Type", "").lower()
+    if response.status == 202 or "text/html" in ct:
+        if auth_token:
+            invalidate_token_cookies(auth_token)
+            asyncio.create_task(get_isolated_cookies_for_token(auth_token))
+        raise UpstreamError(
+            429,
+            f"AWS WAF challenge (HTTP {response.status} text/html) on {context}: refreshing WAF cookie",
+            retry_after=15,
+        )
+    try:
+        return await response.json()
+    except aiohttp.ContentTypeError as e:
+        if auth_token:
+            invalidate_token_cookies(auth_token)
+            asyncio.create_task(get_isolated_cookies_for_token(auth_token))
+        status = getattr(e, "status", response.status) or 502
+        eff_status = 429 if status == 202 else (status if 400 <= status <= 599 else 502)
+        raise UpstreamError(
+            eff_status,
+            f"Upstream returned non-JSON response ({status}) on {context}: {e}",
+            retry_after=15 if eff_status == 429 else None,
+        ) from e
+
+
 async def create_challange_pow(target_path, auth_token):
-    headers = get_headers(auth_token)
-    # Backup: WAF cookies not required with Android headers. Kept as fallback:
-    # cookie = await get_cookies()
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
+    kwargs = {"timeout": aiohttp.ClientTimeout(total=20)}
+    if cookie:
+        kwargs["cookies"] = cookie
     response = await post_with_failover(
         "/api/v0/chat/create_pow_challenge",
         headers=headers,
         json={"target_path": target_path},
-        # cookies=cookie,  # Backup WAF fallback
-        timeout=aiohttp.ClientTimeout(total=20),
+        **kwargs,
     )
     async with response:
-        data = await response.json()
+        data = await _safe_json(response, "create_pow_challenge", auth_token)
     return _biz_data(data, "chat/create_pow_challenge")["challenge"]
 
 
@@ -3652,443 +3158,77 @@ async def find_pow_answer(challange_data):
     return await asyncio.to_thread(_find_pow_answer_blocking, challange_data)
 
 
-# ==============================================================================
-# PoW 预取池
-#
-# solve_create_pow() 是每个上游请求前的必经关卡，由两段串行工作组成：一次到
-# create_pow_challenge 的 HTTP 往返，加一次 wasm 解算。两者都排在第一个字节
-# 发给上游之前，所以全额计入用户感知的首字延迟。
-#
-# 但 challenge 不依赖本轮的消息内容——它的约束只有 expire_at，以及签发给哪个
-# target_path / token。这意味着整段等待可以提前做掉：上一轮收尾时预取，下一轮
-# 到达时直接取用。
-#
-# 池按 (target_path, auth_token) 分桶。token 必须进 key：challenge 按 token 签发
-# 并被 token 校验，跨 token 复用会被上游拒绝；token 池还会在 mark_limited /
-# mark_active 之间轮换，复用等于随机 403。target_path 也必须进 key：
-# chat/completion 与 file/upload_file 是两套互相独立、不能顶替的挑战。
-#
-# 取用路径必须能降级：池里命中且未过期才用，否则原地走同步求解。任何预取失败
-# 都被吞掉——池只是加速器，坏掉时行为退化成今天的样子，而不是报错。
-# ==============================================================================
-
-_POW_POOL = {}
-_POW_POOL_MAX = int(os.getenv("DEEPSEEKER_POW_POOL_MAX", "64"))
-# 不掌握上游真实有效期时的保守兜底；拿到 expire_at 就用更早的那个。
-_POW_PREFETCH_TTL = float(os.getenv("DEEPSEEKER_POW_PREFETCH_TTL", "60"))
-_POW_PREFETCH_ENABLED = os.getenv(
-    "DEEPSEEKER_POW_PREFETCH", "1"
-).strip().lower() not in ("0", "false", "no")
-_pow_prefetch_tasks = set()
-
-
-def _pow_expire_epoch(pow_data):
-    """把 challenge 的 expire_at 归一化成秒级 Unix 时间戳；识别不了返回 None。
-
-    expire_at 的单位没有文档保证，所以按量级判断：超过 1e11 视为毫秒。落在
-    合理区间之外的值（纳秒、损坏值）一律返回 None，交由调用方退回固定 TTL，
-    而不是拿一个错误的过期时间去做判断。
-    """
-    try:
-        value = float(pow_data.get("expire_at"))
-    except (TypeError, ValueError, AttributeError):
-        return None
-    if value <= 0:
-        return None
-    if value > 1e11:
-        value /= 1000.0
-    if value < 1e9 or value > 4e9:
-        return None
-    return value
-
-
-def _build_pow_header(pow_data, answer, target_path):
-    """把 challenge 与解算结果打包成 x-ds-pow-response 需要的 base64 串。"""
+async def solve_create_pow(target_path, auth_token):
+    pow = await create_challange_pow(target_path, auth_token)
+    answer = await find_pow_answer(pow)
+    if answer is None:
+        raise Exception("PoW solve failed")
     json_data = {
         "algorithm": "DeepSeekHashV1",
-        "challenge": pow_data["challenge"],
-        "salt": pow_data["salt"],
+        "challenge": pow["challenge"],
+        "salt": pow["salt"],
         "answer": answer,
-        "signature": pow_data["signature"],
+        "signature": pow["signature"],
         "target_path": target_path,
     }
     return base64.b64encode(json.dumps(json_data).encode()).decode()
 
 
-def _pow_pool_take(target_path, auth_token):
-    """取走一个未过期的预取结果；没有可用条目时返回 None。
-
-    条目取出即弹出：预取的 challenge 只服务一个请求。让并发请求都拿到同一个
-    challenge，只会把校验风险推给上游，不如让它们各自同步求解。
-    """
-    entry = _POW_POOL.pop((target_path, auth_token), None)
-    if entry is None:
-        return None
-    pow_b64, usable_until = entry
-    if usable_until is not None and time.time() >= usable_until:
-        logger.debug("丢弃已过期的预取 PoW：%s", target_path)
-        return None
-    return pow_b64
-
-
-def _pow_pool_store(target_path, auth_token, pow_b64, pow_data):
-    """把解好的 PoW 放进池里，附带一个保守的可用期。"""
-    if len(_POW_POOL) >= _POW_POOL_MAX:
-        # 池满说明有大量 token 在轮换；淘汰最旧的一条而不是无限增长。
-        _POW_POOL.pop(next(iter(_POW_POOL)), None)
-    # 固定 TTL 是不掌握真实有效期时的兜底；拿到 expire_at 就取更早的那个，并留
-    # 5 秒余量，避免正好卡在边界上被上游以「已过期」拒绝。
-    usable_until = time.time() + _POW_PREFETCH_TTL
-    expire_epoch = _pow_expire_epoch(pow_data)
-    if expire_epoch is not None:
-        usable_until = min(usable_until, expire_epoch - 5.0)
-    _POW_POOL[(target_path, auth_token)] = (pow_b64, usable_until)
-
-
-async def _prefetch_pow_once(target_path, auth_token):
-    """后台预取一个 PoW；任何失败都只记日志，绝不外抛。"""
-    try:
-        pow_data = await create_challange_pow(target_path, auth_token)
-        answer = await find_pow_answer(pow_data)
-        if answer is None:
-            logger.debug("预取 PoW 未解出结果：%s", target_path)
-            return
-        _pow_pool_store(
-            target_path,
-            auth_token,
-            _build_pow_header(pow_data, answer, target_path),
-            pow_data,
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.debug("预取 PoW 失败：%s", target_path, exc_info=True)
-
-
-def _schedule_pow_prefetch(target_path, auth_token):
-    """安排一次后台预取；同一个 (target_path, token) 不重复排队。"""
-    if not _POW_PREFETCH_ENABLED:
-        return
-    key = (target_path, auth_token)
-    if key in _POW_POOL:
-        return
-    for task in _pow_prefetch_tasks:
-        if not task.done() and getattr(task, "_pow_key", None) == key:
-            return
-    try:
-        task = asyncio.create_task(_prefetch_pow_once(target_path, auth_token))
-    except RuntimeError:
-        # 没有运行中的事件循环（同步测试环境），静默跳过。
-        return
-    # 持有强引用：create_task 的结果若无人引用，可能在完成前被 GC 回收。
-    task._pow_key = key
-    _pow_prefetch_tasks.add(task)
-    task.add_done_callback(_pow_prefetch_tasks.discard)
-
-
-async def solve_create_pow(target_path, auth_token):
-    cached = _pow_pool_take(target_path, auth_token)
-    if cached is not None:
-        _schedule_pow_prefetch(target_path, auth_token)
-        return cached
-
-    pow_data = await create_challange_pow(target_path, auth_token)
-    answer = await find_pow_answer(pow_data)
-    if answer is None:
-        raise Exception("PoW solve failed")
-    header = _build_pow_header(pow_data, answer, target_path)
-    # 同步求解说明池是空的，顺手为下一轮补上。
-    _schedule_pow_prefetch(target_path, auth_token)
-    return header
-
-
 async def create_new_chat(auth_token):
-    headers = get_headers(auth_token)
-    # Backup: WAF cookies not required with Android headers. Kept as fallback:
-    # cookie = await get_cookies()
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
+    kwargs = {"timeout": aiohttp.ClientTimeout(total=20)}
+    if cookie:
+        kwargs["cookies"] = cookie
     response = await post_with_failover(
         "/api/v0/chat_session/create",
         headers=headers,
-        # cookies=cookie,  # Backup WAF fallback
-        timeout=aiohttp.ClientTimeout(total=20),
+        json={},
+        **kwargs,
     )
     async with response:
-        data = await response.json()
+        data = await _safe_json(response, "chat_session/create", auth_token)
     return _biz_data(data, "chat_session/create")["chat_session"]["id"]
 
 
-def _deepseek_event_fragments(data):
-    """Extract response fragments from both direct and batched DeepSeek SSE events."""
-    found = []
-
-    def add_fragment(fragment):
-        if not isinstance(fragment, dict):
-            return
-        content = fragment.get("content")
-        if content is None:
-            return
-        fragment_type = str(fragment.get("type") or "RESPONSE").upper()
-        if fragment_type in {"RESPONSE", "THINK"}:
-            found.append((fragment_type, str(content)))
-
-    def visit(node):
-        if isinstance(node, list):
-            for item in node:
-                visit(item)
-            return
-        if not isinstance(node, dict):
-            return
-
-        if node.get("p") == "response/fragments" and isinstance(node.get("v"), list):
-            for fragment in node["v"]:
-                add_fragment(fragment)
-            return
-
-        # Some upstream deployments expose the same generation through an
-        # OpenAI-compatible delta envelope instead of the native fragment
-        # protocol. Keep this fallback narrow so status strings are not emitted
-        # as assistant text.
-        choices = node.get("choices")
-        if isinstance(choices, list):
-            for choice in choices:
-                if not isinstance(choice, dict):
-                    continue
-                delta = choice.get("delta")
-                if not isinstance(delta, dict):
-                    delta = choice.get("message")
-                if not isinstance(delta, dict):
-                    continue
-                if delta.get("reasoning_content") is not None:
-                    found.append(("THINK", str(delta["reasoning_content"])))
-                if delta.get("content") is not None:
-                    found.append(("RESPONSE", str(delta["content"])))
-            return
-
-        response = node.get("response")
-        if isinstance(response, dict) and isinstance(response.get("fragments"), list):
-            for fragment in response["fragments"]:
-                add_fragment(fragment)
-            return
-
-        if "content" in node and str(node.get("type") or "").upper() in {
-            "RESPONSE",
-            "THINK",
-        }:
-            add_fragment(node)
-            return
-
-        # Large replies are sometimes wrapped in BATCH operations. Walk only
-        # structured values so status strings are never mistaken for output.
-        for key in ("v", "data", "value"):
-            value = node.get(key)
-            if isinstance(value, (dict, list)):
-                visit(value)
-
-    visit(data)
-    return found
-
-
-def _deepseek_event_finished(data):
-    """Return True when a direct or batched event marks generation finished."""
-    if isinstance(data, list):
-        return any(_deepseek_event_finished(item) for item in data)
-    if not isinstance(data, dict):
+async def purge_chats_for_token(token_id: int):
+    tok = get_token(token_id)
+    if not tok:
         return False
-    if (
-        data.get("p") in {"response/status", "quasi_status"}
-        and data.get("v") == "FINISHED"
-    ):
-        return True
-    return any(
-        _deepseek_event_finished(data.get(key))
-        for key in ("v", "data", "value")
-        if isinstance(data.get(key), (dict, list))
-    )
+    auth_token = tok["token"]
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
+    kwargs = {"timeout": aiohttp.ClientTimeout(total=30)}
+    if cookie:
+        kwargs["cookies"] = cookie
+    with contextlib.suppress(Exception):
+        resp = await post_with_failover(
+            "/api/v0/users/update_settings",
+            headers=headers,
+            json={"training_allowed": False},
+            **kwargs,
+        )
+        async with resp:
+            pass
+    with contextlib.suppress(Exception):
+        resp = await post_with_failover(
+            "/api/v0/chat_session/delete_all",
+            headers=headers,
+            json={},
+            **kwargs,
+        )
+        async with resp:
+            pass
+    delete_sessions_for_token(token_id)
+    return True
 
 
-def _deepseek_status_words(data):
-    """收集事件中所有状态字段的取值（``response/status``、``quasi_status`` 等）。
-
-    状态字段承载的是 FINISHED、INCOMPLETE、WIP 这类状态词，永远不是答案内容。
-    批内（BATCH）事件会把状态字段嵌套在 ``v`` 数组中，因此需要递归遍历。
-    """
-    words = set()
-    if isinstance(data, list):
-        for item in data:
-            words |= _deepseek_status_words(item)
-        return words
-    if not isinstance(data, dict):
-        return words
-    path = data.get("p")
-    value = data.get("v")
-    if (
-        isinstance(path, str)
-        and isinstance(value, str)
-        and (path == "quasi_status" or path.endswith("status"))
-    ):
-        words.add(value)
-    for key in ("v", "data", "value"):
-        child = data.get(key)
-        if isinstance(child, (dict, list)):
-            words |= _deepseek_status_words(child)
-    return words
-
-
-def _deepseek_event_search_results(data):
-    """Collect structured web-search results carried by a DeepSeek SSE event.
-
-    The upstream publishes one event per search round at the JSON path
-    ``response/fragments/<id>/results``; its ``v`` array holds objects with
-    ``url``/``title``/``snippet``/``cite_index``/``published_at``. Batched
-    envelopes nest the identical payload, so the walker recurses through the
-    container keys used by the other event parsers in this module. Items lack a
-    URL are dropped here: the Anthropic result schema requires one, and a
-    downstream consumer cannot cite an address-less entry.
-    """
-    found = []
-
-    def visit(node):
-        if isinstance(node, list):
-            for item in node:
-                visit(item)
-            return
-        if not isinstance(node, dict):
-            return
-
-        path = node.get("p")
-        value = node.get("v")
-        if (
-            isinstance(path, str)
-            and path.endswith("/results")
-            and isinstance(value, list)
-        ):
-            for item in value:
-                if isinstance(item, dict) and item.get("url"):
-                    found.append(item)
-            return
-
-        for key in ("v", "data", "value"):
-            child = node.get(key)
-            if isinstance(child, (dict, list)):
-                visit(child)
-
-    visit(data)
-    return found
-
-
-def _deepseek_event_rate_limited(data):
-    """Detect rate-limit errors encoded in a successful SSE response."""
-    rate_markers = (
-        "rate_limit",
-        "rate limit",
-        "rate-limited",
-        "too frequent",
-        "too many requests",
-    )
-
-    if isinstance(data, list):
-        return any(_deepseek_event_rate_limited(item) for item in data)
-    if not isinstance(data, dict):
-        return False
-
-    finish_reason = data.get("finish_reason")
-    if isinstance(finish_reason, str):
-        normalized_reason = finish_reason.lower().replace("-", "_")
-        if any(
-            marker in normalized_reason for marker in ("rate_limit", "too_frequent")
-        ):
-            return True
-
-    event_type = str(data.get("type") or "").lower()
-    nested_error = data.get("error")
-    if event_type in {"error", "exception", "rate_limit", "rate_limited"} or isinstance(
-        nested_error, dict
-    ):
-        error_text = " ".join(
-            str(data.get(key) or "")
-            for key in ("content", "message", "error", "code", "reason")
-        ).lower()
-        if isinstance(nested_error, dict):
-            error_text += (
-                " "
-                + " ".join(
-                    str(nested_error.get(key) or "")
-                    for key in ("message", "code", "reason", "type")
-                ).lower()
-            )
-        if event_type in {"rate_limit", "rate_limited"} or any(
-            marker in error_text for marker in rate_markers
-        ):
-            return True
-
-    return any(
-        _deepseek_event_rate_limited(data.get(key))
-        for key in ("v", "data", "value", "error")
-        if isinstance(data.get(key), (dict, list))
-    )
-
-
-class _DeepSeekSSEParser:
-    """Accept native SSE framing while tolerating direct JSON responses."""
-
-    def __init__(self):
-        self._data_lines = []
-
-    @staticmethod
-    def _is_json(value):
-        try:
-            json.loads(value)
-        except (TypeError, json.JSONDecodeError):
-            return False
-        return True
-
-    def _flush_data(self):
-        if not self._data_lines:
-            return []
-        payload = "\n".join(self._data_lines).strip()
-        self._data_lines = []
-        return [payload] if payload else []
-
-    def feed(self, raw_line):
-        if isinstance(raw_line, bytes):
-            line = raw_line.decode("utf-8", errors="replace")
-        else:
-            line = str(raw_line)
-        line = line.lstrip("\ufeff").rstrip("\r\n")
-        stripped = line.strip()
-
-        if not stripped:
-            return self._flush_data()
-        if stripped.startswith(":"):
-            return []
-
-        if stripped.startswith("data:"):
-            self._data_lines.append(stripped[5:].lstrip())
-            # Normal DeepSeek events are one JSON object per data line. Emit
-            # them immediately; multiline JSON remains buffered until blank.
-            payload = "\n".join(self._data_lines).strip()
-            if self._is_json(payload):
-                self._data_lines = []
-                return [payload]
-            return []
-
-        # A few proxies strip the SSE field name from a JSON-only response.
-        # Accept only complete JSON here; HTML and diagnostic text are ignored.
-        if not self._data_lines and stripped[:1] in "[{" and self._is_json(stripped):
-            return [stripped]
-        return []
-
-    def flush(self):
-        return self._flush_data()
-
-
-async def _iter_deepseek_sse_payloads(content):
-    parser = _DeepSeekSSEParser()
-    async for raw_line in content:
-        for payload in parser.feed(raw_line):
-            yield payload
-    for payload in parser.flush():
-        yield payload
+async def purge_all_tokens_chats():
+    toks = get_tokens()
+    for tok in toks:
+        await purge_chats_for_token(tok["id"])
+    delete_all_sessions()
+    return True
 
 
 _EMPTY_SSE_DEFAULT = (
@@ -4099,10 +3239,48 @@ _EMPTY_SSE_CONTEXT = (
     "Empty response from DeepSeek (prompt may exceed the session context limit)"
 )
 _CONTEXT_LIMIT_HINT_RE = re.compile(
-    r"context|token.?limit|maximum.?context|too.?long|exceed",
+    r"maximum.?context"
+    r"|context.?(?:length|limit|window)"
+    r"|token.?limit"
+    r"|(?:prompt|payload|conversation|messages?).{0,24}too.?long"
+    r"|exceed(?:ed|s)?[^.\n]{0,30}context",
     re.IGNORECASE,
 )
 _SSE_RECENT_LINES = 8
+
+
+def is_context_limit_error(exc):
+    """Public classifier (DSH fix): did this failure come from the upstream
+    session running out of context?
+
+    Agent harnesses die here: a context-class failure used to be retried
+    verbatim on other tokens (the context belongs to the CHAT, not the token,
+    so every attempt fails the same way) and finally surfaced to the client as
+    a context-limit error. The caller uses this to trigger a summary rollover
+    instead. Matches:
+      * UpstreamError bodies carrying upstream context wording (HTTP 400
+        'maximum context length', 'context limit', 'too long', ...), and
+      * the bridge's own empty-SSE-with-context-hint error.
+    Deliberately NOT matched: generic 5xx/timeouts — 'deadline exceeded' or
+    '502 upstream timeout' are retry-shaped, not context-shaped. The loose
+    words only count when anchored to context material: a bare 'exceed' or a
+    'too long' with no prompt/message in front of it no longer classifies as
+    context (review fix, PR #67 — an upstream body like 'header limit
+    exceeded' for a non-context reason used to force a wasteful summary
+    rollover), and the plain-exception fallback requires explicit context-
+    limit phrasing — a mere 'context' substring ('context deadline
+    exceeded') is retry-shaped, not context-shaped."""
+    if isinstance(exc, UpstreamError):
+        body = exc.body or ""
+        return bool(_CONTEXT_LIMIT_HINT_RE.search(body))
+    text = str(exc or "")
+    return bool(
+        re.search(
+            r"maximum.?context|context.?(?:length|limit|window)|token.?limit",
+            text,
+            re.IGNORECASE,
+        )
+    )
 
 
 class _SseStreamFinished(Exception):
@@ -4147,13 +3325,28 @@ def _scan_recent_sse_errors(parsed_events):
     return None
 
 
-def _raise_empty_sse_response(recent_lines, parsed_events, protocol_detail=""):
-    """Raise for a stream that ended without assistant output (c181d06).
+def _non_sse_biz_error(non_sse_tail):
+    """Return (code, msg) if the non-SSE body tail holds a JSON error envelope.
 
-    `protocol_detail` 由调用方附带流层统计（payload 数、是否见 [DONE]、
-    Content-Type）。缺少该统计时，协议层故障与真正的上下文超限无法区分，
-    排查只能靠猜测，因此该参数在 send_message 的正常路径上必传。
+    Upstream answers some protocol failures on the SSE endpoint with a plain
+    `application/json` envelope (`{"code":26,"msg":"invalid message id",...}`)
+    instead of an event stream. The parser sees zero `data:` lines and the
+    failure surfaces as an anonymous empty stream; this recovers the reason so
+    the error message says what actually went wrong.
     """
+    for line in reversed(non_sse_tail or []):
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and (obj.get("code") or obj.get("msg")):
+            return obj.get("code"), obj.get("msg") or obj.get("message")
+    return None, None
+
+
+def _raise_empty_sse_response(
+    recent_lines, parsed_events, resp_ct="", non_sse_tail=None
+):
     err = _scan_recent_sse_errors(parsed_events)
     if err:
         code, msg = err
@@ -4161,60 +3354,84 @@ def _raise_empty_sse_response(recent_lines, parsed_events, protocol_detail=""):
             "DeepSeek SSE error event (not empty stream); last events: %s",
             recent_lines[-_SSE_RECENT_LINES:],
         )
-        if code == 429:
-            # 限流有专用异常类型，上层据其类型驱动 token 轮换；此处保留上游
-            # 原始措辞于日志，异常消息仍用固定文案，避免上游文案漂移影响判定。
-            raise DeepSeekRateLimitError()
-        raise Exception(f"HTTP {code}: {msg}")
+        raise UpstreamError(code, msg)
     if _sse_context_limit_hint(recent_lines, parsed_events):
         msg = _EMPTY_SSE_CONTEXT
     else:
         msg = _EMPTY_SSE_DEFAULT
+    # Log the response type and the raw non-SSE body so the next upstream
+    # protocol change is identifiable from one request, not an hour of guessing.
+    tail = non_sse_tail or []
     logger.warning(
-        "DeepSeek SSE ended without assistant output; last events: %s",
+        "DeepSeek SSE ended without assistant output; ct=%s non_sse=%s; last events: %s",
+        resp_ct or "-",
+        (" | ".join(tail[-3:])[:400] or "-"),
         recent_lines[-_SSE_RECENT_LINES:],
     )
-    raise Exception(msg + protocol_detail)
+    biz_code, biz_msg = _non_sse_biz_error(tail)
+    if biz_code is not None or biz_msg:
+        code_map = {
+            40002: 401,
+            40003: 401,
+            40012: 403,
+            40029: 429,
+            40303: 403,
+            50006: 429,
+            40006: 502,
+        }
+        retry_after = None
+        if biz_code in (40012, "40012"):
+            retry_after = 86400
+        elif biz_code in (40303, "40303"):
+            retry_after = 1800
+        elif biz_code in (50006, "50006"):
+            retry_after = 3600
+        elif biz_code in (40029, "40029"):
+            retry_after = TOKEN_COOLDOWN_SECONDS
+        status = code_map.get(
+            biz_code, 403 if str(biz_code).startswith("403") else 502
+        )
+        raise UpstreamBizError(
+            status,
+            f"{msg}: code={biz_code} msg={biz_msg}",
+            biz_code=int(biz_code) if str(biz_code).isdigit() else biz_code,
+            retry_after=retry_after,
+        )
+    raise UpstreamError(502, msg)
 
 
 def _raise_sse_error_event(data, recent_lines):
-    """Raise a status-carrying exception for an upstream SSE error event (c181d06).
-
-    状态码经 'HTTP <code>: ' 前缀编码，app._upstream_http_code 据此驱动 token
-    轮换与限流标记；上游改动措辞时该前缀由本函数统一产出，不会漂移。
-    """
     content = data.get("content") or data.get("message") or "Upstream error"
     finish = str(data.get("finish_reason") or "")
     if finish == "rate_limit_reached" or "rate_limit" in finish.lower():
         logger.warning(
-            "DeepSeek SSE error event (not empty stream): %s; last events: %s",
-            content,
+            "DeepSeek SSE error event (not empty stream); last events: %s",
             recent_lines[-_SSE_RECENT_LINES:],
         )
-        # 限流用专用异常，保持与 _deepseek_event_rate_limited 路径同一类型，
-        # 上层按类型而非消息文本判定轮换。
-        raise DeepSeekRateLimitError()
+        raise UpstreamError(429, content)
     if finish in ("permission_denied", "forbidden"):
-        raise Exception(f"HTTP 403: {content}")
-    raise Exception(f"HTTP 502: {content}")
+        raise UpstreamError(403, content)
+    raise UpstreamError(502, content)
 
 
-# DeepSeek 同一账号同一时刻只允许一个生成任务：并发发送会返回
-# 「A message is being generated」或「Messages too frequent」。因此按账号串行化，
-# 所有生成均经由 send_message，覆盖全部调用方。
+# DeepSeek generates one message per account at a time; a second concurrent send
+# fails with "A message is being generated" / "Messages too frequent". Queue sends
+# per token instead. Every generation goes through send_message, so this covers all
+# callers.
 _send_locks = {}
 
 
 def token_busy(auth_token):
-    """账号正在生成时返回 True（其发送锁被持有）。"""
+    """True while this account is generating (its send lock is held)."""
     lock = _send_locks.get(auth_token)
     return bool(lock and lock.locked())
 
 
 async def send_message(chat_id, auth_token, *args, **kwargs):
-    # 上游流由独立任务排空，锁在 DeepSeek 结束生成时即释放；即使消费方中途
-    # 放弃该生成器（客户端断开且未调用 aclose），锁也不会泄漏。此前在 yield
-    # 期间持有锁，一次放弃即会长期占用该账号，后续请求全部阻塞。
+    # The upstream stream is drained by its own task, so the lock is released when
+    # DeepSeek finishes even if the consumer abandons this generator mid-stream
+    # (client gone without aclose): holding it across our yields leaked the lock
+    # and wedged every later request on that account.
     lock = _send_locks.setdefault(auth_token, asyncio.Lock())
     queue = asyncio.Queue()
     done = object()
@@ -4240,7 +3457,7 @@ async def send_message(chat_id, auth_token, *args, **kwargs):
                 raise item
             yield item
     finally:
-        # 消费方关闭本生成器（断开、中止）时仍需取消上游任务。
+        # A consumer that closes us (disconnect, abort) still cancels the upstream.
         task.cancel()
 
 
@@ -4252,25 +3469,32 @@ async def _send_message_unlocked(
     thinking=False,
     search=False,
     file_ids_=None,
-    search_sink=None,
 ):
-    # Backup: WAF cookies not required with Android headers. Kept as fallback:
-    # cookie = await get_cookies()
-    if parent_message_id == 0:
-        parent_message_id = None
+    reply_id.set(None)
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
     file_ids = file_ids_ or []
 
-    headers = get_headers(
-        auth_token, await solve_create_pow("/api/v0/chat/completion", auth_token)
+    pow_resp = await solve_create_pow(
+        "/api/v0/chat/completion", auth_token
     )
-    # 移植自 1515asd/rh-deeperseeker v89.8：默认关闭时零网络、零行为变化；
-    # 开启后取不到令牌即降级为不带该头，绝不阻断对话请求。
-    _hif = await get_hif_token()
-    if _hif:
-        headers["x-hif-leim"] = _hif
+    headers = get_headers(auth_token, pow_resp, device_id=device_id)
+    hif_env = os.getenv("DEEPSEEKER_HIF_ENABLED")
+    should_hif = (
+        hif_env.lower() in ("true", "1", "yes")
+        if hif_env is not None
+        else True
+    )
+    if should_hif:
+        hif_leim = await get_hif_token("leim")
+        if hif_leim:
+            headers["x-hif-leim"] = hif_leim
+        hif_dliq = await get_hif_token("dliq")
+        if hif_dliq:
+            headers["x-hif-dliq"] = hif_dliq
+    if chat_id:
+        headers["referer"] = f"https://chat.deepseek.com/a/chat/s/{chat_id}"
     json_data = {
         "chat_session_id": chat_id,
-        "parent_message_id": parent_message_id,
         "model_type": DEFAULT_MODEL_TYPE,
         "prompt": message,
         "ref_file_ids": file_ids,
@@ -4279,27 +3503,43 @@ async def _send_message_unlocked(
         "preempt": False,
         "action": None,
     }
+    # Since 2026-10-31 upstream rejects parent_message_id=0 with biz_code 26
+    # "invalid message id", and edges disagree about whether null is tolerated.
+    # Omitting the key on the first turn is the only shape that works on all
+    # of them; later turns still chain off the previous response id.
+    if parent_message_id:
+        json_data["parent_message_id"] = parent_message_id
+
+    resolved_shumei = shumei_id or extract_shumei_device_id(cookie)
+    if resolved_shumei:
+        json_data["shumei_device_id"] = resolved_shumei
 
     think_open = False
     got_output = False
-    # DeepSeek 会以 status INCOMPLETE 结束被截断的回复（长上下文下常见于思考中途）。
-    # 此时若尚无答案文本，该轮属于失败而非完成：空 stop 会让 agent 客户端结束回合。
+    # DeepSeek ends a reply it cut short (seen mid-thinking on long contexts) with
+    # status INCOMPLETE. With no answer text yet that is a failed turn, not a
+    # finished one: an empty "stop" makes agent clients end the turn.
     incomplete = False
     got_response = False
-    recent_events = []
-    # c181d06：错误归类需要两条独立轨迹——parsed_events 供 _scan_recent_sse_errors
-    # 读取结构化 error 事件，recent_lines 供 _sse_context_limit_hint 做文本正则匹配。
-    # 二者不可互相替代：把 dict 交给正则会在 search() 处抛 TypeError。
-    recent_lines = []
-    payload_count = 0
-    saw_done = False
+    post_kwargs = {}
+    if cookie:
+        post_kwargs["cookies"] = cookie
     resp = await post_with_failover(
         "/api/v0/chat/completion",
         headers=headers,
         json=json_data,
-        # cookies=cookie,  # Backup WAF fallback
+        **post_kwargs,
     )
     async with resp:
+        resp_ct = (getattr(resp, "headers", None) or {}).get("content-type") or ""
+        if resp.status == 202 or (resp.status != 200 and "text/html" in str(resp_ct).lower()):
+            invalidate_token_cookies(auth_token)
+            asyncio.create_task(get_isolated_cookies_for_token(auth_token))
+            raise UpstreamError(
+                429,
+                f"AWS WAF challenge (HTTP {resp.status} text/html): refreshing WAF cookie",
+                retry_after=15,
+            )
         if resp.status != 200:
             error_text = await resp.text()
             logger.warning(
@@ -4308,151 +3548,176 @@ async def _send_message_unlocked(
                 chat_id,
                 error_text[:300],
             )
-            raise Exception(f"HTTP {resp.status}: {error_text}")
+            raise UpstreamError(resp.status, error_text)
+
+        recent_lines = []
+        parsed_events = []
+        # Non-SSE body lines (no `data: ` prefix). Upstream answers some
+        # protocol failures with a plain application/json envelope on this
+        # endpoint; keeping the raw lines is what makes those diagnosable.
+        non_sse_tail = []
+        line_buf = b""
 
         def _check_incomplete():
             if incomplete and not got_response:
                 raise UpstreamError(
-                    502,
-                    "DeepSeek stopped the reply before any answer (status INCOMPLETE)",
+                    502, "DeepSeek stopped the reply before any answer (status INCOMPLETE)"
                 )
 
-        async for payload in _iter_deepseek_sse_payloads(resp.content):
-            payload_count += 1
-            if payload == "[DONE]":
-                saw_done = True
-                if think_open:
-                    yield "\n</think>\n\n"
-                    think_open = False
-                if got_output:
-                    return
-                continue
-            _remember_sse_line(recent_lines, payload)
-            try:
-                data = json.loads(payload)
-            except Exception as e:
-                logger.debug(
-                    "Ignoring malformed DeepSeek SSE payload for chat %s: %s",
-                    chat_id,
-                    e,
-                )
-                continue
-            recent_events.append(data)
-            recent_events = recent_events[-5:]
-
-            # 移植自 1515asd/rh-deeperseeker v85：记录上游广播的真实回复
-            # 编号，供 app 层 save_session 推进会话映射。
-            _real_id = _extract_response_message_id(data)
-            if _real_id is not None:
-                remember_real_parent(chat_id, _real_id)
-
-            # 移植自 1515asd/rh-deeperseeker v89.7：禁言报文藏在外层
-            # code=0 的嵌套业务信封里，只按外层状态判断会把它当成正常
-            # 应答并继续用死号发请求。命中布尔硬证据即抛隔离异常。
-            _envelope = data.get("data") if isinstance(data, dict) else None
-            if isinstance(_envelope, dict):
-                _raise_if_muted_envelope(_envelope.get("biz_data"))
-
-            # c181d06：上游 error 事件携带真实状态码（429/403/502），必须按码
-            # 上报；此前一律被归类为「上下文超限」，会误导排查方向。
+        async def _emit_from_event(data):
+            nonlocal think_open, got_output, incomplete, got_response
             if isinstance(data, dict) and data.get("type") == "error":
                 _raise_sse_error_event(data, recent_lines)
 
-            # Search results arrive on their own event path and carry no
-            # assistant prose. Collecting them here keeps the generator's
-            # yielded text limited to RESPONSE/THINK fragments, so callers that
-            # need the sources receive them through search_sink instead of
-            # parsing them back out of the visible answer.
-            if search_sink is not None:
-                search_sink.extend(_deepseek_event_search_results(data))
+            if data.get("o") == "BATCH" and isinstance(data.get("v"), list):
+                for op in data["v"]:
+                    if not isinstance(op, dict):
+                        continue
+                    if op.get("p") == "quasi_status":
+                        incomplete = incomplete or op.get("v") == "INCOMPLETE"
+                        continue  # a status word, never content
+                    base, sub = data.get("p"), op.get("p")
+                    if base and sub and not sub.startswith(base + "/"):
+                        # Sub-op paths are relative to the BATCH path:
+                        # {"p":"response","o":"BATCH","v":[{"p":"fragments",...}]}
+                        op = {**op, "p": f"{base}/{sub}"}
+                    async for chunk in _emit_from_event(op):
+                        yield chunk
+                return
 
-            if _deepseek_event_rate_limited(data):
-                logger.warning(
-                    "DeepSeek rate limit reported for chat %s; rotating token",
-                    chat_id,
-                )
-                raise DeepSeekRateLimitError()
-
-            # 状态字段（``response/status``、``.../status`` 与批内的 ``quasi_status``）
-            # 承载的是 FINISHED、INCOMPLETE、WIP 这类状态词，永远不是答案内容。
-            status_words = _deepseek_status_words(data)
-            if "INCOMPLETE" in status_words:
-                incomplete = True
-            p_name = str(data.get("p") or "")
-            if p_name.endswith("status") and not (
-                p_name == "response/status" and data.get("v") == "FINISHED"
+            # Any other status field ("response/status", ".../status") carries a
+            # status word such as INCOMPLETE or WIP, never content.
+            p_name, p_val = str(data.get("p") or ""), data.get("v")
+            if (
+                p_name.endswith("status")
+                and isinstance(p_val, str)
+                and p_val.isupper()
+                and p_val != "FINISHED"
             ):
-                # 纯状态事件：既不能作为正文输出，也不代表本轮结束；FINISHED
-                # 交由下方结束分支处理。
-                continue
+                incomplete = incomplete or p_val == "INCOMPLETE"
+                return
 
-            for fragment_type, content in _deepseek_event_fragments(data):
-                if fragment_type == "THINK":
-                    if not think_open:
-                        yield "<think>\n"
-                        think_open = True
-                elif think_open:
-                    yield "\n</think>\n\n"
-                    think_open = False
-                if content:
-                    got_output = True
-                    if fragment_type == "RESPONSE":
-                        got_response = True
-                    yield content
-
-            v = data.get("v")
-            if not _deepseek_event_finished(data) and isinstance(v, str) and v:
-                got_output = True
-                got_response = got_response or not think_open
-                yield v
-            if _deepseek_event_finished(data):
+            if data.get("p") == "response/status" and data.get("v") == "FINISHED":
                 if think_open:
                     yield "\n</think>\n\n"
                 _check_incomplete()
                 if not got_output:
-                    content_type = getattr(resp, "headers", {}).get(
-                        "Content-Type", "unknown"
-                    )
-                    logger.warning(
-                        "DeepSeek finished without recognized output for chat %s; payloads=%d done=%s content_type=%s recent events=%s",
-                        chat_id,
-                        payload_count,
-                        saw_done,
-                        content_type,
-                        json.dumps(recent_events, ensure_ascii=False)[:2000],
-                    )
                     _raise_empty_sse_response(
-                        recent_lines,
-                        recent_events,
-                        f" (payloads={payload_count} done={saw_done} content_type={content_type})",
+                        recent_lines, parsed_events, resp_ct, non_sse_tail
                     )
+                raise _SseStreamFinished()
+
+            if "v" in data and isinstance(data["v"], dict) and "response" in data["v"]:
+                fragments = data["v"]["response"].get("fragments")
+                if fragments:
+                    for fragment in fragments:
+                        if fragment.get("type") == "THINK":
+                            if not think_open:
+                                yield "<think>\n"
+                                think_open = True
+                            got_output = True
+                            yield fragment.get("content", "")
+                        else:
+                            if think_open:
+                                yield "\n</think>\n\n"
+                                think_open = False
+                            got_output = True
+                            got_response = got_response or bool(fragment.get("content"))
+                            yield fragment.get("content", "")
                 return
+
+            if data.get("p") == "response/fragments" and data.get("o") in ("APPEND", None):
+                fragments = data.get("v")
+                if isinstance(fragments, list):
+                    for fragment in fragments:
+                        if fragment.get("type") == "RESPONSE":
+                            if think_open:
+                                yield "\n</think>\n\n"
+                                think_open = False
+                            got_output = True
+                            got_response = got_response or bool(fragment.get("content"))
+                            yield fragment.get("content", "")
+                        elif fragment.get("type") == "THINK":
+                            if not think_open:
+                                yield "<think>\n"
+                                think_open = True
+                            got_output = True
+                            yield fragment.get("content", "")
+                        else:
+                            got_output = True
+                            yield fragment.get("content", "")
+                return
+
+            v = data.get("v")
+            if isinstance(v, str) and v:
+                got_output = True
+                got_response = got_response or not think_open
+                yield v
+
+        async def _consume_sse_line(decoded_line: str):
+            if not decoded_line.startswith("data: "):
+                non_sse_tail.append(_redact_sse_line(decoded_line))
+                if len(non_sse_tail) > _SSE_RECENT_LINES:
+                    del non_sse_tail[0]
+                return
+            _remember_sse_line(recent_lines, decoded_line)
+            try:
+                data = json.loads(decoded_line[6:])
+            except Exception:
+                return
+            if isinstance(data, dict):
+                parsed_events.append(data)
+                if len(parsed_events) > _SSE_RECENT_LINES:
+                    del parsed_events[0]
+                mid = _extract_upstream_message_id(data)
+                if mid is not None:
+                    reply_id.set(mid)
+            try:
+                async for chunk in _emit_from_event(data):
+                    yield chunk
+            except _SseStreamFinished:
+                raise
+
+        async for chunk in resp.content.iter_any():
+            if not chunk:
+                continue
+            line_buf += chunk
+            while b"\n" in line_buf:
+                raw_line, line_buf = line_buf.split(b"\n", 1)
+                decoded_line = raw_line.decode("utf-8", errors="replace").strip()
+                if not decoded_line:
+                    continue
+                try:
+                    async for out in _consume_sse_line(decoded_line):
+                        yield out
+                except _SseStreamFinished:
+                    return
+
+        if line_buf.strip():
+            decoded_line = line_buf.decode("utf-8", errors="replace").strip()
+            if decoded_line:
+                try:
+                    async for out in _consume_sse_line(decoded_line):
+                        yield out
+                except _SseStreamFinished:
+                    return
+
         if think_open:
             yield "\n</think>\n\n"
         _check_incomplete()
         if not got_output:
-            content_type = getattr(resp, "headers", {}).get("Content-Type", "unknown")
-            logger.warning(
-                "DeepSeek stream ended without recognized output for chat %s; payloads=%d done=%s content_type=%s recent events=%s",
-                chat_id,
-                payload_count,
-                saw_done,
-                content_type,
-                json.dumps(recent_events, ensure_ascii=False)[:2000],
-            )
             _raise_empty_sse_response(
-                recent_lines,
-                recent_events,
-                f" (payloads={payload_count} done={saw_done} content_type={content_type})",
+                recent_lines, parsed_events, resp_ct, non_sse_tail
             )
 
 
 async def upload_file(file_bytes, file_name, file_content_type, auth_token):
-    # Backup: WAF cookies not required with Android headers. Kept as fallback:
-    # cookie = await get_cookies()
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
     session = await get_session()
     file_size = len(file_bytes)
-    pow_response = await solve_create_pow("/api/v0/file/upload_file", auth_token)
+    pow_response = await solve_create_pow(
+        "/api/v0/file/upload_file", auth_token
+    )
     boundary = b"----WebKitFormBoundaryTB0pXOQR2RL219Hu"
     safe_name = re.sub(r"[^ -~]", "_", file_name).replace('"', "_") or "file.bin"
     body_parts = [
@@ -4463,47 +3728,42 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
         b"\r\n--" + boundary + b"--\r\n",
     ]
     reconstructed_body = b"".join(body_parts)
-    headers = get_headers(auth_token, pow_response)
+    headers = get_headers(auth_token, pow_response, device_id=device_id)
     headers.update(
         {
             "content-type": f"multipart/form-data; boundary={boundary.decode('utf-8')}",
             "x-file-size": str(file_size),
         }
     )
+    post_kwargs = {"timeout": aiohttp.ClientTimeout(total=120)}
+    if cookie:
+        post_kwargs["cookies"] = cookie
     response = await post_with_failover(
         "/api/v0/file/upload_file",
         data=reconstructed_body,
         headers=headers,
-        # cookies=cookie,  # Backup WAF fallback
-        timeout=aiohttp.ClientTimeout(total=120),
+        **post_kwargs,
     )
     async with response:
-        resp_json = await response.json()
+        resp_json = await _safe_json(response, "upload_file", auth_token)
     js_data = _biz_data(resp_json, "file/upload_file")
-    file_id = js_data.get("id")
-    if not file_id:
-        # Server returned no file id (WAF block / rate limit / malformed response).
-        raise Exception(
-            f"File upload failed: {json.dumps(resp_json, ensure_ascii=False)[:500]}"
-        )
+    file_id = js_data["id"]
     yield ("uploaded", file_id)
     status = js_data["status"]
-    headers = get_headers(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
     deadline = time.time() + 300
     while status in ["PENDING", "PARSING"] and time.time() < deadline:
         yield ("uploaded", file_id)
         await asyncio.sleep(0.3)
+        get_kwargs = {"timeout": aiohttp.ClientTimeout(total=30)}
+        if cookie:
+            get_kwargs["cookies"] = cookie
         async with session.get(
             "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
             headers=headers,
-            # cookies=cookie,  # Backup WAF fallback
-            timeout=aiohttp.ClientTimeout(total=30),
+            **get_kwargs,
         ) as resp:
-            resp_json = await resp.json()
-        files = _biz_data(resp_json, "file/fetch_files").get("files") or []
-        if not files:
-            continue
-        js_data = files[0]
+            js_data = _biz_data(await resp.json(), "file/fetch_files")["files"][0]
         status = js_data["status"]
     if status == "SUCCESS":
         tp_data = datetime.fromtimestamp(js_data["updated_at"], timezone.utc)
@@ -4521,15 +3781,16 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
 
 
 async def get_file_content(auth_token, file_id):
-    # Backup: WAF cookies not required with Android headers. Kept as fallback:
-    # cookie = await get_cookies()
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
     session = await get_session()
-    headers = get_headers(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
+    get_kwargs = {"timeout": aiohttp.ClientTimeout(total=30)}
+    if cookie:
+        get_kwargs["cookies"] = cookie
     async with session.get(
         "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
         headers=headers,
-        # cookies=cookie,  # Backup WAF fallback
-        timeout=aiohttp.ClientTimeout(total=30),
+        **get_kwargs,
     ) as resp:
         resp_json = await resp.json()
     js_data = _biz_data(resp_json, "file/fetch_files")["files"][0]

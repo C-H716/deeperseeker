@@ -6,6 +6,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import functions  # noqa: E402
+
 
 class _FakeStream:
     def __init__(self, chunks):
@@ -15,23 +17,6 @@ class _FakeStream:
         async def _gen():
             for chunk in self._chunks:
                 yield chunk
-
-        return _gen()
-
-    def __aiter__(self):
-        # 本 fork 的 send_message 经 _iter_deepseek_sse_payloads 读取上游流，
-        # 该函数按 readline 语义逐行消费（与 aiohttp StreamReader.__aiter__ 的
-        # 真实行为一致）。测试桩必须提供同一语义：把任意 TCP 分片重新拼回
-        # 完整行，使跨分片的 JSON 不会被截断。
-        async def _gen():
-            buf = b""
-            for chunk in self._chunks:
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    yield line + b"\n"
-            if buf:
-                yield buf
 
         return _gen()
 
@@ -167,10 +152,7 @@ def test_rate_limit_error_raises_http_429():
     )
     err = asyncio.run(_expect_send_error(body))
     assert "HTTP 429:" in str(err)
-    # 本地契约（见 tests/test_rate_limit_failover.py）要求 429 使用固定文案
-    # "DeepSeek rate limit reached"，避免上游措辞漂移影响上层判定；上游原文
-    # 由 functions._raise_sse_error_event 记入 warning 日志。
-    assert "rate limit" in str(err).lower()
+    assert "too frequent" in str(err).lower()
 
 
 def test_finished_without_output_default_message():
@@ -210,7 +192,6 @@ def test_handle_chat_retries_empty_sse_on_parent_zero():
             thinking=False,
             search=False,
             file_ids_=None,
-            search_sink=None,
         ):
             calls["send"] += 1
             if calls["send"] == 1:
@@ -248,10 +229,7 @@ def test_handle_chat_retries_empty_sse_on_parent_zero():
             ("delete_sessions_for_chat", lambda *a: None),
             ("save_session", lambda *a: None),
             ("parse_tools", lambda t: ([], t)),
-            (
-                "format_response",
-                lambda text, model, messages, tools=None, **kwargs: text,
-            ),
+            ("format_response", lambda text, model, messages, tools=None: text),
         ]
         saved = [(name, getattr(app_module, name)) for name, _ in patches]
         for name, fn in patches:
@@ -298,13 +276,15 @@ def test_handle_chat_rotates_to_another_token_on_429():
         thinking=False,
         search=False,
         file_ids_=None,
-        search_sink=None,
     ):
         calls["send"] += 1
         if calls["send"] == 1:
 
             async def fail_gen():
-                raise Exception("HTTP 429: Messages too frequent. Try again later.")
+                # B6: typed upstream status — the old string protocol is gone
+                raise functions.UpstreamError(
+                    429, "Messages too frequent. Try again later."
+                )
                 yield ""  # pragma: no cover
 
             return fail_gen()
@@ -323,7 +303,10 @@ def test_handle_chat_rotates_to_another_token_on_429():
     async def fake_prompt(messages, tools, model, is_first, rollover_summary=None):
         return "prompt"
 
-    def fake_limited(tid):
+    def fake_limited(tid, *a):
+        # P0-3: mark_limited now also receives the upstream status code; the
+        # recorded token id is what this test asserts on, so the stub takes
+        # the extra argument and still reports only the id.
         calls["limited"].append(tid)
 
     patches = [
@@ -341,7 +324,7 @@ def test_handle_chat_rotates_to_another_token_on_429():
         ("delete_sessions_for_chat", lambda *a: None),
         ("save_session", lambda *a: None),
         ("parse_tools", lambda t: ([], t)),
-        ("format_response", lambda text, model, messages, tools=None, **kwargs: text),
+        ("format_response", lambda text, model, messages, tools=None: text),
     ]
 
     async def run():
@@ -362,6 +345,99 @@ def test_handle_chat_rotates_to_another_token_on_429():
     assert calls["limited"] == [1]
 
 
+def test_handle_chat_rotates_on_40029_fetch_files():
+    import app as app_module
+
+    calls = {"files": 0, "limited": []}
+    session = {"token_id": 1, "session_id": "chat-40029", "parent_message_id": 20}
+    sig = "sig-40029-rotate"
+
+    async def fake_sig(messages, model, scope=""):
+        return sig
+
+    def fake_find(s):
+        if calls["files"] == 0:
+            return dict(session)
+        return None
+
+    def fake_pick(*a, **k):
+        return 2 if calls["files"] >= 1 else 1
+
+    def fake_get_token(tid):
+        return {"token": f"tok-{tid}", "status": "ACTIVE", "alias": f"t{tid}"}
+
+    def fake_send(
+        chat_id,
+        auth_token,
+        message,
+        parent,
+        thinking=False,
+        search=False,
+        file_ids_=None,
+    ):
+        async def ok_gen():
+            yield "ok after rotate"
+
+        return ok_gen()
+
+    async def fake_create_chat(token):
+        return f"new-chat-{token}"
+
+    async def fake_files(messages, token, last_user_only=False):
+        calls["files"] += 1
+        if calls["files"] == 1:
+            raise functions.UpstreamBizError(
+                429,
+                "file/fetch_files: code=40029 msg=TOO_MANY_REQUESTS",
+                biz_code=40029,
+                retry_after=60,
+            )
+        return []
+
+    async def fake_prompt(messages, tools, model, is_first, rollover_summary=None):
+        return "prompt"
+
+    def fake_limited(tid, *a):
+        calls["limited"].append((tid, a))
+
+    patches = [
+        ("get_auth_token", lambda: "tok"),
+        ("generate_signature", fake_sig),
+        ("find_session", fake_find),
+        ("pick_token", fake_pick),
+        ("get_token", fake_get_token),
+        ("send_message", fake_send),
+        ("create_new_chat", fake_create_chat),
+        ("extract_and_upload_files", fake_files),
+        ("build_prompt", fake_prompt),
+        ("mark_limited", fake_limited),
+        ("mark_active", lambda tid: None),
+        ("delete_sessions_for_chat", lambda *a: None),
+        ("save_session", lambda *a: None),
+        ("parse_tools", lambda t: ([], t)),
+        ("format_response", lambda text, model, messages, tools=None: text),
+    ]
+
+    async def run():
+        app_module._chat_locks.clear()
+        saved = [(name, getattr(app_module, name)) for name, _ in patches]
+        for name, fn in patches:
+            setattr(app_module, name, fn)
+        try:
+            return await app_module.handle_chat(
+                [{"role": "user", "content": "hi"}], "test-model"
+            )
+        finally:
+            for name, fn in saved:
+                setattr(app_module, name, fn)
+
+    assert asyncio.run(run()) == "ok after rotate"
+    assert calls["files"] == 2
+    assert len(calls["limited"]) == 1
+    assert calls["limited"][0][0] == 1
+    assert calls["limited"][0][1][0] == 40029
+
+
 TESTS = [
     test_sse_line_split_across_tcp_chunks,
     test_batch_append_after_quasi_finished,
@@ -369,6 +445,7 @@ TESTS = [
     test_finished_without_output_default_message,
     test_handle_chat_retries_empty_sse_on_parent_zero,
     test_handle_chat_rotates_to_another_token_on_429,
+    test_handle_chat_rotates_on_40029_fetch_files,
 ]
 
 

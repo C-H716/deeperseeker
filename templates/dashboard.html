@@ -1,467 +1,176 @@
 {% extends "base.html" %}
-{% block title %}控制台 · DeeperSeeker{% endblock %}
+{% block title %}Dashboard - DeeperSeeker{% endblock %}
 {% block content %}
-<div class="page-head">
-    <div>
-        <h1>控制台</h1>
-        <p class="page-sub">管理 DeepSeek 账号与 Token 号池</p>
+<h1>Dashboard</h1>
+
+<section>
+    <h2>Add Auth Token</h2>
+    <div class="steps">
+        <p><strong>Steps:</strong></p>
+        <ol>
+            <li>Open <strong>incognito/private</strong> window</li>
+            <li>Go to <a href="https://chat.deepseek.com" target="_blank">chat.deepseek.com</a> and login</li>
+            <li>Open DevTools (F12) → Console → paste:</li>
+        </ol>
+        <code>JSON.parse(localStorage.getItem("userToken")).value</code>
+        <ol start="4">
+            <li>Copy the token and paste below</li>
+            <li><strong>Remove any surrounding quotes</strong> — paste only the raw token string</li>
+            <li><strong>Close the incognito window</strong> to preserve the login</li>
+        </ol>
     </div>
-    <span class="pill">{{ accounts|length }} 个账号 · {{ tokens|length }} 个 Token</span>
-</div>
-
-{% if account_error %}<div class="alert alert-error">{{ account_error }}</div>{% endif %}
-{% if account_message %}<div class="alert alert-success">{{ account_message }}</div>{% endif %}
-
-<div class="layout">
-    <div class="col-main">
-        <section class="card">
-            <div class="card-head">
-                <h2>账号列表 <span class="badge">{{ accounts|length }}</span></h2>
-            </div>
-            {% if accounts %}
-            <div class="table-wrap">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>编号</th>
-                            <th>账号</th>
-                            <th>别名</th>
-                            <th>状态</th>
-                            <th>设备指纹</th>
-                            <th>最近登录</th>
-                            <th class="ta-right">操作</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for account in accounts %}
-                        <tr>
-                            <td class="mono muted">{{ account['id'] }}</td>
-                            <td>{{ account['email'] }}</td>
-                            <td>{{ account['alias'] or '—' }}</td>
-                            <td>
-                                <span class="status {% if account['status'] == 'ACTIVE' %}ok{% elif account['status'] == 'CHECK_ERROR' %}warn{% else %}err{% endif %}">
-                                    {% if account['status'] == 'ACTIVE' %}有效{% elif account['status'] == 'INVALID' %}已失效{% elif account['status'] == 'RATE_LIMITED' %}被限流{% else %}检查失败{% endif %}
-                                </span>
-                            </td>
-                            <td>
-                                {% if account.get('device_id') %}<span class="status ok" title="按账号持久化，自动重登复用同一指纹">已绑定</span>{% else %}<span class="status warn" title="未填写指纹，使用全局兜底或浏览器自动采集">未绑定</span>{% endif %}
-                            </td>
-                            <td class="muted nowrap">{{ account['last_login_at'] or '未登录' }}</td>
-                            <td class="ta-right nowrap">
-                                <form method="post" action="/accounts/{{ account['id'] }}/delete" class="inline-form"
-                                      onsubmit="return confirm('确定删除这个账号及其 Token 吗？')">
-                                    <button type="submit" class="btn-sm btn-danger">删除</button>
-                                </form>
-                            </td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            </div>
-            {% else %}
-            <div class="empty">还没有通过账号登录添加账号。</div>
-            {% endif %}
-        </section>
-
-        <section class="card">
-            <div class="card-head">
-                <h2>Token 号池 <span class="badge">{{ tokens|length }}</span></h2>
-                <button type="button" id="check-all" class="btn-sm btn-secondary">立即检查全部</button>
-            </div>
-            <div class="card-note">
-                <p>系统每 {{ (check_interval // 60) }} 分钟自动检查一次，检查只调用认证探测接口，不发送模型消息。</p>
-                <p id="check-message" aria-live="polite">
-                    {% if token_check_state.last_run_at %}上次检查：{{ token_check_state.last_run_at }}{% else %}尚未执行检查{% endif %}
-                </p>
-            </div>
-            {% if tokens %}
-            <div class="table-wrap">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>编号</th>
-                            <th>别名</th>
-                            <th>Token</th>
-                            <th>状态</th>
-                            <th>说明</th>
-                            <th>占用</th>
-                            <th>转移</th>
-                            <th>最近检查</th>
-                            <th class="ta-right">操作</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for tok in tokens %}
-                        <tr data-token-id="{{ tok['id'] }}">
-                            <td class="mono muted">{{ tok['id'] }}</td>
-                            <td>{{ tok['alias'] or '—' }}{% if tok['account_id'] %} <span class="status ok" title="桥内登录产生（安卓形态），令牌失效可自动重登">桥内</span>{% else %} <span class="status warn" title="浏览器粘贴的令牌，跨环境使用可能被整体吊销，建议改用桥内登录">浏览器</span>{% endif %}</td>
-                            <td><code class="nowrap">{{ tok['token'][:12] }}…{{ tok['token'][-4:] }}</code></td>
-                            <td data-cell="status">
-                                <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] in ('RATE_LIMITED', 'CHECK_ERROR', 'MUTED') %}warn{% else %}err{% endif %}" {% if tok.get('quarantine_reason') %}title="{{ tok.get('quarantine_reason') }}"{% endif %}>
-                                    {% if tok['status'] == 'ACTIVE' %}有效{% elif tok['status'] == 'RATE_LIMITED' %}被限流{% elif tok['status'] == 'INVALID' %}已失效{% elif tok['status'] == 'CHECK_ERROR' %}检查失败{% elif tok['status'] == 'QUARANTINED' %}已隔离{% elif tok['status'] == 'MUTED' %}确认禁言{% elif tok['status'] == 'PARKED' %}需人机验证{% else %}{{ tok['status'] }}{% endif %}
-                                </span>
-                            </td>
-                            <td class="muted nowrap" data-cell="note">{{ tok['state_note'] }}</td>
-                            <td class="nowrap" data-cell="inflight">
-                                {% set busy = inflight.get(tok['id'], 0) %}
-                                <span class="status {% if busy %}busy{% else %}idle{% endif %}">
-                                    {% if busy %}使用中 {{ busy }}{% if concurrency_cap %} / {{ concurrency_cap }}{% endif %}{% else %}空闲{% endif %}
-                                </span>
-                            </td>
-                            <td class="muted nowrap" data-cell="rotation">
-                                {% set rot = rotation_stats.get(tok['id']) %}
-                                {% if rot and (rot.out or rot.in) %}
-                                    转出 {{ rot.out }} · 转入 {{ rot.in }}
-                                    {% if rot.last_at %}<span class="sub">最近 {{ rot.last_at|fmt_ts }}</span>{% endif %}
-                                {% else %}
-                                    —
-                                {% endif %}
-                            </td>
-                            <td class="muted nowrap" data-cell="check">
-                                {% if tok['last_checked_at'] %}{{ tok['last_checked_at'] }}{% else %}未检查{% endif %}
-                                {% if tok['last_check_error'] %}<span class="check-error" title="{{ tok['last_check_error'] }}">⚠</span>{% endif %}
-                            </td>
-                            <td class="ta-right nowrap">
-                                {% if tok['can_restore'] %}
-                                <form method="post" action="/tokens/{{ tok['id'] }}/restore" class="inline-form">
-                                    <button type="submit" class="btn-sm btn-secondary">恢复</button>
-                                </form>
-                                {% endif %}
-                                <button type="button" class="btn-sm btn-secondary check-one" data-token-id="{{ tok['id'] }}">检查</button>
-                                <form method="post" action="/tokens/{{ tok['id'] }}/delete" class="inline-form"
-                                      onsubmit="return confirm('确定删除这个 Token 吗？')">
-                                    <button type="submit" class="btn-sm btn-danger">删除</button>
-                                </form>
-                            </td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            </div>
-            {% else %}
-            <div class="empty">号池中还没有 Token。</div>
-            {% endif %}
-        </section>
+    <div class="warning">
+        If you logout from DeepSeek in browser, this token stops working.
     </div>
-
-    <aside class="col-side">
-        <section class="card">
-            <div class="card-head">
-                <h2>添加 DeepSeek 账号（推荐）</h2>
-            </div>
-            <div class="card-body">
-                <p class="hint">按官方安卓 App 形态在桥内直接登录，会话出生与使用都在本服务内，避免浏览器令牌跨环境使用被整体吊销；同一账号始终复用同一设备指纹，令牌失效时按 6 小时间隔自动重登。密码经本地密钥加密后仅存于本机数据库，不写入日志、不返回页面。</p>
-                <p class="hint">若部署在数据中心 IP，登录端点可能被 WAF 挑战（HTTP 202 空响应）；上游也可能要求邮箱验证码或图形验证。这两类都无法在服务端自动完成，请在浏览器完整登录（含验证码）后用下方「粘贴浏览器 Token」加入。</p>
-                <form method="post" action="/accounts/add" class="stack">
-                    <label class="field">
-                        <span>别名（可选）</span>
-                        <input type="text" name="alias" placeholder="例如：个人">
-                    </label>
-                    <label class="field">
-                        <span>邮箱或手机号</span>
-                        <input type="text" name="account" placeholder="you@example.com 或 13800138000" required autocomplete="off">
-                    </label>
-                    <label class="field">
-                        <span>密码</span>
-                        <input type="password" name="password" placeholder="请输入账号密码" required autocomplete="new-password">
-                    </label>
-                    <label class="field">
-                        <span>设备指纹（可选，强烈建议填写）</span>
-                        <input type="text" name="device_id" placeholder="SMSdk.getDeviceId() 返回的 base64 串" autocomplete="off">
-                    </label>
-                    <details class="guide">
-                        <summary>设备指纹怎么获取？为什么建议填写？</summary>
-                        <p>真实安卓 App 登录时，请求体会携带数美（SMSdk）生成的设备指纹（约 89 字符的 base64 串）。随机或伪造的 UUID 会被风控以 <code>RISK_DEVICE_DETECTED</code>（biz_code=11）直接拒绝。</p>
-                        <ol>
-                            <li>Chrome 打开 <a href="https://chat.deepseek.com" target="_blank" rel="noopener">chat.deepseek.com</a>（不需要登录），等页面完全加载</li>
-                            <li>F12 → Console，执行 <code>SMSdk.getDeviceId()</code></li>
-                            <li>把输出的 base64 串粘贴到上方输入框</li>
-                        </ol>
-                        <p>留空时依次回退到该账号已保存的指纹、<code>DEEPSEEKER_DEVICE_ID</code>、本机缓存或浏览器自动采集；仍失败才使用结构化占位值，此时登录大概率被风控拒绝。同一账号请始终使用同一个指纹，桥会记住并在自动重登时复用。</p>
-                    </details>
-                    <button type="submit" class="btn-block">登录并加入号池</button>
-                </form>
-            </div>
-        </section>
-
-        <section class="card">
-            <div class="card-head">
-                <h2>粘贴浏览器 Token（应急备用）</h2>
-            </div>
-            <div class="card-body">
-                <div class="warning">2026 年 11 月起，上游会整体吊销「浏览器出生、跨环境使用」的会话：粘贴的令牌可能几分钟内失效，并使浏览器端同时退出登录，表现为频繁封号与反复重新提取。请优先使用上方「添加 DeepSeek 账号」。</div>
-                <details class="guide">
-                    <summary>如何获取 Token？</summary>
-                    <ol>
-                        <li>打开浏览器无痕/隐私窗口</li>
-                        <li>访问 <a href="https://chat.deepseek.com" target="_blank" rel="noopener">chat.deepseek.com</a> 并登录</li>
-                        <li>打开开发者工具（F12）→ Console，粘贴并回车：</li>
-                    </ol>
-                    <code class="block">JSON.parse(localStorage.getItem("userToken")).value</code>
-                    <ol start="4">
-                        <li>复制返回的 Token，去掉首尾引号</li>
-                        <li>关闭无痕窗口以保留登录状态</li>
-                    </ol>
-                </details>
-                <form method="post" action="/tokens/add" class="stack">
-                    <label class="field">
-                        <span>别名（可选）</span>
-                        <input type="text" name="alias" placeholder="例如：个人、工作">
-                    </label>
-                    <label class="field">
-                        <span>Token</span>
-                        <input type="text" name="auth_token" placeholder="粘贴 Token（不要带引号）">
-                    </label>
-                    <button type="submit" class="btn-block">添加 Token</button>
-                </form>
-            </div>
-        </section>
-
-        <section class="card">
-            <div class="card-head">
-                <h2>功能开关</h2>
-            </div>
-            <div class="card-body">
-                <p class="hint">提示词增强 <span id="effort-state" class="status idle">读取中…</span>
-                    <button type="button" id="effort-btn" class="btn-sm btn-secondary">切换</button>
-                </p>
-                <p class="hint">当客户端请求写了 <code>reasoning_effort=max</code> 等高强度档位时，给模型附加一段「多角度验证、逐步检查」的强化指令；关闭后完全按模型默认方式回答。设置即时生效，无需重启。</p>
-            </div>
-        </section>
-
-        <section class="card">
-            <div class="card-head">
-                <h2>接口信息</h2>
-            </div>
-            <div class="card-body">
-                <dl class="kv">
-                    <dt>OpenAI 兼容</dt>
-                    <dd><code>http://localhost:4000/v1</code></dd>
-                    <dt>Anthropic 兼容</dt>
-                    <dd><code>http://localhost:4000</code></dd>
-                    <dt>默认模型</dt>
-                    <dd><code>v4.1flash</code></dd>
-                </dl>
-                <p class="hint">
-                    <button type="button" id="link-btn" class="btn-sm btn-secondary" onclick="checkLink()">检测链路</button>
-                    <span id="link-result" class="muted">未检测</span>
-                </p>
-                <p class="hint">只读探测「面板 → 上游」链路，不创建会话、不发送消息；结果不代表客户端 API 的真实可用性。</p>
-            </div>
-        </section>
-    </aside>
-</div>
-
-<script>
-// ---- 提示词增强总开关 ----
-const effortState = document.getElementById('effort-state');
-const effortBtn = document.getElementById('effort-btn');
-
-function renderEffort(on) {
-    effortState.textContent = on ? '已开启' : '已关闭';
-    effortState.className = 'status ' + (on ? 'ok' : 'idle');
-    effortBtn.textContent = on ? '关闭' : '开启';
-    effortBtn.dataset.on = on ? '1' : '0';
-}
-
-async function refreshEffort() {
-    try {
-        const response = await fetch('/features/effort-enhance', {headers: {'Accept': 'application/json'}});
-        if (!response.ok) return;
-        const data = await response.json();
-        renderEffort(data.effort_enhance);
-    } catch (error) {
-        effortState.textContent = '读取失败';
-    }
-}
-
-effortBtn.addEventListener('click', async () => {
-    const enabled = effortBtn.dataset.on !== '1';
-    effortBtn.disabled = true;
-    try {
-        const response = await fetch('/features/effort-enhance', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
-            body: JSON.stringify({enabled: enabled}),
-        });
-        const data = await response.json();
-        renderEffort(data.effort_enhance);
-    } catch (error) {
-        effortState.textContent = '设置失败';
-    } finally {
-        effortBtn.disabled = false;
-    }
-});
-refreshEffort();
-
-async function checkLink() {
-    const result = document.getElementById('link-result');
-    const btn = document.getElementById('link-btn');
-    result.textContent = '检测中…';
-    btn.disabled = true;
-    try {
-        const response = await fetch('/dashboard/deep-health', {headers: {'Accept': 'application/json'}});
-        if (!response.ok) throw new Error('HTTP ' + response.status);
-        const data = await response.json();
-        result.textContent = data.upstream_reachable
-            ? `链路正常 · 延迟 ${data.latency_ms ?? '—'} ms`
-            : `异常：${data.reason || '上游不可达'}`;
-    } catch (error) {
-        result.textContent = '检测请求失败';
-    } finally {
-        btn.disabled = false;
-    }
-}
-
-const message = document.getElementById('check-message');
-const checkButtons = document.querySelectorAll('.check-one');
-const checkAll = document.getElementById('check-all');
-async function checkToken(tokenId) {
-    const url = tokenId ? `/tokens/check?token_id=${encodeURIComponent(tokenId)}` : '/tokens/check';
-    message.textContent = '正在检查，请稍候…';
-    checkButtons.forEach(button => button.disabled = true);
-    if (checkAll) checkAll.disabled = true;
-    try {
-        const response = await fetch(url, {method: 'POST', headers: {'Accept': 'application/json'}});
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || '检查失败');
-        const problems = data.results.filter(r => r.error);
-        const summary = problems.length
-            ? `，${problems.length} 个需处理：${problems[0].error}`
-            : '';
-        message.textContent = `检查完成：${data.results.length} 个 Token${summary}，页面即将刷新`;
-        window.setTimeout(() => window.location.reload(), 500);
-    } catch (error) {
-        message.textContent = `检查失败：${error.message}`;
-        checkButtons.forEach(button => button.disabled = false);
-        if (checkAll) checkAll.disabled = false;
-    }
-}
-checkButtons.forEach(button => button.addEventListener('click', () => checkToken(button.dataset.tokenId)));
-if (checkAll) checkAll.addEventListener('click', () => checkToken(null));
-
-// ---- 号池实时轮询 ----
-// 每 3 秒拉一次 /dashboard/status，只重绘「状态 / 占用 / 转移 / 最近检查」四列。
-// 不用整页刷新：整页刷新会打断正在进行的检查、清空表单输入，也会让滚动位置跳动。
-const POLL_MS = 3000;
-const STATUS_META = {
-    ACTIVE: ['ok', '有效'],
-    RATE_LIMITED: ['warn', '被限流'],
-    INVALID: ['err', '已失效'],
-    CHECK_ERROR: ['warn', '检查失败'],
-    QUARANTINED: ['err', '已隔离'],
-    MUTED: ['warn', '确认禁言'],
-    PARKED: ['warn', '需人机验证'],
-};
-const pad2 = value => String(value).padStart(2, '0');
-
-// 与后端 _fmt_ts 过滤器保持同一格式（MM-DD HH:MM:SS，本地时间）。
-function fmtEpoch(sec) {
-    if (!sec) return '';
-    const d = new Date(sec * 1000);
-    return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ` +
-           `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
-}
-
-function renderStatus(cell, tok, now) {
-    const [cls, label] = STATUS_META[tok.status] || ['', tok.status];
-    const span = document.createElement('span');
-    span.className = `status ${cls}`;
-    // 冷却中的账号显示剩余秒数，「被限流」才不是一个静止的词。
-    if (tok.status === 'RATE_LIMITED' && tok.limited_until && tok.limited_until > now) {
-        span.textContent = `${label} ${Math.ceil(tok.limited_until - now)}s`;
-        span.title = '限流冷却中，到期后自动恢复';
-    } else {
-        span.textContent = label;
-    }
-    // 隔离原因由后端落库，悬停即可看到具体诊断与解禁时间。
-    if (tok.quarantine_reason) {
-        span.title = tok.quarantine_reason;
-    }
-    cell.replaceChildren(span);
-}
-
-function renderInflight(cell, tok, cap) {
-    const span = document.createElement('span');
-    span.className = `status ${tok.inflight ? 'busy' : 'idle'}`;
-    span.textContent = tok.inflight
-        ? `使用中 ${tok.inflight}${cap ? ` / ${cap}` : ''}`
-        : '空闲';
-    cell.replaceChildren(span);
-}
-
-function renderRotation(cell, rot) {
-    if (!rot || (!rot.out && !rot.in)) {
-        cell.textContent = '—';
-        return;
-    }
-    cell.textContent = `转出 ${rot.out} · 转入 ${rot.in}`;
-    if (rot.last_at) {
-        const sub = document.createElement('span');
-        sub.className = 'sub';
-        sub.textContent = `最近 ${fmtEpoch(rot.last_at)}`;
-        cell.appendChild(sub);
-    }
-}
-
-function renderCheck(cell, tok) {
-    cell.textContent = tok.last_checked_at || '未检查';
-    if (tok.last_check_error) {
-        const warn = document.createElement('span');
-        warn.className = 'check-error';
-        warn.title = tok.last_check_error;
-        warn.textContent = '⚠';
-        cell.appendChild(warn);
-    }
-}
-
-let pollTimer = null;
-async function pollPool() {
-    pollTimer = null;
-    try {
-        const response = await fetch('/dashboard/status', {headers: {'Accept': 'application/json'}});
-        // 会话失效时不跳转：交给下一次整页操作或手动刷新去登录页，避免死循环。
-        if (response.status === 401) return;
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json();
-        const byId = new Map(data.tokens.map(tok => [String(tok.id), tok]));
-        document.querySelectorAll('tr[data-token-id]').forEach(row => {
-            const tok = byId.get(row.dataset.tokenId);
-            if (!tok) return;  // 表格已过期（新增/删除了账号），等整页刷新
-            const statusCell = row.querySelector('[data-cell="status"]');
-            if (statusCell) renderStatus(statusCell, tok, data.now);
-            const noteCell = row.querySelector('[data-cell="note"]');
-            if (noteCell && tok.state_note) noteCell.textContent = tok.state_note;
-            const inflightCell = row.querySelector('[data-cell="inflight"]');
-            if (inflightCell) renderInflight(inflightCell, tok, data.concurrency_cap);
-            const rotationCell = row.querySelector('[data-cell="rotation"]');
-            if (rotationCell) renderRotation(rotationCell, tok.rotation);
-            const checkCell = row.querySelector('[data-cell="check"]');
-            if (checkCell) renderCheck(checkCell, tok);
-        });
-    } catch (error) {
-        // 网络抖动或后端重启：静默跳过本轮，下一轮继续，不打扰用户。
-    }
-    if (!document.hidden) pollTimer = setTimeout(pollPool, POLL_MS);
-}
-
-function startPolling() {
-    if (pollTimer !== null) return;
-    if (!document.querySelector('tr[data-token-id]')) return;  // 号池为空，无需轮询
-    pollTimer = setTimeout(pollPool, POLL_MS);
-}
-
-// 标签页不可见时停掉轮询，切回来立刻补一次，避免后台空转。
-document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-        if (pollTimer !== null) {
-            clearTimeout(pollTimer);
-            pollTimer = null;
+    <form method="post" action="/tokens/add" id="add-token-form">
+        <input type="text" name="alias" placeholder="Alias (optional, e.g. personal, work)" style="width:200px">
+        <input type="text" name="auth_token" id="auth-token-input" placeholder="Paste auth token here (quotes & value: trimmed automatically)" style="width:400px">
+        <button type="submit">Add Token</button>
+    </form>
+    <script>
+    (function() {
+        const inp = document.getElementById('auth-token-input');
+        if (!inp) return;
+        function clean(v) {
+            if (!v) return v;
+            let s = v.trim();
+            if (s.startsWith('{') && s.includes('value')) {
+                try {
+                    const p = JSON.parse(s);
+                    if (p && p.value) s = String(p.value).trim();
+                } catch(e) {}
+            }
+            s = s.replace(/^(?:"?value"?)\s*[:=]\s*/i, '').trim();
+            while ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+                s = s.slice(1, -1).trim();
+            }
+            return s;
         }
-    } else {
-        startPolling();
-    }
-});
-startPolling();
-</script>
+        inp.addEventListener('paste', function() {
+            setTimeout(function() { inp.value = clean(inp.value); }, 10);
+        });
+        inp.addEventListener('change', function() { inp.value = clean(inp.value); });
+        const form = document.getElementById('add-token-form');
+        if (form) {
+            form.addEventListener('submit', function() { inp.value = clean(inp.value); });
+        }
+    })();
+    </script>
+</section>
+
+<section>
+    <h2>Token pool ({{ tokens|length }})</h2>
+    {% if tokens %}
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Alias</th>
+                <th>State</th>
+                <th>In-flight</th>
+                <th>Last used</th>
+                <th>Cooldown</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for tok in tokens %}
+            <tr>
+                <td>{{ tok['id'] }}</td>
+                <td>{{ tok['label'] }}</td>
+                <td>
+                    <span class="status {{ tok['state_class'] }}">{{ tok['status'] }}</span>
+                    <div class="state-note">{{ tok['state_note'] }}</div>
+                </td>
+                <td>{{ tok['in_flight'] }}</td>
+                <td>{{ tok['last_used'] }}</td>
+                <td>{{ tok['cooldown'] }}</td>
+                <td>
+                    {% if tok['can_solve_captcha'] %}
+                    <form method="post" action="/tokens/{{ tok['id'] }}/solve_captcha" style="display:inline"
+                          onsubmit="return confirm('A browser window will now open to solve captcha challenge captcha. Send any prompt in a new chat, solve the captcha, then close the browser. DO NOT FORGET TO CLICK THE Restore BUTTON IN THE PANEL AFTERWARDS.')">
+                        <button type="submit" class="btn-sm" style="background:#d97706;color:#fff;" title="Open real browser with this account on chat.deepseek.com to solve captcha">Solve Captcha</button>
+                    </form>
+                    {% endif %}
+                    {% if tok['can_restore'] %}
+                    <form method="post" action="/tokens/{{ tok['id'] }}/restore" style="display:inline">
+                        <button type="submit" class="btn-sm">Restore</button>
+                    </form>
+                    {% endif %}
+                    <form method="post" action="/tokens/{{ tok['id'] }}/purge" style="display:inline"
+                          onsubmit="return confirm('This button will delete all your chats and disable captcha challenge tracking, possibly lowering account captcha with frequent purging. Are you sure?')">
+                        <button type="submit" class="btn-sm">Purge Chats</button>
+                    </form>
+                    <form method="post" action="/tokens/{{ tok['id'] }}/delete" style="display:inline"
+                          onsubmit="return confirm('Delete?')">
+                        <button type="submit" class="btn-sm btn-danger">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    <div style="margin-top: 10px; margin-bottom: 10px;">
+        <form method="post" action="/tokens/purge_all" style="display:inline"
+              onsubmit="return confirm('This button will delete all your chats and disable captcha challenge tracking, possibly lowering account captcha with frequent purging. Are you sure?')">
+            <button type="submit" class="btn-sm">Purge All Chats</button>
+        </form>
+    </div>
+    <p class="state-note">
+        RATE_LIMITED cools down and rejoins by itself. QUARANTINED never does —
+        an auth failure or a repeated 403 takes the token out until Restore puts
+        it back. No token material is shown on this page.
+    </p>
+    {% else %}
+    <p>No tokens yet.</p>
+    {% endif %}
+</section>
+
+<section>
+    <h2>Usage — last 30 days (per day × per key)</h2>
+    {% if usage_rows %}
+    <table>
+        <thead>
+            <tr>
+                <th>Day (UTC)</th>
+                <th>Key</th>
+                <th>Surfaces</th>
+                <th>Requests</th>
+                <th>Input tok</th>
+                <th>Output tok</th>
+                <th>Cost (est.)</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in usage_rows %}
+            <tr>
+                <td>{{ row['day'] }}</td>
+                <td>{{ row['key'] }}</td>
+                <td>{{ row['surfaces'] }}</td>
+                <td>{{ row['requests'] }}</td>
+                <td>{{ row['input_tokens'] }}</td>
+                <td>{{ row['output_tokens'] }}</td>
+                <td>${{ '%.6f'|format(row['cost']) }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    <p class="state-note">
+        One row per completed turn — failed attempts and streamed retries never
+        double-count. Tokens are billed on the cleaned reply. Cost is an
+        estimate from the flat tariff table shipped with the bridge
+        (input $0.44/M, output $1.32/M), not upstream metering. Key aliases are
+        masked; no key or token material appears on this page.
+    </p>
+    {% else %}
+    <p class="state-note">No usage recorded yet. A key with no traffic shows no rows — honest zeros, not blanks.</p>
+    {% endif %}
+</section>
+
+<section>
+    <h2>API</h2>
+    <p>OpenAI: <code>http://localhost:4000/v1</code></p>
+    <p>Anthropic: <code>http://localhost:4000</code></p>
+    <p>Model: <code>v4.1flash</code> (single default DeepSeek model)</p>
+</section>
 {% endblock %}

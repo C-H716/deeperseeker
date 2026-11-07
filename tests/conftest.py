@@ -16,3 +16,30 @@ os.environ.setdefault("HOST", "127.0.0.1")
 # 而 load_dotenv 默认不覆盖已存在的环境变量，因此这里先以空值占位：键存在即被
 # 跳过，安全用例得以继续验证「默认拒绝」这一被测语义。
 os.environ.setdefault("DEEPSEEKER_ALLOW_DEFAULT_ADMIN", "")
+
+# 以下用例针对 PR #107 基线之前的本地实现（TokenLease、ReasoningMarkupFilter、
+# 自研 SSE 事件解析、pool_state_note 等）。基线切换后这些组件由 PR 的另一套
+# 实现替代，接口不同，暂不参与收集；待逐个功能重新叠加时再改写。
+collect_ignore = [
+    "test_anti_ban.py",
+    "test_context_rollover.py",
+    "test_effort_switch.py",
+    "test_local_fixes.py",
+    "test_nested_arguments.py",
+    "test_park.py",
+    "test_pool_ops.py",
+    "test_prompt_cache_accounting.py",
+    "test_real_parent.py",
+    "test_responses_api.py",
+    "test_stream_edge_cases.py",
+    "test_token_pool_balance.py",
+    "test_deep_health.py",
+    "test_deepseek_sse.py",
+    "test_dsml_decorated_json.py",
+    "test_minor_fixes.py",
+    "test_pow_prefetch.py",
+    "test_rate_limit_failover.py",
+    "test_rollover_suppression.py",
+    "test_tag_drift.py",
+    "test_usage_stats.py",
+]
