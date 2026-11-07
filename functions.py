@@ -1198,7 +1198,9 @@ def pool_state_note(tok):
     status = tok.get("status")
     reason = str(tok.get("quarantine_reason") or "")
     lowered = reason.lower()
-    if status in ("QUARANTINED", "MUTED"):
+    if status == "MUTED":
+        return "muted", "上游确认禁言，解禁后点「恢复」即可使用"
+    if status == "QUARANTINED":
         if "muted" in lowered or "禁言" in reason:
             return "muted", "上游确认禁言，解禁后点「恢复」即可使用"
         if "auth" in lowered or "401" in reason:
