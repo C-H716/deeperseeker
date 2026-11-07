@@ -73,7 +73,6 @@ from functions import (  # noqa: E402
     mark_active,
     mark_limited,
     mark_quarantined,
-    next_parent,
     parse_tools,
     peek_cached_input,
     pick_token,
@@ -89,6 +88,7 @@ from functions import (  # noqa: E402
     restore_token,
     save_account_login,
     save_session,
+    saved_parent,
     send_message,
     set_effort_enhance,
     token_busy,
@@ -1340,14 +1340,14 @@ async def handle_chat(
                             sig,
                             new_token_id,
                             new_session_id,
-                            next_parent(0),
+                            saved_parent(new_session_id, 0),
                         )
                         await _db(
                             save_session,
                             next_sig,
                             new_token_id,
                             new_session_id,
-                            next_parent(0),
+                            saved_parent(new_session_id, 0),
                         )
                         if (
                             is_responses
@@ -1360,7 +1360,7 @@ async def handle_chat(
                                 r_id,
                                 new_token_id,
                                 new_session_id,
-                                next_parent(0),
+                                saved_parent(new_session_id, 0),
                             )
                             _store_response_history(r_id, next_messages)
                         if rot_owner is not None:
@@ -1679,14 +1679,18 @@ async def handle_chat(
             next_sig = await generate_signature(next_messages, model, scope)
 
             await _db(
-                save_session, sig, token_id, session_id, next_parent(parent_message_id)
+                save_session,
+                sig,
+                token_id,
+                session_id,
+                saved_parent(session_id, parent_message_id),
             )
             await _db(
                 save_session,
                 next_sig,
                 token_id,
                 session_id,
-                next_parent(parent_message_id),
+                saved_parent(session_id, parent_message_id),
             )
             if (
                 is_responses
@@ -1699,7 +1703,7 @@ async def handle_chat(
                     r_id,
                     token_id,
                     session_id,
-                    next_parent(parent_message_id),
+                    saved_parent(session_id, parent_message_id),
                 )
                 _store_response_history(r_id, next_messages)
             in_tokens = count_tok(_messages_text(messages))
@@ -1995,14 +1999,18 @@ async def stream_response(
             next_messages.append(ast_msg)
             next_sig = generate_signature_sync(next_messages, model, scope)
             await _db(
-                save_session, sig, token_id, session_id, next_parent(parent_message_id)
+                save_session,
+                sig,
+                token_id,
+                session_id,
+                saved_parent(session_id, parent_message_id),
             )
             await _db(
                 save_session,
                 next_sig,
                 token_id,
                 session_id,
-                next_parent(parent_message_id),
+                saved_parent(session_id, parent_message_id),
             )
 
         if not aborted and not failed:
@@ -2192,14 +2200,18 @@ async def stream_anthropic_response(
             next_messages.append(ast_msg)
             next_sig = generate_signature_sync(next_messages, model, scope)
             await _db(
-                save_session, sig, token_id, session_id, next_parent(parent_message_id)
+                save_session,
+                sig,
+                token_id,
+                session_id,
+                saved_parent(session_id, parent_message_id),
             )
             await _db(
                 save_session,
                 next_sig,
                 token_id,
                 session_id,
-                next_parent(parent_message_id),
+                saved_parent(session_id, parent_message_id),
             )
             _remember_prompt_tokens(next_sig, in_tokens)
 
@@ -3281,21 +3293,25 @@ async def stream_responses_response(
             next_messages.append(ast_msg)
             next_sig = generate_signature_sync(next_messages, model, scope)
             await _db(
-                save_session, sig, token_id, session_id, next_parent(parent_message_id)
+                save_session,
+                sig,
+                token_id,
+                session_id,
+                saved_parent(session_id, parent_message_id),
             )
             await _db(
                 save_session,
                 next_sig,
                 token_id,
                 session_id,
-                next_parent(parent_message_id),
+                saved_parent(session_id, parent_message_id),
             )
             await _db(
                 save_session,
                 resp_id,
                 token_id,
                 session_id,
-                next_parent(parent_message_id),
+                saved_parent(session_id, parent_message_id),
             )
             _store_response_history(resp_id, next_messages)
 

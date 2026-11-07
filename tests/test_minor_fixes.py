@@ -186,6 +186,9 @@ def test_responses_format_and_stream():
         send_message=fake_send,
         mark_active=lambda tid: None,
         find_session=lambda s: sessions_store.get(s),
+        # 该用例验证 Responses 的格式与 previous_response_id 传递，会话推进
+        # 沿用 +2 语义；真实编号逻辑由 test_real_parent.py 覆盖。
+        saved_parent=lambda sid, prev=0: (prev or 0) + 2,
         save_session=lambda s, tid, sid, pid=0: sessions_store.__setitem__(
             s, {"token_id": tid, "session_id": sid, "parent_message_id": pid}
         ),

@@ -2129,6 +2129,9 @@ def prune_sessions():
 
 
 def save_session(sig, token_id, session_id, parent_message_id=0):
+    if parent_message_id is None:
+        # 本轮没有真实编号广播：上游是否入库未知，保留原映射、不推进链路。
+        return
     conn = get_db()
     conn.execute(
         """INSERT OR REPLACE INTO sessions (signature, token_id, deepseek_session_id, parent_message_id)
@@ -2153,8 +2156,57 @@ def delete_session(sig):
     conn.close()
 
 
+# ── 真实回复编号（移植自 1515asd/rh-deeperseeker v85）────────────────────
+# 2026-10-31 起上游在流首 ready 事件广播真实消息编号（request_message_id /
+# response_message_id）。协议变更后 parent 链必须只认真实编号：+2 猜测会把
+# 链路推进到确定无效的编号，引发 biz_code 26 的连环失败。
+_REAL_PARENT_ENABLED = os.getenv("DEEPSEEKER_REAL_PARENT", "1").strip().lower() not in (
+    "0",
+    "false",
+    "off",
+)
+_LAST_REAL_PARENT: OrderedDict = OrderedDict()
+_MAX_REAL_PARENT = 4096
+
+
+def remember_real_parent(chat_id, response_message_id):
+    """记录上游广播的真实回复编号；有界字典防止长跑进程无限增长。"""
+    if not chat_id or not isinstance(response_message_id, int):
+        return
+    _LAST_REAL_PARENT[chat_id] = response_message_id
+    _LAST_REAL_PARENT.move_to_end(chat_id)
+    while len(_LAST_REAL_PARENT) > _MAX_REAL_PARENT:
+        _LAST_REAL_PARENT.popitem(last=False)
+
+
+def saved_parent(chat_id, prev_parent=None):
+    """返回上游广播的真实回复编号；本轮无广播时返回 None。
+
+    无广播意味着上游未入库、链路状态未知，调用方必须跳过 save_session
+    保留原映射，绝不能写入猜测值。prev_parent 仅用于兼容调用点签名；在
+    DEEPSEEKER_REAL_PARENT=0 的应急回退模式下按旧语义返回 prev_parent + 2。
+    """
+    if not _REAL_PARENT_ENABLED:
+        return (prev_parent or 0) + 2
+    return _LAST_REAL_PARENT.get(chat_id)
+
+
+def _extract_response_message_id(payload):
+    """从上游 SSE 事件中取真实回复编号，兼容顶层与 data / v 包裹。"""
+    if not isinstance(payload, dict):
+        return None
+    for candidate in (payload, payload.get("data"), payload.get("v")):
+        if isinstance(candidate, dict):
+            value = candidate.get("response_message_id")
+            if isinstance(value, int) and value > 0:
+                return value
+    return None
+
+
 def next_parent(parent_message_id):
-    """Compute the parent_message_id to use for the next turn on a chat session.
+    """[已废弃] 旧协议的 +2 猜测；仅为兼容既有导入保留，不应再被调用。
+
+    Compute the parent_message_id to use for the next turn on a chat session.
 
     Invariant: each successful /chat/completion request appends exactly one user
     message and one assistant message to the DeepSeek chat session, so if the
@@ -4252,6 +4304,12 @@ async def _send_message_unlocked(
                 continue
             recent_events.append(data)
             recent_events = recent_events[-5:]
+
+            # 移植自 1515asd/rh-deeperseeker v85：记录上游广播的真实回复
+            # 编号，供 app 层 save_session 推进会话映射。
+            _real_id = _extract_response_message_id(data)
+            if _real_id is not None:
+                remember_real_parent(chat_id, _real_id)
 
             # 移植自 1515asd/rh-deeperseeker v89.7：禁言报文藏在外层
             # code=0 的嵌套业务信封里，只按外层状态判断会把它当成正常
