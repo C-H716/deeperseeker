@@ -151,6 +151,7 @@
             </div>
             <div class="card-body">
                 <p class="hint">按官方安卓 App 形态在桥内直接登录，会话出生与使用都在本服务内，避免浏览器令牌跨环境使用被整体吊销；同一账号始终复用同一设备指纹，令牌失效时按 6 小时间隔自动重登。密码经本地密钥加密后仅存于本机数据库，不写入日志、不返回页面。</p>
+                <p class="hint">若部署在数据中心 IP，登录端点可能被 WAF 挑战（HTTP 202 空响应）；上游也可能要求邮箱验证码或图形验证。这两类都无法在服务端自动完成，请在浏览器完整登录（含验证码）后用下方「粘贴浏览器 Token」加入。</p>
                 <form method="post" action="/accounts/add" class="stack">
                     <label class="field">
                         <span>别名（可选）</span>

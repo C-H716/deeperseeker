@@ -929,6 +929,15 @@ async def login_deepseek_account(account, password, device_id=None):
             response.status,
             response_for_log,
         )
+        if response.status == 202:
+            # AWS WAF 按出口 IP 挑战登录端点：数据中心 IP 上返回 202 与空
+            # text/html，而对话端点（pow、users/current）仍正常。这是 IP
+            # 信誉判定，不是 TLS/UA/头部问题，服务端无法自行绕过。
+            raise AccountLoginError(
+                "waf_challenge",
+                "登录端点被 WAF 挑战（HTTP 202 空响应），当前出口 IP 被风控拦截；"
+                "请换用住宅网络，或在浏览器完整登录后粘贴令牌",
+            )
         if response.status != 200:
             detail = raw[:300] if raw else "empty response body"
             raise Exception(f"HTTP {response.status}: {detail}")
@@ -954,11 +963,27 @@ async def login_deepseek_account(account, password, device_id=None):
                 else type(data.get("data")).__name__,
             )
             if biz_code or biz_msg:
+                # 40303 与验证码类措辞表示上游要求人机验证（图形验证码或
+                # 邮箱 OTP）。这类流程需要真实浏览器交互，服务端无法自动
+                # 完成，故归为终态：停止自动重登，避免反复触发风控。
+                verification = str(biz_code) == "40303" or bool(
+                    re.search(
+                        r"captcha|verify|verification|otp|验证码|验证",
+                        str(biz_msg or ""),
+                        re.I,
+                    )
+                )
                 reason_map = {
                     "2": "bad_credentials",
                     "10": "banned",
                     "11": "risk_device",
                 }
+                if verification:
+                    raise AccountLoginError(
+                        "needs_verification",
+                        "上游要求人机验证（验证码 / 邮箱验证码），"
+                        "需在浏览器完成一次完整登录后再粘贴令牌",
+                    )
                 raise AccountLoginError(
                     reason_map.get(str(biz_code), f"biz_{biz_code}"),
                     f"DeepSeek 登录失败（{biz_code or 'unknown'}: {biz_msg or 'unknown'}）",
@@ -1702,7 +1727,14 @@ async def relogin_account(token_id):
                 creds["email"], creds["password"], creds.get("device_id")
             )
         except AccountLoginError as exc:
-            if exc.reason in ("banned", "risk_device", "bad_credentials", "no_token"):
+            if exc.reason in (
+                "banned",
+                "risk_device",
+                "bad_credentials",
+                "no_token",
+                "waf_challenge",
+                "needs_verification",
+            ):
                 await asyncio.to_thread(_disable_relogin, token_id, str(exc))
             logger.warning(
                 "[relogin] token #%s 桥内登录被拒（%s），停止自动重试",

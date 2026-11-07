@@ -400,12 +400,16 @@ def test_login_device_id_precedence_prefers_env_then_file():
                     os.environ[key] = value
 
 
-def _run_login(monkeypatch, account="user@example.com", device_id=None, body=None):
+def _run_login(
+    monkeypatch, account="user@example.com", device_id=None, body=None, status=200
+):
     """以桩替换上游 POST，钉住设备指纹，返回 (请求快照, 登录结果)。"""
     import functions
 
     captured = {}
-    response_body = body or '{"data":{"biz_data":{"user":{"token":"abc"}}}}'
+    response_body = (
+        '{"data":{"biz_data":{"user":{"token":"abc"}}}}' if body is None else body
+    )
 
     class FakeResponse:
         status = 200
@@ -418,6 +422,8 @@ def _run_login(monkeypatch, account="user@example.com", device_id=None, body=Non
 
         async def text(self):
             return response_body
+
+    FakeResponse.status = status
 
     async def fake_post(path, *, headers, **kwargs):
         captured.update(path=path, headers=headers, payload=kwargs["json"])
@@ -480,6 +486,30 @@ def test_account_login_maps_risk_device_error(monkeypatch):
         assert exc.reason == "risk_device"
     else:
         raise AssertionError("expected AccountLoginError for biz_code=11")
+
+
+def test_account_login_reports_waf_challenge(monkeypatch):
+    from functions import AccountLoginError
+
+    try:
+        _run_login(monkeypatch, status=202, body="")
+    except AccountLoginError as exc:
+        assert exc.reason == "waf_challenge"
+        assert "WAF" in str(exc)
+    else:
+        raise AssertionError("expected waf_challenge for HTTP 202")
+
+
+def test_account_login_reports_verification_required(monkeypatch):
+    from functions import AccountLoginError
+
+    body = '{"code":0,"data":{"biz_code":40303,"biz_msg":"captcha required"}}'
+    try:
+        _run_login(monkeypatch, body=body)
+    except AccountLoginError as exc:
+        assert exc.reason == "needs_verification"
+    else:
+        raise AssertionError("expected needs_verification for biz_code=40303")
 
 
 def test_device_id_falls_back_when_harvest_fails():
