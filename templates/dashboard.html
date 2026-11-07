@@ -1,214 +1,339 @@
 {% extends "base.html" %}
-{% block title %}Dashboard - DeeperSeeker{% endblock %}
+{% block title %}控制台 · DeeperSeeker{% endblock %}
 {% block content %}
-<h1>Dashboard</h1>
-
-<section>
-    <h2>Add Auth Token</h2>
-    <div class="steps">
-        <p><strong>Steps:</strong></p>
-        <ol>
-            <li>Open <strong>incognito/private</strong> window</li>
-            <li>Go to <a href="https://chat.deepseek.com" target="_blank">chat.deepseek.com</a> and login</li>
-            <li>Open DevTools (F12) → Console → paste:</li>
-        </ol>
-        <code>JSON.parse(localStorage.getItem("userToken")).value</code>
-        <ol start="4">
-            <li>Copy the token and paste below</li>
-            <li><strong>Remove any surrounding quotes</strong> — paste only the raw token string</li>
-            <li><strong>Close the incognito window</strong> to preserve the login</li>
-        </ol>
+<div class="page-head">
+    <div>
+        <h1>控制台</h1>
+        <p class="page-sub">管理 DeepSeek Token 号池、运行状态与用量</p>
     </div>
-    <div class="warning">
-        If you logout from DeepSeek in browser, this token stops working.
-    </div>
-    <form method="post" action="/tokens/add" id="add-token-form">
-        <input type="text" name="alias" placeholder="Alias (optional, e.g. personal, work)" style="width:200px">
-        <input type="text" name="auth_token" id="auth-token-input" placeholder="Paste auth token here (quotes & value: trimmed automatically)" style="width:400px">
-        <button type="submit">Add Token</button>
-    </form>
-    <script>
-    (function() {
-        const inp = document.getElementById('auth-token-input');
-        if (!inp) return;
-        function clean(v) {
-            if (!v) return v;
-            let s = v.trim();
-            if (s.startsWith('{') && s.includes('value')) {
-                try {
-                    const p = JSON.parse(s);
-                    if (p && p.value) s = String(p.value).trim();
-                } catch(e) {}
-            }
-            s = s.replace(/^(?:"?value"?)\s*[:=]\s*/i, '').trim();
-            while ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-                s = s.slice(1, -1).trim();
-            }
-            return s;
-        }
-        inp.addEventListener('paste', function() {
-            setTimeout(function() { inp.value = clean(inp.value); }, 10);
-        });
-        inp.addEventListener('change', function() { inp.value = clean(inp.value); });
-        const form = document.getElementById('add-token-form');
-        if (form) {
-            form.addEventListener('submit', function() { inp.value = clean(inp.value); });
-        }
-    })();
-    </script>
-</section>
+    <span class="pill">{{ tokens|length }} 个 Token · {{ active_count }} 个可用</span>
+</div>
 
-<section>
-    <h2>Feature Toggles</h2>
-    <p>
-        <strong>Prompt enhancement</strong>
-        <span id="effort-state">...</span>
-        <button type="button" id="effort-btn" onclick="toggleEffort()">...</button>
-    </p>
-    <p>Appends a stronger reasoning instruction when the client asks for a high effort
-       (e.g. <code>reasoning_effort=max</code>). Turning it off restores the default
-       behaviour immediately, no restart needed.</p>
-    <script>
-    async function refreshEffort() {
+<div class="layout">
+    <div class="col-main">
+        <section class="card">
+            <div class="card-head">
+                <h2>Token 号池 <span class="badge">{{ tokens|length }}</span></h2>
+            </div>
+            {% if tokens %}
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>编号</th>
+                            <th>别名</th>
+                            <th>状态</th>
+                            <th>说明</th>
+                            <th>占用</th>
+                            <th>最近使用</th>
+                            <th>冷却</th>
+                            <th class="ta-right">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for tok in tokens %}
+                        <tr data-token-id="{{ tok['id'] }}">
+                            <td class="mono muted">{{ tok['id'] }}</td>
+                            <td>{{ tok['label'] }}</td>
+                            <td data-cell="status">
+                                <span class="status {{ tok['state_class'] }}">
+                                    {% if tok['status'] == 'ACTIVE' %}有效{% elif tok['status'] == 'RATE_LIMITED' %}限流冷却{% elif tok['status'] == 'PARKED' %}已停放{% elif tok['status'] == 'QUARANTINED' %}已隔离{% elif tok['status'] == 'INVALID' %}已失效{% elif tok['status'] == 'CHECK_ERROR' %}检查失败{% else %}{{ tok['status'] }}{% endif %}
+                                </span>
+                            </td>
+                            <td class="muted" data-cell="note">{{ tok['state_note'] }}</td>
+                            <td data-cell="inflight">{{ tok['in_flight'] }}</td>
+                            <td class="muted nowrap" data-cell="last_used">{{ tok['last_used'] }}</td>
+                            <td class="muted nowrap" data-cell="cooldown">{{ tok['cooldown'] }}</td>
+                            <td class="ta-right nowrap">
+                                {% if tok['can_restore'] %}
+                                <form method="post" action="/tokens/{{ tok['id'] }}/restore" class="inline-form">
+                                    <button type="submit" class="btn-sm btn-secondary" title="清空冷却与停放状态，立即放回轮换">恢复</button>
+                                </form>
+                                {% endif %}
+                                {% if tok['can_solve_captcha'] %}
+                                <form method="post" action="/tokens/{{ tok['id'] }}/solve_captcha" class="inline-form"
+                                      onsubmit="return confirm('将在这台机器上打开一个可见的浏览器窗口，用该账号打开 chat.deepseek.com。请在新会话里发一条消息触发人机验证，解开后关闭窗口，再回面板点「恢复」。Docker 等无图形界面的部署无法弹出窗口，请不要使用此按钮。')">
+                                    <button type="submit" class="btn-sm btn-secondary" title="本机部署可用：打开浏览器手动解人机验证">解验证码</button>
+                                </form>
+                                {% endif %}
+                                <form method="post" action="/tokens/{{ tok['id'] }}/purge" class="inline-form"
+                                      onsubmit="return confirm('将删除该账号在上游的全部会话记录。频繁清理可能提高风控关注度，确定继续吗？')">
+                                    <button type="submit" class="btn-sm btn-secondary">清理会话</button>
+                                </form>
+                                <form method="post" action="/tokens/{{ tok['id'] }}/delete" class="inline-form"
+                                      onsubmit="return confirm('确定从号池删除这个 Token 吗？')">
+                                    <button type="submit" class="btn-sm btn-danger">删除</button>
+                                </form>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            <div class="card-note">
+                <form method="post" action="/tokens/purge_all" class="inline-form"
+                      onsubmit="return confirm('将删除所有账号在上游的全部会话记录。频繁清理可能提高风控关注度，确定继续吗？')">
+                    <button type="submit" class="btn-sm btn-secondary">清理全部会话</button>
+                </form>
+                <span class="hint">本页不展示任何 Token 明文。</span>
+            </div>
+            {% else %}
+            <div class="card-body">
+                <p class="hint">号池为空。先在右侧添加一个 Token。</p>
+            </div>
+            {% endif %}
+        </section>
+
+        <section class="card">
+            <div class="card-head">
+                <h2>近 30 天用量 <span class="badge">按天 × Key</span></h2>
+            </div>
+            {% if usage_rows %}
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>日期</th>
+                            <th>Key</th>
+                            <th>接口</th>
+                            <th>请求</th>
+                            <th>输入 Token</th>
+                            <th>输出 Token</th>
+                            <th>预估费用</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for row in usage_rows %}
+                        <tr>
+                            <td class="mono">{{ row['day'] }}</td>
+                            <td class="mono muted">{{ row['key'] }}</td>
+                            <td>{{ row['surfaces'] }}</td>
+                            <td>{{ row['requests'] }}</td>
+                            <td>{{ "{:,}".format(row['input_tokens']) }}</td>
+                            <td>{{ "{:,}".format(row['output_tokens']) }}</td>
+                            <td>¥{{ "%.4f"|format(row['cost']) }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            <div class="card-note">
+                <span class="hint">每轮完成的对话记一行，失败与重试不重复计数。费用按内置固定价表估算，非上游计量结果。需要峰谷分档与趋势图请到「使用统计」页。</span>
+            </div>
+            {% else %}
+            <div class="card-body">
+                <p class="hint">还没有用量记录。没有流量的 Key 不会出现空行。</p>
+            </div>
+            {% endif %}
+        </section>
+    </div>
+
+    <div class="col-side">
+        <section class="card">
+            <div class="card-head">
+                <h2>添加 Token</h2>
+            </div>
+            <div class="card-body">
+                <details class="guide">
+                    <summary>如何获取 Token？</summary>
+                    <ol>
+                        <li>打开浏览器无痕/隐私窗口</li>
+                        <li>访问 <a href="https://chat.deepseek.com" target="_blank" rel="noopener">chat.deepseek.com</a> 并完整走完登录流程（可能要求邮箱验证码）</li>
+                        <li>打开开发者工具（F12）→ Console，粘贴并回车：</li>
+                    </ol>
+                    <code class="block">JSON.parse(localStorage.getItem("userToken")).value</code>
+                    <ol start="4">
+                        <li>复制返回的 Token，去掉首尾引号</li>
+                        <li>关闭无痕窗口以保留登录状态</li>
+                    </ol>
+                </details>
+                <div class="warning">在浏览器里退出 DeepSeek 会让该 Token 立即失效。建议在自己设备、住宅网络下获取，机房 IP 出生的会话更容易被风控。</div>
+                <form method="post" action="/tokens/add" class="stack" id="add-token-form">
+                    <label class="field">
+                        <span>别名（可选）</span>
+                        <input type="text" name="alias" placeholder="例如：个人、工作">
+                    </label>
+                    <label class="field">
+                        <span>Token</span>
+                        <input type="text" name="auth_token" id="auth-token-input" placeholder="粘贴 Token，首尾引号与 value: 前缀会自动清理" required autocomplete="off">
+                    </label>
+                    <button type="submit" class="btn-block">加入号池</button>
+                </form>
+                <script>
+                (function() {
+                    const inp = document.getElementById('auth-token-input');
+                    if (!inp) return;
+                    function clean(v) {
+                        if (!v) return v;
+                        let s = v.trim();
+                        if (s.startsWith('{') && s.includes('value')) {
+                            try {
+                                const p = JSON.parse(s);
+                                if (p && p.value) s = String(p.value).trim();
+                            } catch (e) {}
+                        }
+                        s = s.replace(/^(?:"?value"?)\s*[:=]\s*/i, '').trim();
+                        while ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+                            s = s.slice(1, -1).trim();
+                        }
+                        return s;
+                    }
+                    inp.addEventListener('paste', function() {
+                        setTimeout(function() { inp.value = clean(inp.value); }, 10);
+                    });
+                    inp.addEventListener('change', function() { inp.value = clean(inp.value); });
+                    const form = document.getElementById('add-token-form');
+                    if (form) form.addEventListener('submit', function() { inp.value = clean(inp.value); });
+                })();
+                </script>
+            </div>
+        </section>
+
+        <section class="card">
+            <div class="card-head">
+                <h2>运行状态</h2>
+            </div>
+            <div class="card-body">
+                <dl class="kv">
+                    <dt>提示词增强</dt>
+                    <dd>
+                        <span class="status {{ 'ok' if effort_enhance else 'warn' }}" id="effort-state">{{ '开启' if effort_enhance else '关闭' }}</span>
+                    </dd>
+                </dl>
+                <p class="hint">客户端请求高强度推理（如 <code>reasoning_effort=max</code>）时追加更强的推理指令。关闭后立即回到默认行为，无需重启。</p>
+                <button type="button" class="btn-sm btn-secondary" id="effort-btn"
+                        data-on="{{ '1' if effort_enhance else '0' }}"
+                        onclick="toggleEffort()">{{ '关闭增强' if effort_enhance else '开启增强' }}</button>
+                <script>
+                function renderEffort(on) {
+                    const s = document.getElementById('effort-state');
+                    s.textContent = on ? '开启' : '关闭';
+                    s.className = 'status ' + (on ? 'ok' : 'warn');
+                    const b = document.getElementById('effort-btn');
+                    b.textContent = on ? '关闭增强' : '开启增强';
+                    b.dataset.on = on ? '1' : '0';
+                }
+                async function toggleEffort() {
+                    const b = document.getElementById('effort-btn');
+                    try {
+                        const r = await fetch('/features/effort-enhance', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({enabled: b.dataset.on !== '1'}),
+                        });
+                        if (r.ok) renderEffort((await r.json()).effort_enhance);
+                    } catch (e) {}
+                }
+                </script>
+
+                <hr class="divider">
+
+                <dl class="kv">
+                    <dt>链路探测</dt>
+                    <dd><span class="muted" id="probe-state">未检测</span></dd>
+                </dl>
+                <p class="hint">用只读接口 <code>users/current</code> 逐个探测上游可达性与账号状态，不创建会话、不发消息。</p>
+                <button type="button" class="btn-sm btn-secondary" id="probe-btn" onclick="runProbe()">检测链路</button>
+                <div class="hint" id="probe-result"></div>
+                <script>
+                async function runProbe() {
+                    const btn = document.getElementById('probe-btn');
+                    const state = document.getElementById('probe-state');
+                    const out = document.getElementById('probe-result');
+                    btn.disabled = true;
+                    state.textContent = '检测中…';
+                    out.textContent = '';
+                    try {
+                        const r = await fetch('/dashboard/probe', {method: 'POST', headers: {'Accept': 'application/json'}});
+                        const data = await r.json();
+                        if (!r.ok) {
+                            state.textContent = '检测失败';
+                            out.textContent = data.detail || data.error || ('HTTP ' + r.status);
+                            return;
+                        }
+                        const rows = data.tokens || [];
+                        const bad = rows.filter(t => !(t.probe && t.probe.ok));
+                        state.textContent = bad.length ? (rows.length + ' 个中 ' + bad.length + ' 个异常') : (rows.length + ' 个全部正常');
+                        out.textContent = rows.map(t => {
+                            const p = t.probe || {};
+                            return (t.alias || ('#' + t.id)) + '：' + (p.ok ? '正常' : ('异常（' + (p.error || p.status || '未知') + '）'));
+                        }).join('；');
+                    } catch (e) {
+                        state.textContent = '检测失败';
+                        out.textContent = String(e);
+                    } finally {
+                        btn.disabled = false;
+                    }
+                }
+                </script>
+            </div>
+        </section>
+
+        <section class="card">
+            <div class="card-head">
+                <h2>接口信息</h2>
+            </div>
+            <div class="card-body">
+                <dl class="kv">
+                    <dt>OpenAI 兼容</dt>
+                    <dd><code id="endpoint-openai"></code></dd>
+                    <dt>Anthropic 兼容</dt>
+                    <dd><code id="endpoint-anthropic"></code></dd>
+                    <dt>默认模型</dt>
+                    <dd><code>v4.1flash</code></dd>
+                </dl>
+                <script>
+                (function() {
+                    const base = window.location.origin;
+                    document.getElementById('endpoint-openai').textContent = base + '/v1';
+                    document.getElementById('endpoint-anthropic').textContent = base;
+                })();
+                </script>
+            </div>
+        </section>
+    </div>
+</div>
+
+<script>
+// 号池状态每 15 秒静默刷新一次：占用数与冷却倒计时会自己走，不必手动刷页面。
+(function() {
+    const STATUS_LABEL = {
+        ACTIVE: '有效',
+        RATE_LIMITED: '限流冷却',
+        PARKED: '已停放',
+        QUARANTINED: '已隔离',
+        INVALID: '已失效',
+        CHECK_ERROR: '检查失败',
+    };
+    async function refreshPool() {
+        if (document.hidden) return;
         try {
-            const r = await fetch('/features/effort-enhance', {headers: {'Accept': 'application/json'}});
-            if (r.ok) renderEffort((await r.json()).effort_enhance);
+            const r = await fetch('/dashboard/status', {headers: {'Accept': 'application/json'}});
+            if (!r.ok) return;
+            const data = await r.json();
+            for (const tok of data.tokens || []) {
+                const row = document.querySelector('tr[data-token-id="' + tok.id + '"]');
+                if (!row) continue;
+                const statusCell = row.querySelector('[data-cell="status"]');
+                if (statusCell) {
+                    const span = statusCell.querySelector('.status');
+                    if (span) {
+                        span.className = 'status ' + tok.state_class;
+                        span.textContent = STATUS_LABEL[tok.status] || tok.status;
+                    }
+                }
+                const noteCell = row.querySelector('[data-cell="note"]');
+                if (noteCell) noteCell.textContent = tok.state_note;
+                const inflightCell = row.querySelector('[data-cell="inflight"]');
+                if (inflightCell) inflightCell.textContent = tok.in_flight;
+                const usedCell = row.querySelector('[data-cell="last_used"]');
+                if (usedCell) usedCell.textContent = tok.last_used;
+                const coolCell = row.querySelector('[data-cell="cooldown"]');
+                if (coolCell) coolCell.textContent = tok.cooldown;
+            }
         } catch (e) {}
     }
-    function renderEffort(on) {
-        document.getElementById('effort-state').textContent = on ? 'ON' : 'OFF';
-        const b = document.getElementById('effort-btn');
-        b.textContent = on ? 'Turn off' : 'Turn on';
-        b.dataset.on = on ? '1' : '0';
-    }
-    async function toggleEffort() {
-        const b = document.getElementById('effort-btn');
-        try {
-            const r = await fetch('/features/effort-enhance', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({enabled: b.dataset.on !== '1'}),
-            });
-            renderEffort((await r.json()).effort_enhance);
-        } catch (e) {}
-    }
-    refreshEffort();
-    </script>
-</section>
-
-<section>
-    <h2>Token pool ({{ tokens|length }})</h2>
-    {% if tokens %}
-    <table>
-        <thead>
-            <tr>
-                <th>ID</th>
-                <th>Alias</th>
-                <th>State</th>
-                <th>In-flight</th>
-                <th>Last used</th>
-                <th>Cooldown</th>
-                <th>Actions</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for tok in tokens %}
-            <tr>
-                <td>{{ tok['id'] }}</td>
-                <td>{{ tok['label'] }}</td>
-                <td>
-                    <span class="status {{ tok['state_class'] }}">{{ tok['status'] }}</span>
-                    <div class="state-note">{{ tok['state_note'] }}</div>
-                </td>
-                <td>{{ tok['in_flight'] }}</td>
-                <td>{{ tok['last_used'] }}</td>
-                <td>{{ tok['cooldown'] }}</td>
-                <td>
-                    {% if tok['can_solve_captcha'] %}
-                    <form method="post" action="/tokens/{{ tok['id'] }}/solve_captcha" style="display:inline"
-                          onsubmit="return confirm('A browser window will now open to solve captcha challenge captcha. Send any prompt in a new chat, solve the captcha, then close the browser. DO NOT FORGET TO CLICK THE Restore BUTTON IN THE PANEL AFTERWARDS.')">
-                        <button type="submit" class="btn-sm" style="background:#d97706;color:#fff;" title="Open real browser with this account on chat.deepseek.com to solve captcha">Solve Captcha</button>
-                    </form>
-                    {% endif %}
-                    {% if tok['can_restore'] %}
-                    <form method="post" action="/tokens/{{ tok['id'] }}/restore" style="display:inline">
-                        <button type="submit" class="btn-sm">Restore</button>
-                    </form>
-                    {% endif %}
-                    <form method="post" action="/tokens/{{ tok['id'] }}/purge" style="display:inline"
-                          onsubmit="return confirm('This button will delete all your chats and disable captcha challenge tracking, possibly lowering account captcha with frequent purging. Are you sure?')">
-                        <button type="submit" class="btn-sm">Purge Chats</button>
-                    </form>
-                    <form method="post" action="/tokens/{{ tok['id'] }}/delete" style="display:inline"
-                          onsubmit="return confirm('Delete?')">
-                        <button type="submit" class="btn-sm btn-danger">Delete</button>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
-    <div style="margin-top: 10px; margin-bottom: 10px;">
-        <form method="post" action="/tokens/purge_all" style="display:inline"
-              onsubmit="return confirm('This button will delete all your chats and disable captcha challenge tracking, possibly lowering account captcha with frequent purging. Are you sure?')">
-            <button type="submit" class="btn-sm">Purge All Chats</button>
-        </form>
-    </div>
-    <p class="state-note">
-        RATE_LIMITED cools down and rejoins by itself. QUARANTINED never does —
-        an auth failure or a repeated 403 takes the token out until Restore puts
-        it back. No token material is shown on this page.
-    </p>
-    {% else %}
-    <p>No tokens yet.</p>
-    {% endif %}
-</section>
-
-<section>
-    <h2>Usage — last 30 days (per day × per key)</h2>
-    {% if usage_rows %}
-    <table>
-        <thead>
-            <tr>
-                <th>Day (UTC)</th>
-                <th>Key</th>
-                <th>Surfaces</th>
-                <th>Requests</th>
-                <th>Input tok</th>
-                <th>Output tok</th>
-                <th>Cost (est.)</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for row in usage_rows %}
-            <tr>
-                <td>{{ row['day'] }}</td>
-                <td>{{ row['key'] }}</td>
-                <td>{{ row['surfaces'] }}</td>
-                <td>{{ row['requests'] }}</td>
-                <td>{{ row['input_tokens'] }}</td>
-                <td>{{ row['output_tokens'] }}</td>
-                <td>${{ '%.6f'|format(row['cost']) }}</td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
-    <p class="state-note">
-        One row per completed turn — failed attempts and streamed retries never
-        double-count. Tokens are billed on the cleaned reply. Cost is an
-        estimate from the flat tariff table shipped with the bridge
-        (input $0.44/M, output $1.32/M), not upstream metering. Key aliases are
-        masked; no key or token material appears on this page.
-    </p>
-    {% else %}
-    <p class="state-note">No usage recorded yet. A key with no traffic shows no rows — honest zeros, not blanks.</p>
-    {% endif %}
-</section>
-
-<section>
-    <h2>API</h2>
-    <p>OpenAI: <code>http://localhost:4000/v1</code></p>
-    <p>Anthropic: <code>http://localhost:4000</code></p>
-    <p>Model: <code>v4.1flash</code> (single default DeepSeek model)</p>
-</section>
+    setInterval(refreshPool, 15000);
+})();
+</script>
 {% endblock %}

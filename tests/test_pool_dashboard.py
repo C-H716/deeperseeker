@@ -85,12 +85,12 @@ def test_pool_table_shows_state_without_secrets():
         assert secret[:12] not in html, "a prefix of a token is still token material"
 
     # State, in-flight, last-used and cooldown-until are all on the page.
-    for needle in ("QUARANTINED", "RATE_LIMITED", "ACTIVE", "In-flight", "Last used"):
+    for needle in ("已隔离", "限流冷却", "有效", "占用", "最近使用"):
         assert needle in html, f"pool view is missing {needle!r}"
     assert "personal" in html and "work" in html, "aliases must still identify rows"
 
     # A quarantined token needs the manual-return action next to it.
-    assert "Restore" in html, "no operator path back into rotation"
+    assert "恢复" in html, "no operator path back into rotation"
 
     # Rendered states must match a direct store read, not a cached guess.
     direct = {row["id"]: row["status"] for row in _store_rows()}
@@ -115,7 +115,7 @@ def test_pool_view_carries_no_credential_fields():
     by_id = {row["id"]: row for row in view}
     assert by_id[3]["cooldown"] == "—", "quarantine has no timer to count down"
     assert by_id[2]["cooldown"] != "—", "a cooling token must show its countdown"
-    assert "manual" in by_id[3]["state_note"].lower(), (
+    assert "人工恢复" in by_id[3]["state_note"], (
         "the quarantine note must tell the operator what returns the token"
     )
 
@@ -125,12 +125,11 @@ def test_purge_chats_buttons_and_routes():
     resp = _render_dashboard()
     assert resp.status_code == 200
     html = resp.text
-    assert "Purge Chats" in html
-    assert "Purge All Chats" in html
+    assert "清理会话" in html
+    assert "清理全部会话" in html
     assert "/tokens/1/purge" in html
     assert "/tokens/purge_all" in html
-    assert "captcha challenge tracking" in html
-    assert "captcha" in html
+    assert "风控关注度" in html
 
     import app as app_module
 
@@ -161,7 +160,7 @@ def test_solve_captcha_button_and_route(monkeypatch):
     resp = _render_dashboard()
     assert resp.status_code == 200
     html = resp.text
-    assert "Solve Captcha" in html
+    assert "解验证码" in html
     assert "/tokens/1/solve_captcha" in html
 
     client = TestClient(app_module.app)

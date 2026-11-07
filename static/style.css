@@ -259,6 +259,9 @@ tbody tr:hover { background: #fbfcfd; }
 /* 表格单元格里的次要说明行（转移时间、冷却截止等） */
 .sub { display: block; margin-top: 3px; font-size: 11.5px; color: var(--text-faint); }
 
+/* 卡片内分区之间的分隔线（功能开关、链路探测等独立区块） */
+hr.divider { border: 0; border-top: 1px solid var(--border); margin: 16px 0; }
+
 /* ---------- 按钮 ---------- */
 button {
     font-family: inherit;

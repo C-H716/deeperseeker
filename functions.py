@@ -1643,39 +1643,39 @@ def get_pool_view():
         )
         if status == "QUARANTINED":
             state_class, cooldown = "err", "—"
-            note = "quarantined — manual return required"
+            note = "已隔离，需人工恢复"
         elif status == "PARKED" and until and until > now:
             state_class = "warn"
-            cooldown = f"{_format_span(until - now)} left"
+            cooldown = f"剩余 {_format_span(until - now)}"
             note = (
-                f"parked ({park_reason})"
+                f"已停放（{park_reason}）"
                 if park_reason
-                else "parked — auto or manual return"
+                else "已停放，到期或人工恢复后回归"
             )
         elif status == "PARKED":
-            state_class, cooldown = "warn", "expired"
+            state_class, cooldown = "warn", "已过期"
             note = (
-                f"parking expired ({park_reason}) — rejoins rotation on next pick"
+                f"停放已到期（{park_reason}），下次调度自动回归"
                 if park_reason
-                else "parking expired — rejoins rotation on next pick"
+                else "停放已到期，下次调度自动回归"
             )
         elif status == "RATE_LIMITED" and until and until > now:
             state_class = "warn"
-            cooldown = f"{_format_span(until - now)} left"
-            note = "cooling down, recovers automatically"
+            cooldown = f"剩余 {_format_span(until - now)}"
+            note = "限流冷却中，到期自动恢复"
         elif status == "RATE_LIMITED":
-            state_class, cooldown = "warn", "expired"
-            note = "rejoins rotation on the next pick"
+            state_class, cooldown = "warn", "已过期"
+            note = "冷却已结束，下次调度自动回归"
         else:
             state_class, cooldown = "ok", "—"
-            note = "in rotation"
+            note = "正常参与轮换"
         if streak and status not in ("QUARANTINED", "PARKED"):
-            note = f"{note}, 403 streak {streak}"
-        age = "never" if not last_used else f"{_format_span(now - last_used)} ago"
+            note = f"{note}，连续 403 {streak} 次"
+        age = "从未使用" if not last_used else f"{_format_span(now - last_used)}前"
         view.append(
             {
                 "id": tid,
-                "label": alias if alias else f"untagged #{tid}",
+                "label": alias if alias else f"未命名 #{tid}",
                 "status": status,
                 "state_class": state_class,
                 "state_note": note,

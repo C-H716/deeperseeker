@@ -4566,8 +4566,46 @@ async def dashboard(request: Request):
     return templates.TemplateResponse(
         request,
         "dashboard.html",
-        {"tokens": tokens, "usage_rows": usage_rows},
+        {
+            "tokens": tokens,
+            "usage_rows": usage_rows,
+            "active_count": sum(1 for t in tokens if t["status"] == "ACTIVE"),
+            # 首屏直接带上开关状态，避免页面先闪一下「关闭」再被 JS 纠正。
+            "effort_enhance": await _db(get_effort_enhance),
+        },
     )
+
+
+@app.get("/dashboard/status")
+async def dashboard_status(request: Request):
+    """号池状态轮询：只读本地库，不触碰上游，不创建会话。"""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return JSONResponse({"tokens": await _db(get_pool_view)})
+
+
+@app.post("/dashboard/probe")
+async def dashboard_probe(request: Request):
+    """面板上的「检测链路」：逐个只读探测上游，不创建会话、不发消息。
+
+    与 /v1/pool/probe 同一套探测逻辑，区别只是鉴权走管理员会话——面板
+    页面拿不到 API Key，用那条路由会被 401。
+    """
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    tokens = await _db(get_tokens)
+    results = []
+    for tok in tokens:
+        try:
+            res = await probe_token(tok["token"])
+        except Exception as e:
+            res = {"ok": False, "error": str(e)[:200]}
+        results.append({"id": tok["id"], "alias": tok.get("alias"), "probe": res})
+    return JSONResponse({"tokens": results})
 
 
 def clean_auth_token(raw: str) -> str:
