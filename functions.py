@@ -2640,25 +2640,36 @@ def parse_tools(text):
             ).strip()
 
     if not tools:
+        # 标签名内部的空格/下划线可漂移："tool_call" / "tool call" /
+        # "tool calls" 都可能出现，统一用 tool[\s_]*calls? 覆盖。
         tag_regex = re.compile(
-            r"<(?:tool_call|function_call)(?:\s+(?:name|tool|function)=[\x27\x22]([^\x27\x22]+)[\x27\x22])?\s*>",
+            r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|function_call)(?:\s+(?:name|tool|function)=[\x27\x22]([^\x27\x22]+)[\x27\x22])?\s*>",
             re.IGNORECASE,
         )
         decoder = json.JSONDecoder()
         matches = [m for m in tag_regex.finditer(text) if not fenced(m.start())]
         if matches:
+            # 外层包裹标签会重复指向同一段 JSON："<tool calls> <tool call>{...}"
+            # 中两个开标签的 after_tag 都以同一个 '{' 开头，不去重会把同一次调用
+            # 解析两遍。consumed_upto 记录已消费到的绝对偏移，命中过的 JSON 不再
+            # 由后续标签重复解析。
+            consumed_upto = -1
             for m in matches:
                 tag_name = m.group(1)
                 after_tag = text[m.end() :]
                 brace_pos = after_tag.find("{")
+                abs_brace = m.end() + brace_pos if brace_pos != -1 else -1
+                if brace_pos == -1 or abs_brace < consumed_upto:
+                    continue
                 if brace_pos != -1:
                     json_substr = after_tag[brace_pos:]
                     data = None
+                    payload_len = 0
                     with contextlib.suppress(Exception):
-                        data, _ = decoder.raw_decode(json_substr)
+                        data, payload_len = decoder.raw_decode(json_substr)
                     if not data:
                         cleaned_json = re.sub(
-                            r"</?(?:tool_call|function_call|tool_calls|invoke)[^>]*>.*",
+                            r"</?(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool_call|function_call|tool_calls|invoke)[^>]*>.*",
                             "",
                             json_substr,
                             flags=re.DOTALL,
@@ -2711,11 +2722,14 @@ def parse_tools(text):
                             norm = normalize_tool_call(name, args)
                             if norm:
                                 tools.append(norm)
+                                # 外层包裹标签（"<tool calls> <tool call>{...}"）
+                                # 与内层标签指向同一个 '{'，只消费一次。
+                                consumed_upto = abs_brace + max(payload_len, 1)
             clean_text = re.sub(
-                r"<(?:tool_call|function_call)[^>]*>.*?(?:</(?:tool_call|function_call)>|$)",
+                r"<(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|function_call|tool)[^>]*>.*?(?:</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|function_call|tool)>|$)",
                 "",
                 text,
-                flags=re.DOTALL,
+                flags=re.DOTALL | re.IGNORECASE,
             ).strip()
 
     if not tools:
@@ -2882,8 +2896,10 @@ def parse_tools(text):
 # the |/｜-decorated variants that parse_tools accepts. Used by
 # StreamToolParser so a mismatched closer closes the open block instead of
 # hanging until flush(). [FIX 3]
+# 标签名内部的空格/下划线会漂移（"tool_call" / "tool call" / "tool calls"），
+# 因此族内统一用 tool[\s_]*calls? 覆盖，并额外接受裸的 tool 作为闭标签。
 _TOOL_END_TAG_RE = re.compile(
-    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_calls?)\s*>",
+    r"</(?:\s*[｜\|]){0,2}\s*(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|invoke|function_calls?)\s*>",
     re.IGNORECASE,
 )
 
@@ -2896,14 +2912,26 @@ _TOOL_END_TAG_RE = re.compile(
 # tag. Only with name=, so a real "</invoke>" closer never opens a block.
 _STREAM_ENTRY_RE = re.compile(
     r"<(?:/(?=[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*invoke\s+name\s*=))?"
-    r"[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_calls?|invoke)\b[^>]*>",
+    r"[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool[\s_]*calls?|calls|function_calls?|invoke)\b[^>]*>",
     re.IGNORECASE,
 )
 
 # Orphan closers trailing a block already closed by the per-tag or family
 # fallback (e.g. "</｜｜DSML｜｜ calls>" after the inner invoke was flushed).
 _ORPHAN_CLOSER_RE = re.compile(
-    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|function_calls?|invoke)\s*[｜\|]{0,2}>",
+    # 第二分支覆盖「只有 DSML 标记、没有标签名」的纯装饰闭标签，例如
+    # ``</ | | DSML | | >``。模型收尾时会成串吐这种标签；第一分支要求带
+    # 标签名，匹配不到时整串会作为正文漏给客户端。
+    # 收尾的 ``>`` 可选：模型收尾的装饰串常整段不带 ``>``（形如
+    # ``</ | | DSML | | `` 反复出现）。缺 ``>`` 时只吃到下一个 ``<`` 或
+    # 文本末尾，避免把后续正文一并吞掉。
+    r"</(?:\s*[｜\|]){0,2}\s*(?:"
+    # 标签名后必须是非标识符字符，避免正文 ``</tool_x`` 被误吞（同 parse_tools）。
+    r"(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|function_calls?|invoke|param(?:eter)?)(?![A-Za-z0-9_])[^<>]*"
+    r"\s*[｜\|]{0,2}\s*(?:>|(?=<|\Z))"
+    # 无标签名的纯装饰分支：``>`` 可选（同 parse_tools 处说明）。
+    r"|DSML\s*(?:\s*[｜\|]){0,2}\s*>?"
+    r")",
     re.IGNORECASE,
 )
 
@@ -2926,7 +2954,7 @@ _BARE_DSML_MARKER_RE = re.compile(
 # the non-streaming path and on flush() to strip wrapper noise; unlike
 # _ORPHAN_CLOSER_RE it also removes stray OPEN tags.
 _WRAPPER_TAG_RE = re.compile(
-    r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|function_calls?|invoke|parameter)[^>]*>",
+    r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool[\s_]*calls?|tool|calls|function_calls?|invoke|parameter)[^>]*>",
     re.IGNORECASE,
 )
 
@@ -2968,10 +2996,29 @@ def _strip_stray_markers(text: str) -> str:
 
 
 def _strip_wrapper_tags(text: str) -> str:
-    """Wrapper path: drop the whole tag family (open or close) + bare markers."""
+    """Wrapper path: drop the whole tag family (open or close) + bare markers.
+
+    第二个分支覆盖「只有 DSML 标记、没有标签名」的纯装饰标签，例如
+    ``</ | | DSML | | >``；首个分支要求带标签名，匹配不到时模型收尾成串
+    吐出的装饰标签会原样留在正文里。收尾的 ``>`` 必须可选：模型常常整串
+    都不写 ``>``（形如 ``</ | | DSML | | `` 反复出现），缺 ``>`` 时用
+    lookahead 限定只吃到下一个 ``<`` 或文本末尾，避免吞掉后续正文。
+    """
     if not text:
         return text
     text = _FULLWIDTH_PIPE_TAG_RE.sub("", text)
+    text = re.sub(
+        r"</?(?:\s*[｜\|]){0,2}\s*(?:"
+        # 标签名后必须是不属于标识符的字符：否则正文里的 ``</tool_x`` 会被
+        # 当成 ``tool`` 标签并吞掉 ``_x``（缺 ``>`` 的分支尤其容易误伤）。
+        r"(?:DSML\s*(?:\s*[｜\|]){0,2})?\s*\s*(?:tool[\s_]*calls?|tool|calls|invoke|function_call|parameter)(?![A-Za-z0-9_])[^<>]*"
+        r"\s*[｜\|]{0,2}\s*(?:>|(?=<|\Z))"
+        r"|DSML\s*(?:\s*[｜\|]){0,2}\s*>?"
+        r")",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
     text = _BARE_DSML_MARKER_RE.sub("", text)
     return _WRAPPER_TAG_RE.sub("", text)
 
@@ -2987,17 +3034,28 @@ def _append_clean_text(results, text: str) -> None:
 _STREAM_ENTRY_TAGS = (
     "tool_calls",
     "tool_call",
+    # 标签名内部的空格会漂移（"tool call" / "tool calls"）：分片恰好切在
+    # 空格处时，前缀判定必须仍认它是候选，否则半个开标签会被当正文吐出去，
+    # 后续真标签也就再也进不了工具模式。
+    "tool calls",
+    "tool call",
     "function_calls",
     "function_call",
     "invoke",
     "calls",
+    "tool",
 )
 
 
 def _skip_bars(text, pos):
-    for _ in range(2):
-        if pos < len(text) and text[pos] in "|｜":
-            pos += 1
+    """跳过装饰分隔符：竖线（ASCII 与全角）以及夹在其间的空格。
+
+    装饰标签写成 ``< | | DSML | | calls>`` 时，分片可能停在任意位置；
+    前缀判定必须能穿过这些分隔符，否则 ``</ | | DSML | | `` 这类收尾装饰串
+    会被逐字符当成正文吐出去（漏出 ``</``、``</ `` 等残片）。
+    """
+    while pos < len(text) and (text[pos] in "|｜" or text[pos].isspace()):
+        pos += 1
     return pos
 
 

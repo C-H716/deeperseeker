@@ -34,9 +34,7 @@ collect_ignore = [
     "test_token_pool_balance.py",
     "test_deep_health.py",
     "test_deepseek_sse.py",
-    "test_dsml_decorated_json.py",
     "test_minor_fixes.py",
     "test_rate_limit_failover.py",
     "test_rollover_suppression.py",
-    "test_tag_drift.py",
 ]
