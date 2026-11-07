@@ -78,6 +78,7 @@ from functions import (  # noqa: E402
     peek_cached_input,
     pick_token,
     pool_state_note,
+    probe_token_mute,
     record_cached_input,
     record_file,
     record_rotation,
@@ -4316,8 +4317,62 @@ async def root(request: Request):
     return await dashboard(request)
 
 
+async def _deep_health_probe():
+    """只读上游链路探测（移植自 1515asd/rh-deeperseeker v89.10）。
+
+    复用 probe_token_mute 的 GET users/current：零会话、零消息、零 PoW，
+    避免「面板轮询创建空上游会话」这类异常流量；禁言视为凭据仍有效。
+    """
+    tokens = await _db(get_tokens)
+    auth_token = next(
+        (t["token"] for t in tokens if t["status"] == "ACTIVE" and t["token"]),
+        None,
+    )
+    if not auth_token:
+        return {
+            "upstream_reachable": False,
+            "latency_ms": None,
+            "reason": "号池中没有可用令牌",
+        }
+    started = time.perf_counter()
+    try:
+        result = await probe_token_mute(auth_token)
+    except Exception as exc:
+        logger.warning("Deep health probe failed: %s", exc)
+        return {
+            "upstream_reachable": False,
+            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+            "reason": "上游探测异常",
+        }
+    alive = result.get("verdict") in ("ok", "muted")
+    return {
+        "upstream_reachable": alive,
+        "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+        "reason": "" if alive else f"令牌判定：{result.get('verdict')}",
+    }
+
+
+@app.get("/dashboard/deep-health")
+async def dashboard_deep_health(request: Request):
+    """面板「检测链路」按钮（管理员会话，只读探测）。"""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return JSONResponse({"error": "未登录或登录已过期"}, status_code=401)
+    return JSONResponse(await _deep_health_probe())
+
+
 @app.get("/health")
 async def health(request: Request):
+    deep = (request.query_params.get("deep") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    # 深度探针需要鉴权，且鉴权先于任何上游流量；浅层检查保持公开，
+    # 容器 HEALTHCHECK 仍可直接访问 /health。
+    if deep and not check_key(request):
+        return JSONResponse({"error": "Invalid API key"}, status_code=401)
     active = sum(1 for t in await _db(get_tokens) if t["status"] == "ACTIVE")
     cookies_valid = False
     try:
@@ -4334,6 +4389,12 @@ async def health(request: Request):
     if check_key(request):
         data["active_tokens"] = active
         data["cookies_valid"] = cookies_valid
+        if deep:
+            probe = await _deep_health_probe()
+            data["deep"] = probe
+            if not probe.get("upstream_reachable"):
+                data["status"] = "degraded"
+                ok = False
     return JSONResponse(data, status_code=200 if ok else 503)
 
 

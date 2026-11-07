@@ -241,6 +241,11 @@
                     <dt>默认模型</dt>
                     <dd><code>v4.1flash</code></dd>
                 </dl>
+                <p class="hint">
+                    <button type="button" id="link-btn" class="btn-sm btn-secondary" onclick="checkLink()">检测链路</button>
+                    <span id="link-result" class="muted">未检测</span>
+                </p>
+                <p class="hint">只读探测「面板 → 上游」链路，不创建会话、不发送消息；结果不代表客户端 API 的真实可用性。</p>
             </div>
         </section>
     </aside>
@@ -287,6 +292,25 @@ effortBtn.addEventListener('click', async () => {
     }
 });
 refreshEffort();
+
+async function checkLink() {
+    const result = document.getElementById('link-result');
+    const btn = document.getElementById('link-btn');
+    result.textContent = '检测中…';
+    btn.disabled = true;
+    try {
+        const response = await fetch('/dashboard/deep-health', {headers: {'Accept': 'application/json'}});
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const data = await response.json();
+        result.textContent = data.upstream_reachable
+            ? `链路正常 · 延迟 ${data.latency_ms ?? '—'} ms`
+            : `异常：${data.reason || '上游不可达'}`;
+    } catch (error) {
+        result.textContent = '检测请求失败';
+    } finally {
+        btn.disabled = false;
+    }
+}
 
 const message = document.getElementById('check-message');
 const checkButtons = document.querySelectorAll('.check-one');
