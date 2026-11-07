@@ -17,6 +17,9 @@ def pool(tmp_path, monkeypatch):
     """在临时库里建立一个通过桥内登录加入的账号。"""
     db = str(tmp_path / "pool.db")
     monkeypatch.setattr(functions, "_db", db)
+    monkeypatch.setattr(
+        functions, "_ACCOUNT_KEY_FILE", str(tmp_path / "account_secret.key")
+    )
     functions.init_db()
     functions.save_account_login(
         "a@b.com", "alias-a", "tok-a", password="pw", device_id="fingerprint-a"
