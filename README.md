@@ -1,3 +1,5 @@
+[简体中文说明](README.zh-CN.md) · [中文使用指南](docs/GUIDE.zh-CN.md)
+
 # Important Note
 I am busy with exams so new PR and Issues might be slow to resolve or merge (but i would merge them or resolve the issue as I get time in between) so expect some inconvenience.
 
@@ -104,6 +106,10 @@ cp .env.example .env
 | `DEEPSEEKER_DEVICE_ID` | Explicit device ID for account login; skips browser harvesting | unset |
 | `DEEPSEEKER_DEVICE_ID_PATH` | Where the harvested device ID is cached | next to the database |
 | `DEEPSEEKER_DEVICE_ID_TIMEOUT` | Seconds to wait for the fingerprint SDK to publish a device ID | `60` |
+| `DEEPSEEKER_HIF_ENABLED` | Attach the `x-hif-leim` anti-abuse header (off by default; the Android client does not send it) | `0` |
+| `DEEPSEEKER_RELOGIN_MIN_INTERVAL` | Minimum seconds between automatic bridge re-logins | `21600` |
+| `DEEPSEEKER_BACKUP_SECRET` | Enables encrypted token-pool backup when set | unset |
+| `DEEPSEEKER_BACKUP_TARGET` | Backup target: `telegram` / `gist` / `file` / `none` | `none` |
 
 ## Auth Token Setup
 
@@ -111,9 +117,9 @@ cp .env.example .env
 2. Console (F12): `JSON.parse(localStorage.getItem("userToken")).value`
 3. Paste raw token string into Dashboard (`/dashboard`). Close incognito window.
 
-The Chinese dashboard also supports adding an account directly with its DeepSeek email and password. The bridge calls `/api/v0/users/login`, stores only the returned bearer token, and does not persist the submitted password.
+The dashboard's recommended path is **bridge-native login** with a DeepSeek email or mobile number. The bridge calls `/api/v0/users/login` using the Android client profile (`os=android`, Android headers, `x-device-id` UUID, `referer: sign_in`), so the session is born and used inside the bridge. The submitted password is encrypted with a local key and stored only in the local SQLite database, never logged and never returned to the page; it is used solely for automatic re-login (throttled to at least 6 hours) when a token is invalidated. Pasting a browser-extracted token is kept as an emergency fallback only: since November 2026 upstream revokes whole sessions used across environments.
 
-The login endpoint validates the device ID produced by the web client's fingerprint SDK, so a random value is rejected with `biz_code=11 / RISK_DEVICE_DETECTED`. Before the first login the bridge therefore opens the sign-in page in headless Chromium, reads the SDK's device ID, and caches it next to the database. Later logins reuse the cached ID, which keeps one stable device identity for the whole deployment. Set `DEEPSEEKER_DEVICE_ID` to bypass harvesting with a value you copied from a real browser session. The dashboard stays usable either way: a rejected login only reports the error, and the cached ID survives container recreation as long as the data volume is kept.
+The login body must carry a real Shumei (SMSdk) device fingerprint; random or fabricated UUIDs are rejected with `biz_code=11 / RISK_DEVICE_DETECTED`. Paste one from the dashboard's device-fingerprint field (obtained via `SMSdk.getDeviceId()` in the browser console), otherwise the bridge falls back to `DEEPSEEKER_DEVICE_ID`, a cached fingerprint, or headless-Chromium harvesting. The fingerprint is persisted per account and reused by automatic re-login.
 
 ## API Endpoints & Usage
 
@@ -132,8 +138,8 @@ The login endpoint validates the device ID produced by the web client's fingerpr
 
 ## Features
 
-- **Multi-Token Pooling**: Random active token rotation.
-- **Token Pool Health Checks**: The dashboard is Chinese-localized and checks every token every five minutes through a lightweight authenticated challenge request. Checks can also be triggered manually per token or for the entire pool; no model prompt is sent during a health check.
+- **Multi-Token Pooling**: Least-in-flight token rotation with rate-limit cooldown and per-token ownership tracking.
+- **Token Pool Health Checks**: The dashboard is Chinese-localized and probes every token every five minutes through the read-only `users/current` endpoint (no chat session is created). Muted accounts are detected from the upstream `is_muted` flag, quarantined immediately with an unmute time, and can be restored manually from the pool table. Checks can also be triggered manually per token or for the entire pool.
 - **Context-Based Session Selector**: Computes a SHA-256 signature over the canonicalized message history (up to the last assistant turn), the model, and the API key scope, to match and resume existing web chat sessions. Session creation is lock-protected to avoid duplicates.
 - **Summarize-and-Rollover Context Policy**: When accumulated session context nears the observed remembered-context limit (~393K input tokens), the bridge asks the model for a compact, language-matched handoff summary in a scratch chat, starts a fresh web chat, and seeds it with that summary plus the newest user message. System instructions, history, tool results, and the active request are kept in separate sections; replayed history/tool output is marked as untrusted data so OpenCode's long English system prompt or tool text cannot redirect the current task. `DEEPSEEKER_PROMPT_LANGUAGE=auto` follows the latest user turn, while `zh-CN` forces Simplified Chinese for reasoning and answers. Relevant newest tool calls/results are preserved (capped by `DEEPSEEKER_MAX_TOOL_RESULT_TOKENS`, with a tighter per-result cap via `DEEPSEEKER_PER_TOOL_RESULT_TOKENS`); attachments are described in words inside the summary rather than forwarded. The first exchange — however large — is never rolled over (the first-message path accepts ~1M tokens). Declared limits in `/v1/models` (`context_window`, `max_output_tokens`) reflect this observed behavior, not guaranteed upstream limits.
 - **Full History Injection**: Inject full conversation history into new sessions when session signature is not in DB or when account fails over.
