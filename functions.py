@@ -1189,6 +1189,32 @@ def get_tokens():
     ]
 
 
+def pool_state_note(tok):
+    """把号池状态翻译成五态说明（移植自 1515asd/rh-deeperseeker v89.6）。
+
+    返回 (分类键, 说明文本)。分类是纯读侧字符串判断，不新增任何写路径；
+    隔离原因由 mark_quarantined() 落库，说明文本供面板直接渲染。
+    """
+    status = tok.get("status")
+    reason = str(tok.get("quarantine_reason") or "")
+    lowered = reason.lower()
+    if status in ("QUARANTINED", "MUTED"):
+        if "muted" in lowered or "禁言" in reason:
+            return "muted", "上游确认禁言，解禁后点「恢复」即可使用"
+        if "auth" in lowered or "401" in reason:
+            return "expired", "疑似过期，需重新添加账号或令牌；点「恢复」通常无效"
+        if "403" in reason:
+            return "restricted", "疑似被临时限制发言，解封后点「恢复」"
+        return "other", "其他隔离，具体原因见悬停提示；确认正常后点「恢复」"
+    if status == "RATE_LIMITED":
+        return "cooling", "限流冷却中，到期自动回到轮换"
+    if status == "INVALID":
+        return "expired", "令牌已失效，需重新添加账号或令牌"
+    if status == "CHECK_ERROR":
+        return "other", "检查失败，见「最近检查」列的具体报错"
+    return "ok", "轮换中，能正常干活"
+
+
 def get_token(token_id):
     conn = get_db()
     row = conn.execute(

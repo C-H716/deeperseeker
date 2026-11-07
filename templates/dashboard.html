@@ -83,6 +83,7 @@
                             <th>别名</th>
                             <th>Token</th>
                             <th>状态</th>
+                            <th>说明</th>
                             <th>占用</th>
                             <th>转移</th>
                             <th>最近检查</th>
@@ -93,13 +94,14 @@
                         {% for tok in tokens %}
                         <tr data-token-id="{{ tok['id'] }}">
                             <td class="mono muted">{{ tok['id'] }}</td>
-                            <td>{{ tok['alias'] or '—' }}</td>
+                            <td>{{ tok['alias'] or '—' }}{% if tok['account_id'] %} <span class="status ok" title="桥内登录产生（安卓形态），令牌失效可自动重登">桥内</span>{% else %} <span class="status warn" title="浏览器粘贴的令牌，跨环境使用可能被整体吊销，建议改用桥内登录">浏览器</span>{% endif %}</td>
                             <td><code class="nowrap">{{ tok['token'][:12] }}…{{ tok['token'][-4:] }}</code></td>
                             <td data-cell="status">
                                 <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] in ('RATE_LIMITED', 'CHECK_ERROR', 'MUTED') %}warn{% else %}err{% endif %}" {% if tok.get('quarantine_reason') %}title="{{ tok.get('quarantine_reason') }}"{% endif %}>
                                     {% if tok['status'] == 'ACTIVE' %}有效{% elif tok['status'] == 'RATE_LIMITED' %}被限流{% elif tok['status'] == 'INVALID' %}已失效{% elif tok['status'] == 'CHECK_ERROR' %}检查失败{% elif tok['status'] == 'QUARANTINED' %}已隔离{% elif tok['status'] == 'MUTED' %}确认禁言{% else %}{{ tok['status'] }}{% endif %}
                                 </span>
                             </td>
+                            <td class="muted nowrap" data-cell="note">{{ tok['state_note'] }}</td>
                             <td class="nowrap" data-cell="inflight">
                                 {% set busy = inflight.get(tok['id'], 0) %}
                                 <span class="status {% if busy %}busy{% else %}idle{% endif %}">
@@ -120,6 +122,11 @@
                                 {% if tok['last_check_error'] %}<span class="check-error" title="{{ tok['last_check_error'] }}">⚠</span>{% endif %}
                             </td>
                             <td class="ta-right nowrap">
+                                {% if tok['can_restore'] %}
+                                <form method="post" action="/tokens/{{ tok['id'] }}/restore" class="inline-form">
+                                    <button type="submit" class="btn-sm btn-secondary">恢复</button>
+                                </form>
+                                {% endif %}
                                 <button type="button" class="btn-sm btn-secondary check-one" data-token-id="{{ tok['id'] }}">检查</button>
                                 <form method="post" action="/tokens/{{ tok['id'] }}/delete" class="inline-form"
                                       onsubmit="return confirm('确定删除这个 Token 吗？')">
@@ -344,6 +351,8 @@ async function pollPool() {
             if (!tok) return;  // 表格已过期（新增/删除了账号），等整页刷新
             const statusCell = row.querySelector('[data-cell="status"]');
             if (statusCell) renderStatus(statusCell, tok, data.now);
+            const noteCell = row.querySelector('[data-cell="note"]');
+            if (noteCell && tok.state_note) noteCell.textContent = tok.state_note;
             const inflightCell = row.querySelector('[data-cell="inflight"]');
             if (inflightCell) renderInflight(inflightCell, tok, data.concurrency_cap);
             const rotationCell = row.querySelector('[data-cell="rotation"]');

@@ -76,6 +76,7 @@ from functions import (  # noqa: E402
     parse_tools,
     peek_cached_input,
     pick_token,
+    pool_state_note,
     record_cached_input,
     record_file,
     record_rotation,
@@ -83,6 +84,7 @@ from functions import (  # noqa: E402
     request_effort,
     request_tools,
     reset_cached_input,
+    restore_token,
     save_account_login,
     save_session,
     send_message,
@@ -4014,6 +4016,9 @@ async def dashboard(request: Request):
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     tokens = await _db(get_tokens)
+    for tok in tokens:
+        tok["state_note"] = pool_state_note(tok)[1]
+        tok["can_restore"] = tok["status"] in ("QUARANTINED", "MUTED")
     accounts = await _db(get_accounts)
     rotation_stats = await _db(get_rotation_stats)
     account_error = request.query_params.get("account_error")
@@ -4063,6 +4068,7 @@ async def dashboard_status(request: Request):
                     "limited_until": tok["limited_until"],
                     "quarantine_reason": tok.get("quarantine_reason"),
                     "mute_until": tok.get("mute_until"),
+                    "state_note": pool_state_note(tok)[1],
                     "last_checked_at": tok["last_checked_at"],
                     "last_check_error": tok["last_check_error"],
                     "rotation": rotations.get(tok["id"]),
@@ -4249,6 +4255,20 @@ async def tokens_check(request: Request, token_id: int | None = None):
     # The page reloads to show updated rows; never echo raw bearer tokens in JSON.
     return JSONResponse(
         {"results": results, "checked_at": _token_check_state["last_run_at"]}
+    )
+
+
+@app.post("/tokens/{token_id}/restore")
+async def tokens_restore(token_id: int, request: Request):
+    """人工恢复隔离账号（移植自 rh v89.6 的恢复入口，沿用本地表单交互）。"""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    await _db(restore_token, token_id)
+    return RedirectResponse(
+        "/dashboard?account_message=" + quote(f"Token #{token_id} 已恢复轮换"),
+        status_code=303,
     )
 
 
