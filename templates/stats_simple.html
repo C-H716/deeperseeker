@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}使用统计 · DeeperSeeker{% endblock %}
+{% block content %}
+<div class="page-head">
+    <div>
+        <h1>使用统计</h1>
+        <p class="page-sub">按天 × API Key 聚合的请求与 Token 用量（来自上游完成的回合）。</p>
+    </div>
+</div>
+
+<section class="card">
+    <div class="card-head">
+        <h2>按天用量 <span class="badge">{{ rows|length }}</span></h2>
+    </div>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>日期</th>
+                    <th>API Key</th>
+                    <th>入口</th>
+                    <th>请求</th>
+                    <th>输入</th>
+                    <th>输出</th>
+                    <th>成本</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in rows %}
+                <tr>
+                    <td class="nowrap">{{ row['day'] }}</td>
+                    <td class="mono">{{ row['key'] }}</td>
+                    <td>{{ row['surfaces'] }}</td>
+                    <td>{{ row['requests'] }}</td>
+                    <td>{{ row['input_tokens'] }}</td>
+                    <td>{{ row['output_tokens'] }}</td>
+                    <td>{{ row['cost'] }}</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="7" class="empty">还没有用量记录。</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+{% endblock %}

@@ -4536,6 +4536,17 @@ def clean_auth_token(raw: str) -> str:
     return token
 
 
+@app.get("/stats", response_class=HTMLResponse)
+async def stats_page(request: Request):
+    """按天 × API Key 的用量统计页（管理员）。"""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    rows = await _db(usage_by_day_key, 0.0)
+    return templates.TemplateResponse(request, "stats_simple.html", {"rows": rows})
+
+
 @app.get("/features/effort-enhance")
 async def effort_enhance_get(request: Request):
     """读取提示词增强总开关（管理员）。"""
