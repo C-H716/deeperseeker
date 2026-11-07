@@ -36,6 +36,16 @@ def test_first_turn_has_no_cache_to_read():
     assert peek_cached_input(sig) == 0
 
 
+def _prior_sig(msgs):
+    """与 app.py 一致：会话续接用「截到最后一个 assistant 为止」的签名。"""
+    last_ast = -1
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i].get("role") == "assistant":
+            last_ast = i
+            break
+    return generate_signature_sync(msgs[: last_ast + 1], MODEL)
+
+
 def test_next_sig_of_turn_n_equals_sig_of_turn_n_plus_1():
     """This equality is the whole basis of the reconstruction."""
     m1 = _msgs("[SYSTEM]\npolicy\n\n[USER]\nfirst question")
@@ -44,7 +54,7 @@ def test_next_sig_of_turn_n_equals_sig_of_turn_n_plus_1():
     next_sig1 = generate_signature_sync(m1 + [a1], MODEL)
 
     m2 = m1 + [a1, {"role": "user", "content": "second question"}]
-    sig2 = generate_signature_sync(m2, MODEL)
+    sig2 = _prior_sig(m2)
 
     assert sig1 != sig2, "distinct turns must not share a signature"
     assert sig2 == next_sig1, "turn-2 sig must equal turn-1 next_sig"
@@ -60,7 +70,7 @@ def test_cached_tokens_reports_previous_turn_prompt_size():
     record_cached_input(generate_signature_sync(m1 + [a1], MODEL), in1)
 
     m2 = m1 + [a1, {"role": "user", "content": "second question"}]
-    sig2 = generate_signature_sync(m2, MODEL)
+    sig2 = _prior_sig(m2)
     in2 = sum(count_tokens(m["content"]) for m in m2)
 
     assert peek_cached_input(sig2) == in1

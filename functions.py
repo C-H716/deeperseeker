@@ -13,6 +13,7 @@ import string
 import time
 import urllib.parse
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timezone
 
 import aiohttp
@@ -1630,6 +1631,30 @@ def usage_by_day_key(since_ts=0.0):
             }
         )
     return out
+
+
+_CACHED_INPUT_HISTORY = OrderedDict()
+_CACHED_INPUT_HISTORY_MAX = 512
+
+
+def peek_cached_input(sig):
+    """Prompt tokens this conversation can reuse from its previous turn."""
+    return _CACHED_INPUT_HISTORY.get(sig, 0)
+
+
+def record_cached_input(sig, input_tokens):
+    """Remember this turn's input size as the next turn's cached prefix."""
+    if not sig:
+        return
+    _CACHED_INPUT_HISTORY.pop(sig, None)
+    _CACHED_INPUT_HISTORY[sig] = max(0, input_tokens)
+    while len(_CACHED_INPUT_HISTORY) > _CACHED_INPUT_HISTORY_MAX:
+        _CACHED_INPUT_HISTORY.popitem(last=False)
+
+
+def reset_cached_input(sig):
+    """Forget the remembered prefix after a rollover rebuilds the history."""
+    _CACHED_INPUT_HISTORY.pop(sig, None)
 
 
 def pool_state_note(tok):

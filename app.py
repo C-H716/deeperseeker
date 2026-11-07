@@ -73,11 +73,13 @@ from functions import (
     mask_api_key,
     next_parent,
     parse_tools,
+    peek_cached_input,
     pick_token,
     probe_token,
     probe_token_mute,
     purge_all_tokens_chats,
     purge_chats_for_token,
+    record_cached_input,
     record_file,
     record_usage,
     reply_id,
@@ -955,7 +957,9 @@ async def _record_usage_safe(
     return None
 
 
-ROLLOVER_SUPPRESS_SECONDS = int(os.getenv("DEEPSEEKER_ROLLOVER_SUPPRESS_SECONDS", "600"))
+ROLLOVER_SUPPRESS_SECONDS = int(
+    os.getenv("DEEPSEEKER_ROLLOVER_SUPPRESS_SECONDS", "600")
+)
 # 自上次滚动以来客户端历史至少新增这么多（相对上下文预算的比例）token，才
 # 允许再次滚动。保证抑制不会把远超上游上限的内容硬塞进新 chat。
 ROLLOVER_RESUME_FRACTION = float(
@@ -1023,6 +1027,25 @@ def _note_rollover(messages, model, scope):
     _ROLLOVER_LAST.move_to_end(key)
     while len(_ROLLOVER_LAST) > _ROLLOVER_LAST_MAX:
         _ROLLOVER_LAST.popitem(last=False)
+
+
+def _cached_prompt_tokens(sig, prompt_tokens):
+    """Prompt tokens this turn can read from the upstream prompt cache.
+
+    The DeepSeek web endpoint reports no token metadata, so the bridge cannot
+    read a real cache-hit figure back. Caching still applies upstream: the
+    client resends the whole conversation every turn, so the previous turn's
+    full prompt is a prefix of this turn's prompt. That remembered size is the
+    closest honest reproduction of DeepSeek's own `prompt_cache_hit_tokens`.
+    """
+    cached = peek_cached_input(sig)
+    return max(0, min(cached, prompt_tokens))
+
+
+def _remember_prompt_tokens(next_sig, prompt_tokens):
+    """Record this turn's prompt size as the next turn's cacheable prefix."""
+    if next_sig:
+        record_cached_input(next_sig, prompt_tokens)
 
 
 def _resp_parent(parent_message_id):
@@ -1427,6 +1450,10 @@ async def handle_chat(
                             ast_msg["content"] = clean_text
                         next_messages.append(ast_msg)
                         next_sig = await generate_signature(next_messages, model, scope)
+                        # 本轮 prompt 的全量大小即下一轮可复用的缓存前缀。
+                        _remember_prompt_tokens(
+                            next_sig, count_tok(_messages_text(messages))
+                        )
 
                         await _db(
                             save_session,
@@ -1793,6 +1820,8 @@ async def handle_chat(
                 ast_msg["content"] = clean_text
             next_messages.append(ast_msg)
             next_sig = await generate_signature(next_messages, model, scope)
+            # 本轮 prompt 的全量大小即下一轮可复用的缓存前缀。
+            _remember_prompt_tokens(next_sig, count_tok(_messages_text(messages)))
 
             await _db(
                 save_session,
@@ -1833,6 +1862,9 @@ async def handle_chat(
                 count_tok(_messages_text(messages)),
                 count_tok(_completion_usage_text(clean_text, parsed_tools)),
                 token_id=token_id,
+                cached_tokens=_cached_prompt_tokens(
+                    sig, count_tok(_messages_text(messages))
+                ),
             )
             return format_response(resp_text, model, messages, tools)
     except asyncio.CancelledError:
@@ -2163,6 +2195,8 @@ async def stream_response(
                 ast_msg["content"] = clean_text
             next_messages.append(ast_msg)
             next_sig = generate_signature_sync(next_messages, model, scope)
+            # 本轮 prompt 的全量大小即下一轮可复用的缓存前缀。
+            _remember_prompt_tokens(next_sig, count_tok(_messages_text(messages)))
             await _db(
                 save_session,
                 next_sig,
@@ -2212,7 +2246,13 @@ async def stream_response(
                 # (aborted/failed streams record nothing, mirroring the skip
                 # above so a partial response never pollutes billing).
                 await _record_usage_safe(
-                    scope, "openai", model, in_tokens, out_tokens, token_id=token_id
+                    scope,
+                    "openai",
+                    model,
+                    in_tokens,
+                    out_tokens,
+                    token_id=token_id,
+                    cached_tokens=_cached_prompt_tokens(sig, in_tokens),
                 )
                 usage_chunk = _chat_chunk([], cid=cid, created=created, model=model)
                 usage_chunk["usage"] = {
@@ -2365,6 +2405,8 @@ async def stream_anthropic_response(
                 ast_msg["content"] = clean_text
             next_messages.append(ast_msg)
             next_sig = generate_signature_sync(next_messages, model, scope)
+            # 本轮 prompt 的全量大小即下一轮可复用的缓存前缀。
+            _remember_prompt_tokens(next_sig, count_tok(_messages_text(messages)))
             await _db(
                 save_session,
                 next_sig,
@@ -2435,6 +2477,7 @@ async def stream_anthropic_response(
                     in_tokens,
                     out_tokens,
                     token_id=token_id,
+                    cached_tokens=_cached_prompt_tokens(sig, in_tokens),
                 )
                 for evt in tail_events.split("\n\n"):
                     if evt.strip():
@@ -3141,6 +3184,8 @@ async def stream_responses_response(
                 ast_msg["content"] = final_text.strip()
             next_messages.append(ast_msg)
             next_sig = generate_signature_sync(next_messages, model, scope)
+            # 本轮 prompt 的全量大小即下一轮可复用的缓存前缀。
+            _remember_prompt_tokens(next_sig, count_tok(_messages_text(messages)))
             await _db(
                 save_session,
                 next_sig,
@@ -3299,6 +3344,7 @@ async def stream_responses_response(
                     in_tokens,
                     out_tokens,
                     token_id=token_id,
+                    cached_tokens=_cached_prompt_tokens(sig, in_tokens),
                 )
             except asyncio.CancelledError:
                 pass

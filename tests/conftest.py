@@ -24,7 +24,6 @@ collect_ignore = [
     "test_anti_ban.py",
     "test_context_rollover.py",
     "test_local_fixes.py",
-    "test_prompt_cache_accounting.py",
     "test_real_parent.py",
     "test_responses_api.py",
     "test_token_pool_balance.py",
