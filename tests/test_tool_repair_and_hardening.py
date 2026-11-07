@@ -1079,6 +1079,62 @@ def test_send_message_includes_shumei_device_id_when_cookie_present(monkeypatch)
     assert "parent_message_id" not in captured_json
 
 
+def test_send_message_always_sends_shumei_device_id_key(monkeypatch):
+    """没有指纹时也必须带该键（值为 null）。
+
+    2026-11-07 上游协议变更：带 parent_message_id 的后续轮次缺少
+    shumei_device_id 键会被以 biz_code 26 "invalid message id" 拒绝，
+    而 null 是放行的（移植自 PR #107 0b241f3a2 / rh v90.2）。
+    """
+    from unittest import mock
+
+    import functions
+
+    monkeypatch.setattr(functions, "solve_create_pow", mock.AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        functions, "get_cookies_safely", mock.AsyncMock(return_value={})
+    )
+
+    captured_json = {}
+
+    class FakeStreamResponse:
+        def __init__(self):
+            self.status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def iter_any(self):
+            if False:
+                yield b""
+
+    class FakeClientSession:
+        async def post(self, url, headers=None, json=None, timeout=None, **kwargs):
+            captured_json.clear()
+            captured_json.update(json or {})
+            return FakeStreamResponse()
+
+    monkeypatch.setattr(
+        functions, "get_session", mock.AsyncMock(return_value=FakeClientSession())
+    )
+
+    async def run():
+        gen = functions.send_message("chat-123", "fake-token", "hello", 4242)
+        try:
+            async for _ in gen:
+                pass
+        except Exception:
+            pass
+
+    asyncio.run(run())
+    assert "shumei_device_id" in captured_json
+    assert captured_json["shumei_device_id"] is None
+    assert captured_json["parent_message_id"] == 4242
+
+
 def test_account_isolation_distinct_credentials(monkeypatch, tmp_path):
     from unittest import mock
 

@@ -3713,9 +3713,12 @@ async def _send_message_unlocked(
     if parent_message_id:
         json_data["parent_message_id"] = parent_message_id
 
+    # 2026-11-07 上游协议变更（移植自 PR #107 0b241f3a2，与 rh v90.2 同一结论）：
+    # 带 parent_message_id 的后续轮次若缺少 shumei_device_id 键，会被以
+    # biz_code 26 "invalid message id" 拒绝；该键值为 null 时上游放行。因此
+    # 必须无条件写入（可为 None），而不是「有指纹才发」。
     resolved_shumei = shumei_id or extract_shumei_device_id(cookie)
-    if resolved_shumei:
-        json_data["shumei_device_id"] = resolved_shumei
+    json_data["shumei_device_id"] = resolved_shumei
 
     think_open = False
     got_output = False
@@ -3832,10 +3835,8 @@ async def _send_message_unlocked(
                             yield fragment.get("content", "")
                 return
 
-            if data.get("p") == "response/fragments" and data.get("o") in (
-                "APPEND",
-                None,
-            ):
+            _frag_op = data.get("o")
+            if data.get("p") == "response/fragments" and _frag_op in ("APPEND", None):
                 fragments = data.get("v")
                 if isinstance(fragments, list):
                     for fragment in fragments:
@@ -3845,16 +3846,22 @@ async def _send_message_unlocked(
                                 think_open = False
                             got_output = True
                             got_response = got_response or bool(fragment.get("content"))
-                            yield fragment.get("content", "")
+                            yield fragment.get("content") or ""
                         elif fragment.get("type") == "THINK":
+                            # 上游在 o 缺失时下发的是「片段切割快照」——整段重发当前
+                            # 内容而非增量。此时若思考块已经打开，说明这段文字此前
+                            # 已经输出过，再发一遍就会重复（移植自 PR #107
+                            # 0b241f3a2，与 rh v90.3 同一处修复）。
+                            if _frag_op is None and think_open:
+                                continue
                             if not think_open:
                                 yield "<think>\n"
                                 think_open = True
                             got_output = True
-                            yield fragment.get("content", "")
+                            yield fragment.get("content") or ""
                         else:
                             got_output = True
-                            yield fragment.get("content", "")
+                            yield fragment.get("content") or ""
                 return
 
             v = data.get("v")
