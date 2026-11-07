@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 from functions import (
     count_tokens,
+    get_effort_enhance,
     get_session,
     is_json_object_format,
     request_effort,
@@ -337,7 +338,9 @@ def _render_tool_definition(i):
     if desc:
         lines.append(f"Description: {desc}")
 
-    props = params.get("properties") if isinstance(params.get("properties"), dict) else {}
+    props = (
+        params.get("properties") if isinstance(params.get("properties"), dict) else {}
+    )
     req_set = set(params.get("required") or [])
 
     lines.append(f"Parameters: {json.dumps(params, ensure_ascii=False)}")
@@ -378,9 +381,7 @@ async def extract_tools(tools):
         cache_key = None
 
     json_schema_block = (
-        "<tools>\n"
-        + json.dumps(tools, indent=2, ensure_ascii=False)
-        + "\n</tools>"
+        "<tools>\n" + json.dumps(tools, indent=2, ensure_ascii=False) + "\n</tools>"
     )
     final_tools = [json_schema_block]
     for i in tools:
@@ -693,7 +694,9 @@ def conversation_to_chat_text(messages):
                     fn_name = d.get("name", "")
                     fn_args = d.get("arguments", {})
                     if isinstance(fn_args, dict):
-                        args_str = json.dumps(fn_args, sort_keys=True, ensure_ascii=False)
+                        args_str = json.dumps(
+                            fn_args, sort_keys=True, ensure_ascii=False
+                        )
                     else:
                         args_str = str(fn_args)
                     return f"[call: {fn_name}({args_str})]"
@@ -753,6 +756,9 @@ for _alias in ("xhigh", "ultra", "extreme"):
 
 
 def _with_effort(prompt):
+    # 提示词增强总开关：关闭时不附加任何强化指令，与开关加入前行为一致。
+    if not get_effort_enhance():
+        return prompt
     instruction = EFFORT_INSTRUCTIONS.get(request_effort.get() or "")
     return prompt + instruction + "\n" if instruction else prompt
 
@@ -942,7 +948,10 @@ async def build_prompt(
 
         if tools_extract:
             final_prompt += TOOL_USE_INSTRUCTIONS + "\n"
-        if is_json_object_format(response_format) and JSON_OBJECT_INSTRUCTION not in final_prompt:
+        if (
+            is_json_object_format(response_format)
+            and JSON_OBJECT_INSTRUCTION not in final_prompt
+        ):
             final_prompt += JSON_OBJECT_INSTRUCTION + "\n"
 
     return _with_effort(final_prompt)

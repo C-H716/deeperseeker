@@ -53,6 +53,7 @@ from functions import (
     effort_level,
     find_session,
     get_auth_token,
+    get_effort_enhance,
     get_file_content,
     get_file_token,
     get_isolated_cookies_for_token,
@@ -83,6 +84,7 @@ from functions import (
     restore_token,
     save_session,
     send_message,
+    set_effort_enhance,
     solve_captcha_interactive,
     token_busy,
     upload_file,
@@ -372,9 +374,7 @@ async def lifespan(app: FastAPI):
         logger.info("[ds_backup] %s", restore_message)
     _install_key_access_formatter()
     asyncio.create_task(_warmup_cookies_startup())
-    _backup_task = asyncio.create_task(
-        ds_backup.background_loop(), name="token-backup"
-    )
+    _backup_task = asyncio.create_task(ds_backup.background_loop(), name="token-backup")
     yield
     if _backup_task:
         _backup_task.cancel()
@@ -664,9 +664,7 @@ def _upstream_http_code(exc):
     biz = getattr(exc, "biz_code", None)
     if biz in (40002, 40003, "40002", "40003"):
         return 401
-    if biz in (40012, 40303, "40012", "40303") or "40303" in str(
-        exc
-    ):
+    if biz in (40012, 40303, "40012", "40303") or "40303" in str(exc):
         return 403
     if biz in (40029, 50006, "40029", "50006"):
         return 429
@@ -1012,9 +1010,9 @@ async def _setup_failure_outcome(e, token_id, retry_kwargs):
     if attempt + 1 >= MAX_UPSTREAM_ATTEMPTS:
         return _terminal_error_response(e, retry_kwargs.get("is_anthropic", False))
     retry_kwargs["_attempt"] = attempt + 1
-    retry_kwargs["_auth_rotated"] = bool(
-        retry_kwargs.get("_auth_rotated")
-    ) or auth_class
+    retry_kwargs["_auth_rotated"] = (
+        bool(retry_kwargs.get("_auth_rotated")) or auth_class
+    )
     if token_id is not None:
         retry_kwargs["_exclude_token"] = token_id
     return retry_kwargs
@@ -3402,7 +3400,15 @@ def is_thinking_enabled(body, request=None):
             "1",
         ]:
             return True
-        if effort_str in ["minimal", "none", "off", "disable", "disabled", "false", "0"]:
+        if effort_str in [
+            "minimal",
+            "none",
+            "off",
+            "disable",
+            "disabled",
+            "false",
+            "0",
+        ]:
             return False
 
     if request:
@@ -4528,6 +4534,33 @@ def clean_auth_token(raw: str) -> str:
     ):
         token = token[1:-1].strip()
     return token
+
+
+@app.get("/features/effort-enhance")
+async def effort_enhance_get(request: Request):
+    """读取提示词增强总开关（管理员）。"""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return JSONResponse({"effort_enhance": await _db(get_effort_enhance)})
+
+
+@app.post("/features/effort-enhance")
+async def effort_enhance_set(request: Request):
+    """切换提示词增强总开关（管理员），即时生效，无需重启。"""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+        enabled = bool(body.get("enabled"))
+    except Exception:
+        return JSONResponse({"error": "enabled (bool) required"}, status_code=400)
+    return JSONResponse(
+        {"ok": True, "effort_enhance": await _db(set_effort_enhance, enabled)}
+    )
 
 
 @app.post("/tokens/add")

@@ -59,6 +59,44 @@
 </section>
 
 <section>
+    <h2>Feature Toggles</h2>
+    <p>
+        <strong>Prompt enhancement</strong>
+        <span id="effort-state">...</span>
+        <button type="button" id="effort-btn" onclick="toggleEffort()">...</button>
+    </p>
+    <p>Appends a stronger reasoning instruction when the client asks for a high effort
+       (e.g. <code>reasoning_effort=max</code>). Turning it off restores the default
+       behaviour immediately, no restart needed.</p>
+    <script>
+    async function refreshEffort() {
+        try {
+            const r = await fetch('/features/effort-enhance', {headers: {'Accept': 'application/json'}});
+            if (r.ok) renderEffort((await r.json()).effort_enhance);
+        } catch (e) {}
+    }
+    function renderEffort(on) {
+        document.getElementById('effort-state').textContent = on ? 'ON' : 'OFF';
+        const b = document.getElementById('effort-btn');
+        b.textContent = on ? 'Turn off' : 'Turn on';
+        b.dataset.on = on ? '1' : '0';
+    }
+    async function toggleEffort() {
+        const b = document.getElementById('effort-btn');
+        try {
+            const r = await fetch('/features/effort-enhance', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({enabled: b.dataset.on !== '1'}),
+            });
+            renderEffort((await r.json()).effort_enhance);
+        } catch (e) {}
+    }
+    refreshEffort();
+    </script>
+</section>
+
+<section>
     <h2>Token pool ({{ tokens|length }})</h2>
     {% if tokens %}
     <table>

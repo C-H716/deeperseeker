@@ -133,6 +133,10 @@ def init_db():
         conn.execute("ALTER TABLE tokens ADD COLUMN device_id TEXT")
     if "park_reason" not in existing_cols:
         conn.execute("ALTER TABLE tokens ADD COLUMN park_reason TEXT")
+    # 管理员运行时设置（提示词增强总开关）。
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
     existing_session_cols = {
         row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
     }
@@ -514,13 +518,20 @@ def _biz_data(payload, what="response"):
     data = payload.get("data") if isinstance(payload, dict) else None
     biz = data.get("biz_data") if isinstance(data, dict) else None
     if biz:
-        if isinstance(biz, dict) and (biz.get("is_muted") == 1 or biz.get("biz_code") == 5):
+        if isinstance(biz, dict) and (
+            biz.get("is_muted") == 1 or biz.get("biz_code") == 5
+        ):
             mute_until = biz.get("mute_until") or biz.get("end_at")
             retry_after = None
             if mute_until:
                 with contextlib.suppress(Exception):
                     retry_after = max(1, int(float(mute_until) - time.time()))
-            raise UpstreamBizError(429, f"{what}: account muted until {mute_until}", biz_code=5, retry_after=retry_after)
+            raise UpstreamBizError(
+                429,
+                f"{what}: account muted until {mute_until}",
+                biz_code=5,
+                retry_after=retry_after,
+            )
         return biz
     payload = payload if isinstance(payload, dict) else {}
     code = payload.get("code")
@@ -550,7 +561,9 @@ def _biz_data(payload, what="response"):
         status = 401
     else:
         status = 429
-    raise UpstreamBizError(status, f"{what}: code={code} msg={msg}", biz_code=code, retry_after=retry_after)
+    raise UpstreamBizError(
+        status, f"{what}: code={code} msg={msg}", biz_code=code, retry_after=retry_after
+    )
 
 
 def _parse_cookie_env(val: str) -> dict | None:
@@ -674,9 +687,10 @@ async def get_cookies():
 async def _generate_isolated_cookies_payload():
     if async_playwright is None:
         raise CookieGenerationError("playwright is not installed")
-    headless = (
-        os.getenv("DEEPSEEKER_COOKIE_HEADLESS", "true").lower()
-        in ("1", "true", "yes")
+    headless = os.getenv("DEEPSEEKER_COOKIE_HEADLESS", "true").lower() in (
+        "1",
+        "true",
+        "yes",
     )
     launch_kwargs = {
         "headless": headless,
@@ -825,7 +839,11 @@ async def get_isolated_cookies_for_token(
                 if isinstance(data, dict):
                     expiry = data.get("expiry", 0)
                     c_dict = data.get("cookie")
-                    if c_dict and isinstance(c_dict, dict) and expiry - time.time() > 120:
+                    if (
+                        c_dict
+                        and isinstance(c_dict, dict)
+                        and expiry - time.time() > 120
+                    ):
                         sh_id = row2["shumei_id"] or extract_shumei_device_id(c_dict)
                         d_id = row2["device_id"] or dev_id
                         return c_dict, sh_id, d_id
@@ -837,9 +855,11 @@ async def get_isolated_cookies_for_token(
             return global_c, shumei_id or extract_shumei_device_id(global_c), dev_id
 
         try:
-            final_cookies, expiry, generated_shumei = (
-                await _generate_isolated_cookies_payload()
-            )
+            (
+                final_cookies,
+                expiry,
+                generated_shumei,
+            ) = await _generate_isolated_cookies_payload()
             resolved_shumei = generated_shumei or shumei_id
             update_token_credentials(
                 tid,
@@ -1668,21 +1688,41 @@ async def probe_token(auth_token: str) -> dict:
                 if code == 0:
                     if biz.get("is_muted") == 1 or biz.get("biz_code") == 5:
                         mute_until = biz.get("mute_until") or biz.get("end_at")
-                        return {"status": "muted", "mute_until": mute_until, "msg": "account muted"}
+                        return {
+                            "status": "muted",
+                            "mute_until": mute_until,
+                            "msg": "account muted",
+                        }
                     return {"status": "valid", "msg": "ok"}
                 if code in (40001, 40002, 40003):
-                    return {"status": "invalid", "code": code, "msg": js.get("msg") or "invalid token"}
+                    return {
+                        "status": "invalid",
+                        "code": code,
+                        "msg": js.get("msg") or "invalid token",
+                    }
                 if code == 40012:
-                    return {"status": "banned", "code": code, "msg": js.get("msg") or "user banned"}
+                    return {
+                        "status": "banned",
+                        "code": code,
+                        "msg": js.get("msg") or "user banned",
+                    }
                 if code == 40029:
-                    return {"status": "rate_limited", "code": code, "msg": js.get("msg") or "too many requests"}
+                    return {
+                        "status": "rate_limited",
+                        "code": code,
+                        "msg": js.get("msg") or "too many requests",
+                    }
                 if code == 40303:
                     return {
                         "status": "challenge_required",
                         "code": code,
                         "msg": CAPTCHA_PARK_REASON,
                     }
-                return {"status": "unknown", "code": code, "msg": js.get("msg") or "unknown error"}
+                return {
+                    "status": "unknown",
+                    "code": code,
+                    "msg": js.get("msg") or "unknown error",
+                }
             if resp.status == 202:
                 return {"status": "unknown", "msg": "WAF challenge (202)"}
             if resp.status == 401:
@@ -2057,7 +2097,9 @@ def _dsml_params(body):
         ).strip()
         # string="true" marks a literal string; don't turn "42"/"true" into JSON.
         # ('<｜｜DSML｜｜old_string="true">' puts the type right after the name.)
-        if re.search(r"(?:string\s*=|^\s*=)\s*[\x27\x22]true", pm.group(3), re.IGNORECASE):
+        if re.search(
+            r"(?:string\s*=|^\s*=)\s*[\x27\x22]true", pm.group(3), re.IGNORECASE
+        ):
             args[p_name] = p_val
             continue
         try:
@@ -2224,12 +2266,12 @@ def _repair_tool_names(tools):
     return tools
 
 
-
-
 # The request's reasoning effort ("high", "max", ...) when thinking is on, set by
 # the chat endpoints; build_prompt turns it into a think-harder instruction.
 request_effort = contextvars.ContextVar("request_effort", default=None)
-request_response_format = contextvars.ContextVar("request_response_format", default=None)
+request_response_format = contextvars.ContextVar(
+    "request_response_format", default=None
+)
 
 
 def is_json_object_format(fmt):
@@ -2291,6 +2333,40 @@ def json_mode_coerce(text: str) -> str:
     return json.dumps({"response": text.strip()}, ensure_ascii=False)
 
 
+_effort_enhance_cache = None
+
+
+def get_effort_enhance():
+    """提示词增强是否开启。settings 表持久化，进程内缓存；缺省开启。"""
+    global _effort_enhance_cache
+    if _effort_enhance_cache is None:
+        try:
+            conn = get_db()
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = 'effort_enhance'"
+            ).fetchone()
+            conn.close()
+            _effort_enhance_cache = (row[0] != "off") if row else True
+        except sqlite3.Error:
+            _effort_enhance_cache = True
+    return _effort_enhance_cache
+
+
+def set_effort_enhance(enabled):
+    """写入开关并立即刷新内存缓存，下一个请求即时生效。"""
+    global _effort_enhance_cache
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES ('effort_enhance', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        ("on" if enabled else "off",),
+    )
+    conn.commit()
+    conn.close()
+    _effort_enhance_cache = bool(enabled)
+    return _effort_enhance_cache
+
+
 def effort_level(body):
     """The client's effort string, wherever the dialect puts it."""
     cands = [body.get("reasoning_effort"), body.get("effort")]
@@ -2309,13 +2385,21 @@ def effort_level(body):
 # Structural DSML tag names: a lone wrapper tag is never a call to a tool of
 # that name (unless the client really defines one).
 _DSML_WRAPPER_NAMES = {
-    "function_calls", "function_call", "tool_calls", "tool_call",
-    "calls", "invoke", "parameter", "param",
+    "function_calls",
+    "function_call",
+    "tool_calls",
+    "tool_call",
+    "calls",
+    "invoke",
+    "parameter",
+    "param",
 }
 
 
 def _is_wrapper_name(name, args):
-    return not args and name.lower() in _DSML_WRAPPER_NAMES and name not in _tool_schemas()
+    return (
+        not args and name.lower() in _DSML_WRAPPER_NAMES and name not in _tool_schemas()
+    )
 
 
 def parse_tools(text):
@@ -2448,7 +2532,11 @@ def parse_tools(text):
                     args[p_name] = json.loads(p_val)
                 except Exception:
                     args[p_name] = p_val
-            norm = None if _is_wrapper_name(tool_name, args) else normalize_tool_call(tool_name, args)
+            norm = (
+                None
+                if _is_wrapper_name(tool_name, args)
+                else normalize_tool_call(tool_name, args)
+            )
             if norm:
                 tools.append(norm)
         if not tools:
@@ -2486,7 +2574,11 @@ def parse_tools(text):
                         r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", desc_match.group(1)
                     ).strip("\x22\x27() ")
                     args["description"] = clean_desc
-                norm = None if _is_wrapper_name(tool_name, args) else normalize_tool_call(tool_name, args)
+                norm = (
+                    None
+                    if _is_wrapper_name(tool_name, args)
+                    else normalize_tool_call(tool_name, args)
+                )
                 if norm:
                     tools.append(norm)
         if tools:
@@ -2693,9 +2785,7 @@ def parse_tools(text):
                             parsed_obj = None
                     if parsed_obj is not None:
                         items = (
-                            parsed_obj
-                            if isinstance(parsed_obj, list)
-                            else [parsed_obj]
+                            parsed_obj if isinstance(parsed_obj, list) else [parsed_obj]
                         )
                         if isinstance(parsed_obj, dict) and isinstance(
                             parsed_obj.get("tool_calls") or parsed_obj.get("calls"),
@@ -3388,9 +3478,7 @@ def _raise_empty_sse_response(
             retry_after = 3600
         elif biz_code in (40029, "40029"):
             retry_after = TOKEN_COOLDOWN_SECONDS
-        status = code_map.get(
-            biz_code, 403 if str(biz_code).startswith("403") else 502
-        )
+        status = code_map.get(biz_code, 403 if str(biz_code).startswith("403") else 502)
         raise UpstreamBizError(
             status,
             f"{msg}: code={biz_code} msg={biz_msg}",
@@ -3474,15 +3562,11 @@ async def _send_message_unlocked(
     cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
     file_ids = file_ids_ or []
 
-    pow_resp = await solve_create_pow(
-        "/api/v0/chat/completion", auth_token
-    )
+    pow_resp = await solve_create_pow("/api/v0/chat/completion", auth_token)
     headers = get_headers(auth_token, pow_resp, device_id=device_id)
     hif_env = os.getenv("DEEPSEEKER_HIF_ENABLED")
     should_hif = (
-        hif_env.lower() in ("true", "1", "yes")
-        if hif_env is not None
-        else True
+        hif_env.lower() in ("true", "1", "yes") if hif_env is not None else True
     )
     if should_hif:
         hif_leim = await get_hif_token("leim")
@@ -3532,7 +3616,9 @@ async def _send_message_unlocked(
     )
     async with resp:
         resp_ct = (getattr(resp, "headers", None) or {}).get("content-type") or ""
-        if resp.status == 202 or (resp.status != 200 and "text/html" in str(resp_ct).lower()):
+        if resp.status == 202 or (
+            resp.status != 200 and "text/html" in str(resp_ct).lower()
+        ):
             invalidate_token_cookies(auth_token)
             asyncio.create_task(get_isolated_cookies_for_token(auth_token))
             raise UpstreamError(
@@ -3561,7 +3647,8 @@ async def _send_message_unlocked(
         def _check_incomplete():
             if incomplete and not got_response:
                 raise UpstreamError(
-                    502, "DeepSeek stopped the reply before any answer (status INCOMPLETE)"
+                    502,
+                    "DeepSeek stopped the reply before any answer (status INCOMPLETE)",
                 )
 
         async def _emit_from_event(data):
@@ -3626,7 +3713,10 @@ async def _send_message_unlocked(
                             yield fragment.get("content", "")
                 return
 
-            if data.get("p") == "response/fragments" and data.get("o") in ("APPEND", None):
+            if data.get("p") == "response/fragments" and data.get("o") in (
+                "APPEND",
+                None,
+            ):
                 fragments = data.get("v")
                 if isinstance(fragments, list):
                     for fragment in fragments:
@@ -3715,9 +3805,7 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
     cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
     session = await get_session()
     file_size = len(file_bytes)
-    pow_response = await solve_create_pow(
-        "/api/v0/file/upload_file", auth_token
-    )
+    pow_response = await solve_create_pow("/api/v0/file/upload_file", auth_token)
     boundary = b"----WebKitFormBoundaryTB0pXOQR2RL219Hu"
     safe_name = re.sub(r"[^ -~]", "_", file_name).replace('"', "_") or "file.bin"
     body_parts = [

@@ -23,7 +23,6 @@ os.environ.setdefault("DEEPSEEKER_ALLOW_DEFAULT_ADMIN", "")
 collect_ignore = [
     "test_anti_ban.py",
     "test_context_rollover.py",
-    "test_effort_switch.py",
     "test_local_fixes.py",
     "test_nested_arguments.py",
     "test_park.py",
