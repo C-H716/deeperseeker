@@ -98,7 +98,7 @@
                             <td><code class="nowrap">{{ tok['token'][:12] }}…{{ tok['token'][-4:] }}</code></td>
                             <td data-cell="status">
                                 <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] in ('RATE_LIMITED', 'CHECK_ERROR', 'MUTED') %}warn{% else %}err{% endif %}" {% if tok.get('quarantine_reason') %}title="{{ tok.get('quarantine_reason') }}"{% endif %}>
-                                    {% if tok['status'] == 'ACTIVE' %}有效{% elif tok['status'] == 'RATE_LIMITED' %}被限流{% elif tok['status'] == 'INVALID' %}已失效{% elif tok['status'] == 'CHECK_ERROR' %}检查失败{% elif tok['status'] == 'QUARANTINED' %}已隔离{% elif tok['status'] == 'MUTED' %}确认禁言{% else %}{{ tok['status'] }}{% endif %}
+                                    {% if tok['status'] == 'ACTIVE' %}有效{% elif tok['status'] == 'RATE_LIMITED' %}被限流{% elif tok['status'] == 'INVALID' %}已失效{% elif tok['status'] == 'CHECK_ERROR' %}检查失败{% elif tok['status'] == 'QUARANTINED' %}已隔离{% elif tok['status'] == 'MUTED' %}确认禁言{% elif tok['status'] == 'PARKED' %}需人机验证{% else %}{{ tok['status'] }}{% endif %}
                                 </span>
                             </td>
                             <td class="muted nowrap" data-cell="note">{{ tok['state_note'] }}</td>
@@ -351,6 +351,7 @@ const STATUS_META = {
     CHECK_ERROR: ['warn', '检查失败'],
     QUARANTINED: ['err', '已隔离'],
     MUTED: ['warn', '确认禁言'],
+    PARKED: ['warn', '需人机验证'],
 };
 const pad2 = value => String(value).padStart(2, '0');
 

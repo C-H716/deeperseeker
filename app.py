@@ -72,6 +72,7 @@ from functions import (  # noqa: E402
     login_deepseek_account,
     mark_active,
     mark_limited,
+    mark_parked,
     mark_quarantined,
     parse_tools,
     peek_cached_input,
@@ -741,6 +742,17 @@ async def _handle_upstream_failure(e, token_id):
     """
     if isinstance(e, UpstreamMutedError):
         await _db(mark_quarantined, token_id, str(e), e.mute_until)
+        return
+    # 40303 = 上游要求人机验证（移植自 artyom08-dev 的 parking 设计）。
+    # 免费方案无法在服务端自动解验证码，只能停放账号并提示人工去浏览器解。
+    if "40303" in str(e):
+        await _db(
+            mark_parked,
+            token_id,
+            "上游要求人机验证（40303）：请在自己电脑的浏览器登录该账号、"
+            "发一条消息解掉验证码，再点「恢复」",
+            1800,
+        )
         return
     await _db(mark_limited, token_id)
     if _upstream_http_code(e) == 401:
@@ -4037,7 +4049,7 @@ async def dashboard(request: Request):
     tokens = await _db(get_tokens)
     for tok in tokens:
         tok["state_note"] = pool_state_note(tok)[1]
-        tok["can_restore"] = tok["status"] in ("QUARANTINED", "MUTED")
+        tok["can_restore"] = tok["status"] in ("QUARANTINED", "MUTED", "PARKED")
     accounts = await _db(get_accounts)
     rotation_stats = await _db(get_rotation_stats)
     account_error = request.query_params.get("account_error")
@@ -4087,6 +4099,7 @@ async def dashboard_status(request: Request):
                     "limited_until": tok["limited_until"],
                     "quarantine_reason": tok.get("quarantine_reason"),
                     "mute_until": tok.get("mute_until"),
+                    "park_reason": tok.get("park_reason"),
                     "state_note": pool_state_note(tok)[1],
                     "last_checked_at": tok["last_checked_at"],
                     "last_check_error": tok["last_check_error"],

@@ -306,6 +306,10 @@ def init_db():
         conn.execute("ALTER TABLE tokens ADD COLUMN quarantine_reason TEXT")
     if "mute_until" not in token_columns:
         conn.execute("ALTER TABLE tokens ADD COLUMN mute_until REAL")
+    # 人机验证停放（移植自 artyom08-dev 的 parking 设计）：PARKED 带计时器，
+    # 到期自动回到轮换；park_reason 供面板展示具体原因。
+    if "park_reason" not in token_columns:
+        conn.execute("ALTER TABLE tokens ADD COLUMN park_reason TEXT")
     # 桥内登录自动重登凭据：移植自 v89.12。密码以本地密钥加密后存放，
     # 从不写入日志或返回给页面；未添加账号时这些列保持为空。
     account_columns = {
@@ -1197,8 +1201,8 @@ def get_tokens():
     conn = get_db()
     rows = conn.execute(
         "SELECT id, alias, token, status, last_checked_at, last_check_error, "
-        "account_id, last_used, limited_until, quarantine_reason, mute_until "
-        "FROM tokens ORDER BY id"
+        "account_id, last_used, limited_until, quarantine_reason, mute_until, "
+        "park_reason FROM tokens ORDER BY id"
     ).fetchall()
     conn.close()
     return [
@@ -1214,6 +1218,7 @@ def get_tokens():
             "limited_until": r[8],
             "quarantine_reason": r[9],
             "mute_until": r[10],
+            "park_reason": r[11],
         }
         for r in rows
     ]
@@ -1230,6 +1235,12 @@ def pool_state_note(tok):
     lowered = reason.lower()
     if status == "MUTED":
         return "muted", "上游确认禁言，解禁后点「恢复」即可使用"
+    if status == "PARKED":
+        return (
+            "captcha",
+            "上游要求人机验证（40303）：请在自己电脑的浏览器登录该账号、"
+            "发一条消息解掉验证码，再点「恢复」",
+        )
     if status == "QUARANTINED":
         if "muted" in lowered or "禁言" in reason:
             return "muted", "上游确认禁言，解禁后点「恢复」即可使用"
@@ -1465,12 +1476,15 @@ def pick_token(exclude=None):
         recovered = []  # 冷却到期、本次翻回 ACTIVE 的 token
         cooling = []  # (token_id, 恢复时刻)：仍在冷却，用于全冷却兜底
         for tid, status, until, last_used in rows:
-            if status not in ("ACTIVE", "RATE_LIMITED"):
+            if status not in ("ACTIVE", "RATE_LIMITED", "PARKED"):
                 continue  # INVALID / CHECK_ERROR 属永久性故障，始终排除
+            if status == "PARKED" and until and until > now:
+                # 人机验证需人工处理，不参与「全冷却兜底」等待。
+                continue
             if status == "RATE_LIMITED" and until and until > now:
                 cooling.append((tid, until))
                 continue
-            if status == "RATE_LIMITED":
+            if status in ("RATE_LIMITED", "PARKED"):
                 recovered.append(tid)
             available.append((tid, last_used or 0.0))
 
@@ -1478,8 +1492,8 @@ def pick_token(exclude=None):
         if pickable:
             if recovered:
                 conn.executemany(
-                    "UPDATE tokens SET status = 'ACTIVE', limited_until = NULL "
-                    "WHERE id = ?",
+                    "UPDATE tokens SET status = 'ACTIVE', limited_until = NULL, "
+                    "park_reason = NULL WHERE id = ?",
                     [(tid,) for tid in recovered],
                 )
                 logger.info(
@@ -1506,7 +1520,8 @@ def pick_token(exclude=None):
         # 禁言隔离行不得作为「无可用账号」时的兜底被选中，否则会继续用
         # 死号发请求；其余状态沿用既有兜底语义（v89.7 的隔离约束）。
         row = conn.execute(
-            "SELECT id FROM tokens WHERE status != 'QUARANTINED' ORDER BY id LIMIT 1"
+            "SELECT id FROM tokens WHERE status NOT IN ('QUARANTINED', 'PARKED') "
+            "ORDER BY id LIMIT 1"
         ).fetchone()
         return row[0] if row else None
     finally:
@@ -1545,6 +1560,25 @@ def mark_active(token_id):
     conn.close()
 
 
+def mark_parked(token_id, reason, seconds=1800):
+    """账号临时停放：退出轮换，到期自动回到候选集。
+
+    移植自 artyom08-dev 的 parking 设计。与 QUARANTINED 的区别是有计时器：
+    适合「人机验证 / 短暂封禁」这类过一段时间会自行缓解的状态；到期由
+    pick_token 翻回 ACTIVE，也可由管理员提前恢复。
+    """
+    hold = max(60, min(int(seconds or 1800), 7 * 86400))
+    logger.warning("Token #%d PARKED for %ds: %s", token_id, hold, reason)
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET status = 'PARKED', limited_until = ?, "
+        "park_reason = ? WHERE id = ?",
+        (time.time() + hold, str(reason or ""), token_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def mark_quarantined(token_id, reason, mute_until=None):
     """账号退出轮换，直到管理员显式恢复。
 
@@ -1574,7 +1608,8 @@ def restore_token(token_id):
     conn = get_db()
     conn.execute(
         "UPDATE tokens SET status = 'ACTIVE', limited_until = NULL, "
-        "quarantine_reason = NULL, mute_until = NULL WHERE id = ?",
+        "quarantine_reason = NULL, mute_until = NULL, park_reason = NULL "
+        "WHERE id = ?",
         (token_id,),
     )
     conn.commit()
