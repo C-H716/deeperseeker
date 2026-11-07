@@ -2087,6 +2087,49 @@ def count_tokens(text, model="deepseek-v4.1-flash"):
     return len(deepseek_tokenizer.ds_token.encode(text))
 
 
+_NESTED_ARG_KEYS = frozenset({"arguments", "parameters", "input", "args", "params"})
+
+
+def _unwrap_nested_arguments(args):
+    """Collapse the double-wrapped ``{"arguments": {...}}`` shape.
+
+    DeepSeek V4 occasionally emits the whole argument object as a single
+    ``arguments`` parameter (or as the value of a JSON ``arguments`` field),
+    so the decoded payload carries one extra level. Unwrap only when the
+    wrapper is the sole key and its value is itself an object, which leaves
+    genuine single-key tools untouched.
+    """
+    for _ in range(2):
+        if isinstance(args, str):
+            try:
+                decoded = json.loads(args)
+            except Exception:
+                return args
+            if not isinstance(decoded, (dict, list)):
+                return args
+            args = decoded
+        if not isinstance(args, dict) or len(args) != 1:
+            return args
+        key = next(iter(args))
+        if key.lower() not in _NESTED_ARG_KEYS:
+            return args
+        inner = args[key]
+        # 内层也可能是序列化后的 JSON 字符串（XML parameter 的 string="true"
+        # 语义会把整个对象当字符串发出），必须先解码才能继续判断层级。
+        if isinstance(inner, str):
+            try:
+                decoded_inner = json.loads(inner)
+            except Exception:
+                return args
+            if not isinstance(decoded_inner, (dict, list)):
+                return args
+            inner = decoded_inner
+        if not isinstance(inner, (dict, list)):
+            return args
+        args = inner
+    return args
+
+
 def normalize_tool_call(tool_data_or_name, args_if_name=None):
     if isinstance(tool_data_or_name, str):
         name = tool_data_or_name
@@ -2128,6 +2171,8 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
     if not name or not isinstance(name, str):
         return None
     args = _clean_tool_arg(args)
+    # 双层包裹的 arguments 先拆一层，否则工具会收到 {"arguments": {...}}。
+    args = _unwrap_nested_arguments(args)
     if isinstance(args, (dict, list)):
         args_str = json.dumps(args)
     elif isinstance(args, str):
