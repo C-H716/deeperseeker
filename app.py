@@ -128,6 +128,7 @@ API_KEY, _api_key_generated = _resolve_api_key()
 ADMIN_USER = os.getenv("DEEPSEEKER_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("DEEPSEEKER_ADMIN_PASSWORD", "admin")
 
+import ds_backup
 from middleware import RealIPMiddleware, RecovererMiddleware, RequestIDMiddleware
 from plugin_helper import (
     MAX_SUMMARY_TOKENS,
@@ -376,6 +377,7 @@ async def _record_usage(
 TOKEN_CHECK_INTERVAL = int(os.getenv("DEEPSEEKER_TOKEN_CHECK_INTERVAL", "300"))
 _token_check_lock = asyncio.Lock()
 _token_check_task = None
+_backup_task = None
 _token_check_state = {"running": False, "last_run_at": None, "last_results": []}
 
 
@@ -425,15 +427,25 @@ async def _db(fn, *args, **kwargs):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _token_check_task
+    global _token_check_task, _backup_task
     # B5 (Stage 1 audit): 数据库初始化是阻塞的 sqlite3 往返，启动时同样不得
     # 占用事件循环，统一经 _db() 转入线程池执行。
     await _db(init_db)
+    # 号池为空时尝试从加密备份恢复；未配置备份时保持静默。
+    restore_message = await _db(ds_backup.restore_if_needed)
+    if restore_message != "backup disabled":
+        logger.info("[ds_backup] %s", restore_message)
     _install_key_access_formatter()
     _token_check_task = asyncio.create_task(
         _token_check_loop(), name="token-health-check"
     )
+    _backup_task = asyncio.create_task(ds_backup.background_loop(), name="token-backup")
     yield
+    if _backup_task:
+        _backup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _backup_task
+        _backup_task = None
     if _token_check_task:
         _token_check_task.cancel()
         try:
