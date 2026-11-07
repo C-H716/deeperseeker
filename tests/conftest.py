@@ -39,5 +39,4 @@ collect_ignore = [
     "test_rate_limit_failover.py",
     "test_rollover_suppression.py",
     "test_tag_drift.py",
-    "test_usage_stats.py",
 ]

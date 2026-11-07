@@ -91,6 +91,19 @@ from functions import (
     usage_by_day_key,
     warmup_all_tokens_cookies,
 )
+from usage_stats import (
+    RANGE_LABELS,
+    aggregate,
+    beijing_now,
+    build_heatmap,
+    cost_of_hour,
+    earliest_day,
+    hit_rate_series,
+    hour_key,
+    query_hours,
+    resolve_range,
+)
+from usage_stats import record_usage as record_usage_hour
 
 
 def _resolve_api_key():
@@ -391,6 +404,22 @@ templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 app.mount(
     "/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static"
 )
+
+
+def _static_version() -> str:
+    """用 style.css 的 mtime 作为缓存版本号。
+
+    StaticFiles 不发送 Cache-Control，浏览器会按 Last-Modified 做启发式缓存；
+    样式表 URL 固定不变时，即便镜像已重建，旧页面仍会沿用缓存的旧样式。
+    在 URL 上挂版本号可强制浏览器重新拉取，无需用户手动强刷。
+    """
+    try:
+        return str(int(os.path.getmtime(os.path.join(BASE_DIR, "static", "style.css"))))
+    except OSError:
+        return "0"
+
+
+templates.env.globals["static_version"] = _static_version()
 
 
 @app.middleware("http")
@@ -891,17 +920,35 @@ def _replay_stream(gen, first):
     return _wrapped()
 
 
-async def _record_usage_safe(scope, surface, model, in_tokens, out_tokens):
+async def _record_usage_safe(
+    scope, surface, model, in_tokens, out_tokens, token_id=None, cached_tokens=0
+):
     """P0-6: record one completed turn. Failure-proof by design — a stats
     write must never break (or delay beyond a thread hop) a served response.
-    The key is masked here so raw key material never reaches the store."""
+    The key is masked here so raw key material never reaches the store.
+
+    两处落库：``usage`` 表按每轮一行留原始记录（供 /dashboard 按天汇总），
+    ``usage_hours`` 表按小时桶累加（供 /stats 峰谷分档计价）。两者各自
+    容错，任一失败都不影响另一处，也不影响已经生成的响应。
+    """
+    masked = mask_api_key(scope)
     try:
-        return await _db(
-            record_usage, mask_api_key(scope), surface, model, in_tokens, out_tokens
-        )
+        await _db(record_usage, masked, surface, model, in_tokens, out_tokens)
     except Exception:
         logger.warning("usage record failed (non-fatal)", exc_info=True)
-        return None
+    try:
+        await _db(
+            record_usage_hour,
+            model=model,
+            token_id=token_id,
+            api_key=masked,
+            input_tokens=in_tokens,
+            output_tokens=out_tokens,
+            cache_read_tokens=cached_tokens,
+        )
+    except Exception:
+        logger.warning("hourly usage record failed (non-fatal)", exc_info=True)
+    return None
 
 
 def _resp_parent(parent_message_id):
@@ -1701,6 +1748,7 @@ async def handle_chat(
                 req_model or model,
                 count_tok(_messages_text(messages)),
                 count_tok(_completion_usage_text(clean_text, parsed_tools)),
+                token_id=token_id,
             )
             return format_response(resp_text, model, messages, tools)
     except asyncio.CancelledError:
@@ -2070,7 +2118,9 @@ async def stream_response(
                 # P0-6: completed streamed turns record exactly one usage row
                 # (aborted/failed streams record nothing, mirroring the skip
                 # above so a partial response never pollutes billing).
-                await _record_usage_safe(scope, "openai", model, in_tokens, out_tokens)
+                await _record_usage_safe(
+                    scope, "openai", model, in_tokens, out_tokens, token_id=token_id
+                )
                 usage_chunk = _chat_chunk([], cid=cid, created=created, model=model)
                 usage_chunk["usage"] = {
                     "prompt_tokens": in_tokens,
@@ -2283,6 +2333,7 @@ async def stream_anthropic_response(
                     req_model if req_model else model,
                     in_tokens,
                     out_tokens,
+                    token_id=token_id,
                 )
                 for evt in tail_events.split("\n\n"):
                     if evt.strip():
@@ -2309,8 +2360,6 @@ def _completion_usage_text(clean_text, parsed_tools):
 
 
 def format_response(text, model, messages, tools=None, response_format=None):
-    from functions import DEEPSEEK_TARIFFS
-
     if response_format is None:
         response_format = request_response_format.get()
 
@@ -2336,10 +2385,15 @@ def format_response(text, model, messages, tools=None, response_format=None):
     # to pay for.
     usage_text = _completion_usage_text(clean_text, parsed_tools)
     out_tokens = count_tok(usage_text) if usage_text else 0
-    tariff = DEEPSEEK_TARIFFS["deepseek-v4.1-flash"]
-    cost = (in_tokens / 1_000_000 * tariff["cache_miss_input"]) + (
-        out_tokens / 1_000_000 * tariff["output_generation"]
+    # 计价与 /stats 面板同源：输入按缓存命中/未命中拆分，并按当前时刻的峰谷
+    # 档取价。这里是非流式的最终响应，只能按「生成完成的这一刻」定档；面板
+    # 的逐小时聚合仍以采样落库时的小时键为准，两者对同一小时不会给出不同档位。
+    charge = cost_of_hour(
+        model,
+        {"cache_hit": 0, "cache_miss": in_tokens, "output": out_tokens},
+        hour_key(beijing_now()),
     )
+    cost = charge["total"]
 
     msg_dict = {
         "role": "assistant",
@@ -3124,6 +3178,7 @@ async def stream_responses_response(
                     model_name,
                     in_tokens,
                     out_tokens,
+                    token_id=token_id,
                 )
             except asyncio.CancelledError:
                 pass
@@ -4536,15 +4591,89 @@ def clean_auth_token(raw: str) -> str:
     return token
 
 
+# 图表降采样阈值：小时点超过这个数（约 30 天及以上区间）就退回按天聚合，
+# 否则 Chart.js 要在页面上画上千根柱子，渲染会明显卡顿。
+CHART_MAX_HOUR_POINTS = 720
+
+
+def _chart_series(stats, from_hour):
+    """挑图表的出点粒度，返回 (序列, "hour" / "day")。
+
+    24 小时窗口逐小时出点才能还原峰谷两档；再长的区间按小时出点会把
+    图挤成一团，超过 CHART_MAX_HOUR_POINTS 就改用逐日序列。
+    """
+    if from_hour and len(stats["hourly"]) <= CHART_MAX_HOUR_POINTS:
+        return stats["hourly"], "hour"
+    return stats["daily"], "day"
+
+
+def _chart_from_stats(stats, from_hour):
+    """把区间统计折成 Chart.js 需要的多序列。
+
+    峰谷两档成本各自成列、叠成同一根柱，便于一眼看出高峰时段多花的钱；
+    token 按输入（未缓存）/ 输出 / 缓存读拆三条折线走右轴，与顶部卡片的
+    口径一致（缓存写不单独出线，它已计入区间总量）。
+
+    命中率序列也在这里出：本函数才知道图表最终采用哪个粒度，模板不该
+    自己再按分母算一遍。
+
+    @param from_hour 区间是否为滚动 24 小时窗口（resolve_range 的小时下界
+        非 None）。只有它才值得逐小时出点，其余区间一律按天。
+    """
+    series, granularity = _chart_series(stats, from_hour)
+    if granularity == "hour":
+        labels = [s["hour"][11:] + ":00" for s in series]
+    else:
+        labels = [s["day"][5:] for s in series]
+    hit_rate = [round(v, 6) for v in hit_rate_series(series)]
+    return {
+        "labels": labels,
+        "cost_peak": [round(s["cost_peak"], 6) for s in series],
+        "cost_off_peak": [round(s["cost_off_peak"], 6) for s in series],
+        "input": [s["cache_miss"] for s in series],
+        "output": [s["output"] for s in series],
+        "cache_read": [s["cache_hit"] for s in series],
+        "cache_hit_rate": hit_rate,
+        "granularity": granularity,
+    }
+
+
 @app.get("/stats", response_class=HTMLResponse)
 async def stats_page(request: Request):
-    """按天 × API Key 的用量统计页（管理员）。"""
+    """逐小时采样聚合的使用统计页：峰谷计价、趋势图、热力图与模型拆分。"""
     try:
         get_current_admin(request)
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
-    rows = await _db(usage_by_day_key, 0.0)
-    return templates.TemplateResponse(request, "stats_simple.html", {"rows": rows})
+    # resolve_range 读的是 parse_qs 形状（值一律是列表），QueryParams 直接转过去会
+    # 拿到裸字符串，故在这里包一层。
+    params = {k: [v] for k, v in request.query_params.items()}
+    # 「全部」预设的起点只能从库里读：resolve_range 是纯函数，读不到库，
+    # 所以先取最早一天再喂给它。
+    earliest = await _db(earliest_day)
+    from_day, to_day, from_hour, to_hour = resolve_range(params, earliest)
+    if from_hour:
+        rows = await _db(query_hours, from_hour, to_hour)
+    else:
+        rows = await _db(query_hours, from_day + "T00", to_day + "T23")
+    # 号池成员用别名显示，别名为空才退回 "Token #id"。
+    tokens = await _db(get_tokens)
+    labels = {
+        "tokens": {t["id"]: (t["alias"] or f"Token #{t['id']}") for t in tokens},
+        "keys": {},
+    }
+    stats = aggregate(rows, from_day, to_day, labels)
+    return templates.TemplateResponse(
+        request,
+        "stats.html",
+        {
+            "stats": stats,
+            "chart": _chart_from_stats(stats, bool(from_hour)),
+            "heatmap": build_heatmap(stats["daily"], from_day, to_day),
+            "range_preset": params.get("range", ["30"])[0],
+            "range_labels": RANGE_LABELS,
+        },
+    )
 
 
 @app.get("/features/effort-enhance")

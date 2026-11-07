@@ -164,6 +164,28 @@ def init_db():
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_usage_day_key ON usage(day, key_alias)"
     )
+    # 逐小时用量桶（usage_stats.py 的落库表）。与上面的 usage 表并存：
+    # usage 按「每轮一行」留原始记录便于审计，usage_hours 按
+    # (小时, 模型, token, API Key) UPSERT 累加，供峰谷分档计价使用——
+    # 高峰窗口边界落在整点，日粒度无法反推每次调用属于哪一档。
+    # token_id -1 与 '' 代表「未知」，使主键永不出现 NULL（SQLite 把 NULL
+    # 视作互不相等，同一桶会被重复插入）。
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS usage_hours (
+            hour TEXT NOT NULL,
+            model TEXT NOT NULL,
+            token_id INTEGER NOT NULL DEFAULT -1,
+            api_key TEXT NOT NULL DEFAULT '',
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+            requests INTEGER NOT NULL DEFAULT 0,
+            last_seen REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY (hour, model, token_id, api_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_usage_hours_hour ON usage_hours(hour);
+    """)
     conn.commit()
     conn.close()
     try:
