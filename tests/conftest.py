@@ -25,8 +25,6 @@ collect_ignore = [
     "test_context_rollover.py",
     "test_local_fixes.py",
     "test_nested_arguments.py",
-    "test_park.py",
-    "test_pool_ops.py",
     "test_prompt_cache_accounting.py",
     "test_real_parent.py",
     "test_responses_api.py",

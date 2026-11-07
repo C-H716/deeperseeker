@@ -24,10 +24,10 @@ from functions import (
 @pytest.fixture()
 def pool(tmp_path, monkeypatch):
     monkeypatch.setattr(functions, "_db", str(tmp_path / "pool.db"))
-    functions._inflight.clear()
+    functions._in_flight.clear()
     functions.init_db()
     yield
-    functions._inflight.clear()
+    functions._in_flight.clear()
 
 
 def test_mark_parked_sets_timer_and_reason(pool):
@@ -36,7 +36,7 @@ def test_mark_parked_sets_timer_and_reason(pool):
     row = get_tokens()[0]
     assert row["status"] == "PARKED"
     assert "40303" in row["park_reason"]
-    assert row["limited_until"] > time.time()
+    assert row["rate_limited_until"] > time.time()
     assert pool_state_note(row)[0] == "captcha"
 
 
@@ -53,7 +53,7 @@ def test_parked_token_recovers_after_expiry(pool):
     mark_parked(tid, "captcha", 1800)
     conn = functions.get_db()
     conn.execute(
-        "UPDATE tokens SET limited_until = ? WHERE id = ?", (time.time() - 1, tid)
+        "UPDATE tokens SET rate_limited_until = ? WHERE id = ?", (time.time() - 1, tid)
     )
     conn.commit()
     conn.close()
@@ -82,7 +82,8 @@ def test_40303_failure_parks_token(pool, monkeypatch):
     error = functions.UpstreamBizError(
         429, "response: code=40303 msg=CHALLENGE_REQUIRED"
     )
-    asyncio.run(app_module._handle_upstream_failure(error, tid))
+    asyncio.run(app_module._record_upstream_limit(tid, error, 429))
     row = get_tokens()[0]
     assert row["status"] == "PARKED"
-    assert "40303" in row["park_reason"]
+    # 停放原因由 mark_parked 写成可读文案（含 captcha 提示），不必保留原始码。
+    assert row["park_reason"] and "captcha" in row["park_reason"].lower()

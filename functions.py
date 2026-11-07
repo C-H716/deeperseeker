@@ -133,6 +133,12 @@ def init_db():
         conn.execute("ALTER TABLE tokens ADD COLUMN device_id TEXT")
     if "park_reason" not in existing_cols:
         conn.execute("ALTER TABLE tokens ADD COLUMN park_reason TEXT")
+    # 隔离原因与解禁时间：面板要告诉运维「为什么被隔离、什么时候能回来」。
+    # 幂等 ALTER，旧数据卷自动兼容。
+    if "quarantine_reason" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN quarantine_reason TEXT")
+    if "mute_until" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN mute_until REAL")
     # 管理员运行时设置（提示词增强总开关）。
     conn.execute(
         "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -1113,6 +1119,8 @@ def add_token(token, alias=None, cookies=None, shumei_id=None, device_id=None):
     )
     conn.commit()
     conn.close()
+    # 返回新行的 id：调用方（面板添加、测试、后续状态标记）需要它定位令牌。
+    return next_id
 
 
 def update_token_credentials(
@@ -1157,7 +1165,8 @@ def invalidate_token_cookies(token_id_or_token):
 def get_tokens():
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, alias, token, status, cookies, shumei_id, device_id, park_reason FROM tokens"
+        "SELECT id, alias, token, status, cookies, shumei_id, device_id, park_reason, "
+        "quarantine_reason, mute_until, rate_limited_until FROM tokens"
     ).fetchall()
     conn.close()
     return [
@@ -1170,6 +1179,9 @@ def get_tokens():
             "shumei_id": r[5],
             "device_id": r[6],
             "park_reason": r[7],
+            "quarantine_reason": r[8],
+            "mute_until": r[9],
+            "rate_limited_until": r[10],
         }
         for r in rows
     ]
@@ -1323,7 +1335,8 @@ def pick_token(exclude=None):
         if recovered:
             conn = get_db()
             conn.executemany(
-                "UPDATE tokens SET status = 'ACTIVE', rate_limited_until = NULL WHERE id = ?",
+                "UPDATE tokens SET status = 'ACTIVE', rate_limited_until = NULL, "
+                "park_reason = NULL WHERE id = ?",
                 [(tid,) for tid in recovered],
             )
             conn.commit()
@@ -1364,21 +1377,22 @@ def pick_token(exclude=None):
     return row[0] if row else None
 
 
-def mark_quarantined(token_id, reason):
+def mark_quarantined(token_id, reason, mute_until=None):
     """Take a token out of rotation until an operator restores it (P0-3).
 
     Unlike RATE_LIMITED there is no timer on this state: rate_limited_until is
     cleared so pick_token()'s auto-recovery can never mistake a quarantined row
-    for a cooled-down one. The reason is logged for whoever is watching the
-    pool.
+    for a cooled-down one. 原因与解禁时间一并落库，面板据此告诉运维该做什么；
+    mute_until 只是展示用，不参与调度。
     """
     logger.warning(
         "Token #%d QUARANTINED (manual return required): %s", token_id, reason
     )
     conn = get_db()
     conn.execute(
-        "UPDATE tokens SET status = ?, rate_limited_until = NULL WHERE id = ?",
-        ("QUARANTINED", token_id),
+        "UPDATE tokens SET status = ?, rate_limited_until = NULL, "
+        "quarantine_reason = ?, mute_until = ? WHERE id = ?",
+        ("QUARANTINED", str(reason)[:500], mute_until, token_id),
     )
     conn.commit()
     conn.close()
@@ -1425,7 +1439,8 @@ def restore_token(token_id):
     conn = get_db()
     conn.execute(
         "UPDATE tokens SET status = ?, rate_limited_until = NULL, "
-        "consecutive_403 = 0, park_reason = NULL WHERE id = ?",
+        "consecutive_403 = 0, park_reason = NULL, quarantine_reason = NULL, "
+        "mute_until = NULL WHERE id = ?",
         ("ACTIVE", token_id),
     )
     conn.commit()
@@ -1617,6 +1632,42 @@ def usage_by_day_key(since_ts=0.0):
     return out
 
 
+def pool_state_note(tok):
+    """把号池状态翻译成五态说明。
+
+    返回 (分类键, 说明文本)。分类是纯读侧字符串判断，不新增任何写路径；
+    隔离原因由 mark_quarantined() 落库，说明文本供面板与 API 直接渲染。
+    get_pool_view() 另外渲染带倒计时的更细文本，这里给出的是给调用方用的
+    粗分类（ok / cooling / expired / muted / restricted / captcha / other）。
+    """
+    status = tok.get("status")
+    reason = str(tok.get("quarantine_reason") or "")
+    lowered = reason.lower()
+    if status == "MUTED":
+        return "muted", "上游确认禁言，解禁后点「恢复」即可使用"
+    if status == "PARKED":
+        return (
+            "captcha",
+            "上游要求人机验证（40303）：请在自己电脑的浏览器登录该账号、"
+            "发一条消息解掉验证码，再点「恢复」",
+        )
+    if status == "QUARANTINED":
+        if "muted" in lowered or "禁言" in reason:
+            return "muted", "上游确认禁言，解禁后点「恢复」即可使用"
+        if "auth" in lowered or "401" in reason:
+            return "expired", "疑似过期，需重新添加账号或令牌；点「恢复」通常无效"
+        if "403" in reason:
+            return "restricted", "疑似被临时限制发言，解封后点「恢复」"
+        return "other", "其他隔离，具体原因见悬停提示；确认正常后点「恢复」"
+    if status == "RATE_LIMITED":
+        return "cooling", "限流冷却中，到期自动回到轮换"
+    if status == "INVALID":
+        return "expired", "令牌已失效，需重新添加账号或令牌"
+    if status == "CHECK_ERROR":
+        return "other", "检查失败，见「最近检查」列的具体报错"
+    return "ok", "轮换中，能正常干活"
+
+
 def get_pool_view():
     """Per-token operator view of the pool (P0-3).
 
@@ -1629,13 +1680,13 @@ def get_pool_view():
     now = time.time()
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, alias, status, rate_limited_until, last_used, consecutive_403, park_reason "
-        "FROM tokens ORDER BY id"
+        "SELECT id, alias, status, rate_limited_until, last_used, consecutive_403, "
+        "park_reason, quarantine_reason FROM tokens ORDER BY id"
     ).fetchall()
     conn.close()
 
     view = []
-    for tid, alias, status, until, last_used, streak, park_reason in rows:
+    for tid, alias, status, until, last_used, streak, park_reason, q_reason in rows:
         streak = streak or 0
         is_captcha = status == "PARKED" and (
             "captcha" in str(park_reason or "").lower()
@@ -1643,7 +1694,12 @@ def get_pool_view():
         )
         if status == "QUARANTINED":
             state_class, cooldown = "err", "—"
-            note = "已隔离，需人工恢复"
+            # 隔离原因落库后按五态分类给出可操作说明；没有原因时退回通用文案。
+            note = (
+                pool_state_note({"status": status, "quarantine_reason": q_reason})[1]
+                if q_reason
+                else "已隔离，需人工恢复"
+            )
         elif status == "PARKED" and until and until > now:
             state_class = "warn"
             cooldown = f"剩余 {_format_span(until - now)}"

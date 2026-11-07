@@ -115,7 +115,7 @@ def test_pool_view_carries_no_credential_fields():
     by_id = {row["id"]: row for row in view}
     assert by_id[3]["cooldown"] == "—", "quarantine has no timer to count down"
     assert by_id[2]["cooldown"] != "—", "a cooling token must show its countdown"
-    assert "人工恢复" in by_id[3]["state_note"], (
+    assert "恢复" in by_id[3]["state_note"], (
         "the quarantine note must tell the operator what returns the token"
     )
 
