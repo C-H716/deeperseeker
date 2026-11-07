@@ -35,6 +35,10 @@ wasm_path = os.path.join(BASE_DIR, "wasm", "deepseek_pow_solver.wasm")
 _session = None
 _db = os.getenv("DB_PATH") or os.path.join(BASE_DIR, "deeperseeker.db")
 
+# any <...> token containing a fullwidth pipe U+FF5C, which never appears in
+# legitimate prose. ASCII '|' is deliberately NOT matched (tables, code).
+_FULLWIDTH_PIPE_TAG_RE = re.compile(r"<[^<>]*｜[^<>]*>")
+
 
 def data_dir():
     """返回存放 SQLite 数据库的目录。
@@ -65,6 +69,57 @@ class UpstreamError(Exception):
         self.status = int(status)
         self.body = str(body)
         super().__init__(f"HTTP {self.status}: {self.body}")
+
+
+class UpstreamBizError(UpstreamError):
+    """HTTP 200 whose envelope carries a business-level error.
+
+    DeepSeek answers several endpoints with 200 + `{"code": N, "data": null}`
+    (or `data.biz_data: null`) when the account is flagged, its web session
+    was killed, or the per-account "messages too frequent" wall is hit. 直接
+    索引 biz_data 会抛 `'NoneType' object is not subscriptable`，那不是
+    UpstreamError，token 永远不会被轮换，死账号会一直留在池子里。
+
+    Subclassing UpstreamError means `_upstream_http_code()` already reads
+    `.status`, and handle_chat's rotation path (401/403/429) picks it up with
+    no changes there.
+    """
+
+
+def _biz_data(payload, what="response"):
+    """Return `payload["data"]["biz_data"]` or raise UpstreamBizError.
+
+    Auth-shaped business messages map to 401 so the token is quarantined /
+    rotated; everything else maps to 429 so it cools down and rotates. Both
+    are statuses handle_chat already understands.
+    """
+    data = payload.get("data") if isinstance(payload, dict) else None
+    biz = data.get("biz_data") if isinstance(data, dict) else None
+    if biz:
+        return biz
+    payload = payload if isinstance(payload, dict) else {}
+    code = payload.get("code")
+    msg = payload.get("msg") or payload.get("message") or "empty biz_data"
+    status = (
+        401 if re.search(r"login|auth|token|session|expire", str(msg), re.I) else 429
+    )
+    raise UpstreamBizError(status, f"{what}: code={code} msg={msg}")
+
+
+def _clean_tool_arg(value):
+    # Strip corrupted DSML markers that leaked INTO a tool-call argument
+    # value (e.g. a path parsed as "shell/core/Theme.qml</｜｜DSML｜｜ >").
+    # Only touches strings that actually contain a fullwidth pipe U+FF5C, so
+    # normal arguments are untouched. Recurses into dicts/lists.
+    if isinstance(value, str):
+        if "｜" in value:
+            value = _FULLWIDTH_PIPE_TAG_RE.sub("", value).strip()
+        return value
+    if isinstance(value, dict):
+        return {k: _clean_tool_arg(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clean_tool_arg(v) for v in value]
+    return value
 
 
 def cookie_file_path():
@@ -1772,6 +1827,7 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
 
     if not name or not isinstance(name, str):
         return None
+    args = _clean_tool_arg(args)
 
     # 黑名单拦截：包装标签名不是真实工具调用，直接丢弃，由调用方继续查找
     # invoke 的真实 name= 属性。判定前先剥离分隔符，与 _WRAPPER_TAG_NAMES
@@ -2469,21 +2525,11 @@ _ORPHAN_CLOSER_RE = re.compile(
     re.IGNORECASE,
 )
 
-# 裸 DSML 装饰残片：只有 `<` 或 `</` 加 DSML 标记、却没有标签名的串。
-# 模型收尾或分片时会单独吐出这类串；孤立闭标签正则要求 `</` 前缀且必须
-# 带标签名，覆盖不到它们。DSML 之后用先行断言排除「装饰串后紧跟标识符
-# 字母」的形态，否则会把真实开标签咬掉半截。上游用占有量词表达同一约束，
-# 但 Python 3.10 的 re 不支持，故改写为等价的先行断言形式。
-
-
 def _strip_stray_markers(text):
-    """正文路径清洗：只去掉裸 DSML 残片与孤立闭标签。
-
-    开标签不在这里清：正文里真的提到 DSML 开标签时不应被静默删除，只有
-    纯粹的装饰残片才需要清掉。
-    """
+    """清理正文中的残损标记、裸装饰串和孤立闭标签。"""
     if not text:
         return text
+    text = _FULLWIDTH_PIPE_TAG_RE.sub("", text)
     text = re.sub(
         r"</?[｜\|]{0,2}DSML(?![｜\|\s]*[A-Za-z_])[｜\|]{0,2}\s*[>＞]?",
         "",
@@ -2493,7 +2539,6 @@ def _strip_stray_markers(text):
     return _ORPHAN_CLOSER_RE.sub("", text)
 
 
-# Tag names _STREAM_ENTRY_RE can open on.
 _STREAM_ENTRY_TAGS = (
     "tool_calls",
     "tool_call",
@@ -2759,6 +2804,9 @@ class StreamToolParser:
                 hold = ">" not in tail and (
                     _is_plausible_stream_entry_prefix(tail)
                     or _is_plausible_stream_closer_prefix(tail)
+                    # 残损标记可能被 SSE 分片切断，未闭合的 < 尾段里只要已经
+                    # 出现全角竖线就先别吐，等兜底正则能整段清掉。
+                    or "｜" in tail
                 )
                 if last_lt != -1 and hold:
                     if last_lt > 0:
@@ -2884,7 +2932,7 @@ async def create_challange_pow(target_path, auth_token):
     )
     async with response:
         data = await response.json()
-    return data["data"]["biz_data"]["challenge"]
+    return _biz_data(data, "chat/create_pow_challenge")["challenge"]
 
 
 def write_string_pow(text, alloc_func, memory, store):
@@ -3062,7 +3110,7 @@ async def create_new_chat(auth_token):
     )
     async with response:
         data = await response.json()
-    return data["data"]["biz_data"]["chat_session"]["id"]
+    return _biz_data(data, "chat_session/create")["chat_session"]["id"]
 
 
 def _deepseek_event_fragments(data):
@@ -3709,15 +3757,14 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
     )
     async with response:
         resp_json = await response.json()
-    biz_data = (resp_json.get("data") or {}).get("biz_data") or {}
-    file_id = biz_data.get("id")
+    js_data = _biz_data(resp_json, "file/upload_file")
+    file_id = js_data.get("id")
     if not file_id:
         # Server returned no file id (WAF block / rate limit / malformed response).
         raise Exception(
             f"File upload failed: {json.dumps(resp_json, ensure_ascii=False)[:500]}"
         )
     yield ("uploaded", file_id)
-    js_data = biz_data
     status = js_data["status"]
     headers = get_headers(auth_token)
     deadline = time.time() + 300
@@ -3731,10 +3778,8 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             resp_json = await resp.json()
-        biz_data = (resp_json.get("data") or {}).get("biz_data") or {}
-        files = biz_data.get("files") or []
+        files = _biz_data(resp_json, "file/fetch_files").get("files") or []
         if not files:
-            # File still being registered server-side; keep waiting.
             continue
         js_data = files[0]
         status = js_data["status"]
@@ -3765,7 +3810,7 @@ async def get_file_content(auth_token, file_id):
         timeout=aiohttp.ClientTimeout(total=30),
     ) as resp:
         resp_json = await resp.json()
-    js_data = resp_json["data"]["biz_data"]["files"][0]
+    js_data = _biz_data(resp_json, "file/fetch_files")["files"][0]
     yield mimetypes.guess_type(js_data["file_name"])[0]
     deadline = time.time() + 60
     while (
@@ -3780,7 +3825,7 @@ async def get_file_content(auth_token, file_id):
             # cookies=cookie,  # Backup WAF fallback
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
-            js_data = (await resp.json())["data"]["biz_data"]["files"][0]
+            js_data = _biz_data(await resp.json(), "file/fetch_files")["files"][0]
     if not js_data.get("signed_path"):
         return
     file_path = "https://files.deepseeksvc.com/api" + js_data["signed_path"] + "&ty=r"
