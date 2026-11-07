@@ -4782,24 +4782,62 @@ async def dashboard_probe(request: Request):
     return JSONResponse({"tokens": results})
 
 
+# 粘贴 Token 时常见的包裹字符：直引号、弯引号、全角引号与反引号。
+_TOKEN_WRAP_QUOTES = "\"'`“”‘’＂＇"
+
+
+def _strip_token_quotes(token: str) -> str:
+    """去掉 Token 两端的引号。
+
+    两端成对时逐个剥掉，允许左右不同（``'abc"``）；只剩单侧引号、且整串
+    别处再无引号时，也视为粘贴残留一并去掉（``'abc``）。Token 本身是
+    base64url / JWT 形态，不会以引号开头或结尾，因此不会误伤真实内容。
+    """
+    token = token.strip()
+    while (
+        len(token) >= 2
+        and token[0] in _TOKEN_WRAP_QUOTES
+        and token[-1] in _TOKEN_WRAP_QUOTES
+    ):
+        token = token[1:-1].strip()
+    if (
+        token
+        and token[0] in _TOKEN_WRAP_QUOTES
+        and not any(c in _TOKEN_WRAP_QUOTES for c in token[1:])
+    ):
+        token = token[1:].strip()
+    if (
+        token
+        and token[-1] in _TOKEN_WRAP_QUOTES
+        and not any(c in _TOKEN_WRAP_QUOTES for c in token[:-1])
+    ):
+        token = token[:-1].strip()
+    return token
+
+
 def clean_auth_token(raw: str) -> str:
+    """把粘贴进来的 Token 洗成裸串。
+
+    面板粘贴的形态五花八门：首尾引号与空格、``value: 'xxx'`` 前缀、
+    ``{"value":"xxx"}`` 整段 JSON。这里反复清洗到稳定，一次调用即可覆盖
+    ``value: "'xxx'"`` 这类叠加包裹。
+    """
     if not raw:
         return ""
     token = str(raw).strip()
-    if token.startswith("{") and "value" in token:
-        try:
-            parsed = json.loads(token)
-            if isinstance(parsed, dict) and "value" in parsed:
-                token = str(parsed["value"]).strip()
-        except Exception:
-            pass
-    m = re.match(r'^(?:"?value"?)\s*[:=]\s*(.+)$', token, re.IGNORECASE)
-    if m:
-        token = m.group(1).strip()
-    while (token.startswith('"') and token.endswith('"')) or (
-        token.startswith("'") and token.endswith("'")
-    ):
-        token = token[1:-1].strip()
+    for _ in range(4):
+        before = token
+        if token.startswith("{") and "value" in token:
+            with suppress(Exception):
+                parsed = json.loads(token)
+                if isinstance(parsed, dict) and "value" in parsed:
+                    token = str(parsed["value"])
+        m = re.match(r'^(?:"?value"?)\s*[:=]\s*(.+)$', token.strip(), re.IGNORECASE)
+        if m:
+            token = m.group(1)
+        token = _strip_token_quotes(token)
+        if token == before:
+            break
     return token
 
 

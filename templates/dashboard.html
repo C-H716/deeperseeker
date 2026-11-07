@@ -163,6 +163,22 @@
                 (function() {
                     const inp = document.getElementById('auth-token-input');
                     if (!inp) return;
+                    // 与后端 clean_auth_token 保持同一套包裹字符：直引号、弯引号、
+                    // 全角引号与反引号。后端仍是最终裁决，这里只让输入框即时变干净。
+                    const QUOTES = "\"'`“”‘’＂＇";
+                    function stripQuotes(s) {
+                        s = s.trim();
+                        while (s.length >= 2 && QUOTES.includes(s[0]) && QUOTES.includes(s[s.length - 1])) {
+                            s = s.slice(1, -1).trim();
+                        }
+                        if (s && QUOTES.includes(s[0]) && ![...s.slice(1)].some(c => QUOTES.includes(c))) {
+                            s = s.slice(1).trim();
+                        }
+                        if (s && QUOTES.includes(s[s.length - 1]) && ![...s.slice(0, -1)].some(c => QUOTES.includes(c))) {
+                            s = s.slice(0, -1).trim();
+                        }
+                        return s;
+                    }
                     function clean(v) {
                         if (!v) return v;
                         let s = v.trim();
@@ -173,10 +189,7 @@
                             } catch (e) {}
                         }
                         s = s.replace(/^(?:"?value"?)\s*[:=]\s*/i, '').trim();
-                        while ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-                            s = s.slice(1, -1).trim();
-                        }
-                        return s;
+                        return stripQuotes(s);
                     }
                     inp.addEventListener('paste', function() {
                         setTimeout(function() { inp.value = clean(inp.value); }, 10);
