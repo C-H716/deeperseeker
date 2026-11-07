@@ -30,7 +30,6 @@ collect_ignore = [
     "test_prompt_cache_accounting.py",
     "test_real_parent.py",
     "test_responses_api.py",
-    "test_stream_edge_cases.py",
     "test_token_pool_balance.py",
     "test_deep_health.py",
     "test_deepseek_sse.py",

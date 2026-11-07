@@ -38,6 +38,7 @@ security = HTTPBasic()
 from functions import (
     CAPTCHA_PARK_REASON,
     CookieGenerationError,
+    ReasoningMarkupFilter,
     StreamToolParser,
     UpstreamError,
     acquire_token_slot,
@@ -1961,6 +1962,9 @@ async def stream_response(
     created = int(time.time())
     full_text = ""
     is_thinking = False
+    # 推理通道同样要净化：模型会在思考里写出 DSML 工具标记，parse_tools 只
+    # 处理正文，不净化就会把协议残留原样透传给客户端。
+    reasoning_filter = ReasoningMarkupFilter()
     aborted = False
     failed = False
     sent_content = False  # visible text reached the client (reasoning does not count)
@@ -1979,13 +1983,19 @@ async def stream_response(
                 is_thinking = False
                 end_thinking = True
                 parts = chunk.split("</think>")
-                think_part = parts[0]
+                think_part = reasoning_filter.feed(parts[0])
                 chunk = parts[1].lstrip("\n") if len(parts) > 1 else ""
                 if think_part:
                     yield f"data: {json.dumps(_chat_chunk([_choice({'reasoning_content': think_part})], cid=cid, created=created, model=model))}\n\n"
+                # 思考块结束时释放过滤器里暂存的残余（可能是被切断的标签前缀）。
+                tail = reasoning_filter.flush()
+                if tail:
+                    yield f"data: {json.dumps(_chat_chunk([_choice({'reasoning_content': tail})], cid=cid, created=created, model=model))}\n\n"
 
             if is_thinking and chunk:
-                yield f"data: {json.dumps(_chat_chunk([_choice({'reasoning_content': chunk})], cid=cid, created=created, model=model))}\n\n"
+                filtered = reasoning_filter.feed(chunk)
+                if filtered:
+                    yield f"data: {json.dumps(_chat_chunk([_choice({'reasoning_content': filtered})], cid=cid, created=created, model=model))}\n\n"
                 continue
 
             if end_thinking and not chunk:
@@ -2153,6 +2163,7 @@ async def stream_anthropic_response(
     yield start_evt
 
     parser = StreamToolParser()
+    reasoning_filter = ReasoningMarkupFilter()
     full_text = ""
     text_block_started = False
     block_index = 0
@@ -2177,15 +2188,22 @@ async def stream_anthropic_response(
                 is_thinking = False
                 end_thinking = True
                 parts = chunk.split("</think>")
-                think_part = parts[0]
+                think_part = reasoning_filter.feed(parts[0])
                 chunk = parts[1].lstrip("\n") if len(parts) > 1 else ""
                 if think_part:
                     delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'thinking_delta', 'thinking': think_part}})}\n\n"
                     yield delta_evt
+                # 思考块结束时释放过滤器里暂存的残余。
+                tail = reasoning_filter.flush()
+                if tail:
+                    delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'thinking_delta', 'thinking': tail}})}\n\n"
+                    yield delta_evt
 
             if is_thinking and chunk:
-                delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'thinking_delta', 'thinking': chunk}})}\n\n"
-                yield delta_evt
+                filtered = reasoning_filter.feed(chunk)
+                if filtered:
+                    delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'thinking_delta', 'thinking': filtered}})}\n\n"
+                    yield delta_evt
                 continue
 
             if end_thinking:
@@ -2885,6 +2903,7 @@ async def stream_responses_response(
     yield _sse({"type": "response.in_progress", "response": initial_resp})
 
     parser = StreamToolParser()
+    reasoning_filter = ReasoningMarkupFilter()
     full_text = ""
     aborted = False
     failed = False
@@ -2908,7 +2927,7 @@ async def stream_responses_response(
                 is_thinking = False
                 end_thinking = True
                 parts = chunk.split("</think>")
-                think_part = parts[0]
+                think_part = reasoning_filter.feed(parts[0])
                 chunk = parts[1].lstrip("\n") if len(parts) > 1 else ""
                 if think_part:
                     if not rs_started:
@@ -2924,18 +2943,36 @@ async def stream_responses_response(
                             "delta": think_part,
                         }
                     )
+                # 思考块结束时释放过滤器里暂存的残余。
+                tail = reasoning_filter.flush()
+                if tail:
+                    if not rs_started:
+                        for f in _open_rs():
+                            yield f
+                    rs_text += tail
+                    yield _sse(
+                        {
+                            "type": "response.reasoning_summary_text.delta",
+                            "item_id": rs_id,
+                            "output_index": rs_index,
+                            "summary_index": 0,
+                            "delta": tail,
+                        }
+                    )
 
             if is_thinking and chunk:
-                rs_text += chunk
-                yield _sse(
-                    {
-                        "type": "response.reasoning_summary_text.delta",
-                        "item_id": rs_id,
-                        "output_index": rs_index,
-                        "summary_index": 0,
-                        "delta": chunk,
-                    }
-                )
+                filtered = reasoning_filter.feed(chunk)
+                if filtered:
+                    rs_text += filtered
+                    yield _sse(
+                        {
+                            "type": "response.reasoning_summary_text.delta",
+                            "item_id": rs_id,
+                            "output_index": rs_index,
+                            "summary_index": 0,
+                            "delta": filtered,
+                        }
+                    )
                 continue
 
             if end_thinking:
