@@ -92,8 +92,8 @@
                             <td>{{ tok['alias'] or '—' }}</td>
                             <td><code class="nowrap">{{ tok['token'][:12] }}…{{ tok['token'][-4:] }}</code></td>
                             <td data-cell="status">
-                                <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] in ('RATE_LIMITED', 'CHECK_ERROR') %}warn{% else %}err{% endif %}">
-                                    {% if tok['status'] == 'ACTIVE' %}有效{% elif tok['status'] == 'RATE_LIMITED' %}被限流{% elif tok['status'] == 'INVALID' %}已失效{% elif tok['status'] == 'CHECK_ERROR' %}检查失败{% else %}{{ tok['status'] }}{% endif %}
+                                <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] in ('RATE_LIMITED', 'CHECK_ERROR', 'MUTED') %}warn{% else %}err{% endif %}" {% if tok.get('quarantine_reason') %}title="{{ tok.get('quarantine_reason') }}"{% endif %}>
+                                    {% if tok['status'] == 'ACTIVE' %}有效{% elif tok['status'] == 'RATE_LIMITED' %}被限流{% elif tok['status'] == 'INVALID' %}已失效{% elif tok['status'] == 'CHECK_ERROR' %}检查失败{% elif tok['status'] == 'QUARANTINED' %}已隔离{% elif tok['status'] == 'MUTED' %}确认禁言{% else %}{{ tok['status'] }}{% endif %}
                                 </span>
                             </td>
                             <td class="nowrap" data-cell="inflight">
@@ -136,10 +136,10 @@
     <aside class="col-side">
         <section class="card">
             <div class="card-head">
-                <h2>添加 DeepSeek 账号</h2>
+                                <h2>添加 DeepSeek 账号（推荐）</h2>
             </div>
             <div class="card-body">
-                <p class="hint">输入账号密码，系统调用 DeepSeek 登录接口，成功后只保存返回的 Token，不保存密码。</p>
+                <p class="hint">账号在桥内直接登录，会话出生于本服务并复用已采集的设备指纹；令牌失效时按 6 小时间隔自动重登。密码经本地密钥加密后仅存于本机数据库，不写入日志、不返回页面。</p>
                 <form method="post" action="/accounts/add" class="stack">
                     <label class="field">
                         <span>别名（可选）</span>
@@ -160,9 +160,10 @@
 
         <section class="card">
             <div class="card-head">
-                <h2>添加账号 Token</h2>
+                <h2>粘贴浏览器 Token（应急备用）</h2>
             </div>
             <div class="card-body">
+                <div class="warning">2026 年 11 月起，上游会整体吊销「浏览器出生、跨环境使用」的会话：粘贴的令牌可能几分钟内失效，并使浏览器端同时退出登录，表现为频繁封号与反复重新提取。请优先使用上方「添加 DeepSeek 账号」。</div>
                 <details class="guide">
                     <summary>如何获取 Token？</summary>
                     <ol>
@@ -176,7 +177,6 @@
                         <li>关闭无痕窗口以保留登录状态</li>
                     </ol>
                 </details>
-                <div class="warning">如果在浏览器中退出 DeepSeek，该 Token 将立即失效。</div>
                 <form method="post" action="/tokens/add" class="stack">
                     <label class="field">
                         <span>别名（可选）</span>
@@ -222,7 +222,11 @@ async function checkToken(tokenId) {
         const response = await fetch(url, {method: 'POST', headers: {'Accept': 'application/json'}});
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || '检查失败');
-        message.textContent = `检查完成：${data.results.length} 个 Token，页面即将刷新`;
+        const problems = data.results.filter(r => r.error);
+        const summary = problems.length
+            ? `，${problems.length} 个需处理：${problems[0].error}`
+            : '';
+        message.textContent = `检查完成：${data.results.length} 个 Token${summary}，页面即将刷新`;
         window.setTimeout(() => window.location.reload(), 500);
     } catch (error) {
         message.textContent = `检查失败：${error.message}`;
@@ -242,6 +246,8 @@ const STATUS_META = {
     RATE_LIMITED: ['warn', '被限流'],
     INVALID: ['err', '已失效'],
     CHECK_ERROR: ['warn', '检查失败'],
+    QUARANTINED: ['err', '已隔离'],
+    MUTED: ['warn', '确认禁言'],
 };
 const pad2 = value => String(value).padStart(2, '0');
 
@@ -263,6 +269,10 @@ function renderStatus(cell, tok, now) {
         span.title = '限流冷却中，到期后自动恢复';
     } else {
         span.textContent = label;
+    }
+    // 隔离原因由后端落库，悬停即可看到具体诊断与解禁时间。
+    if (tok.quarantine_reason) {
+        span.title = tok.quarantine_reason;
     }
     cell.replaceChildren(span);
 }

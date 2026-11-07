@@ -13,7 +13,7 @@ import sqlite3
 import string
 import time
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import deepseek_tokenizer
@@ -86,6 +86,46 @@ class UpstreamBizError(UpstreamError):
     """
 
 
+def _format_mute_until(ts):
+    """把上游秒级解禁时间戳格式化为 UTC+8 的可读时间。
+
+    移植自 1515asd/rh-deeperseeker v89.7。容器时区通常不可控，故固定
+    UTC+8，避免面板显示的解禁日期随部署环境漂移。
+    """
+    try:
+        return datetime.fromtimestamp(float(ts), timezone(timedelta(hours=8))).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "unknown"
+
+
+class UpstreamMutedError(UpstreamBizError):
+    """上游明确报告账号禁言（biz_data.is_muted == 1 的布尔硬证据）。
+
+    移植自 1515asd/rh-deeperseeker v89.7。与依赖报文措辞的软证据不同，
+    该字段由上游直接给出，不存在措辞巧合造成的误判，因此命中即隔离，
+    不设多击宽限；隔离后由管理员显式恢复。
+    """
+
+    def __init__(self, mute_until=None):
+        self.mute_until = mute_until
+        super().__init__(403, f"user is muted (until {_format_mute_until(mute_until)})")
+
+
+def _raise_if_muted_envelope(biz):
+    """在业务信封中检测禁言硬证据，命中即抛 UpstreamMutedError。
+
+    兼容两种形态：biz_data.is_muted 与 biz_data.chat.is_muted（后者由
+    /api/v0/users/current 返回）。
+    """
+    if not isinstance(biz, dict):
+        return
+    chat = biz.get("chat") if isinstance(biz.get("chat"), dict) else {}
+    if biz.get("is_muted") == 1 or chat.get("is_muted") == 1:
+        raise UpstreamMutedError(chat.get("mute_until") or biz.get("mute_until"))
+
+
 def _biz_data(payload, what="response"):
     """Return `payload["data"]["biz_data"]` or raise UpstreamBizError.
 
@@ -95,6 +135,7 @@ def _biz_data(payload, what="response"):
     """
     data = payload.get("data") if isinstance(payload, dict) else None
     biz = data.get("biz_data") if isinstance(data, dict) else None
+    _raise_if_muted_envelope(biz)
     if biz:
         return biz
     payload = payload if isinstance(payload, dict) else {}
@@ -253,6 +294,25 @@ def init_db():
     # 注意与 sessions.last_used（B13 的会话清理）分属两张表。
     if "last_used" not in token_columns:
         conn.execute("ALTER TABLE tokens ADD COLUMN last_used REAL")
+    # 禁言隔离：移植自 1515asd/rh-deeperseeker v89.7。隔离原因与解禁时间
+    # 仅供面板展示；QUARANTINED 状态由 pick_token 的状态白名单自然排除。
+    if "quarantine_reason" not in token_columns:
+        conn.execute("ALTER TABLE tokens ADD COLUMN quarantine_reason TEXT")
+    if "mute_until" not in token_columns:
+        conn.execute("ALTER TABLE tokens ADD COLUMN mute_until REAL")
+    # 桥内登录自动重登凭据：移植自 v89.12。密码以本地密钥加密后存放，
+    # 从不写入日志或返回给页面；未添加账号时这些列保持为空。
+    account_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()
+    }
+    if "password_secret" not in account_columns:
+        conn.execute("ALTER TABLE accounts ADD COLUMN password_secret TEXT")
+    if "relogin_at" not in account_columns:
+        conn.execute("ALTER TABLE accounts ADD COLUMN relogin_at REAL")
+    if "relogin_disabled" not in account_columns:
+        conn.execute(
+            "ALTER TABLE accounts ADD COLUMN relogin_disabled INTEGER DEFAULT 0"
+        )
     # B13: session pruning keys on real recency of USE, so older volumes need
     # the column; the ALTER is idempotent behind the pragma check.
     session_columns = {
@@ -264,8 +324,7 @@ def init_db():
     # 账号后 add_token() 会复用最小空位，新账号便会继承旧账号的转移历史。
     # 旧行只有自增 id，无法还原当时是哪个 token，因此不参与统计（留 NULL）。
     rotation_columns = {
-        row[1]
-        for row in conn.execute("PRAGMA table_info(token_rotations)").fetchall()
+        row[1] for row in conn.execute("PRAGMA table_info(token_rotations)").fetchall()
     }
     if "from_token_key" not in rotation_columns:
         conn.execute("ALTER TABLE token_rotations ADD COLUMN from_token_key TEXT")
@@ -759,6 +818,18 @@ async def _resolve_login_device_id(explicit_device_id=None):
     return _generate_web_device_id()
 
 
+class AccountLoginError(Exception):
+    """登录被上游业务拒绝，携带可判定的原因码。
+
+    移植自 1515asd/rh-deeperseeker v89.12 的错误分级：密码错误、封号与
+    风控设备属于终态，自动重登不应反复尝试；网络与意外失败可延后重试。
+    """
+
+    def __init__(self, reason, message):
+        self.reason = reason
+        super().__init__(message)
+
+
 async def login_deepseek_account(email, password, device_id=None):
     """Log in through DeepSeek's web endpoint and return its bearer token."""
     if not email or not password:
@@ -846,8 +917,14 @@ async def login_deepseek_account(email, password, device_id=None):
                 else type(data.get("data")).__name__,
             )
             if biz_code or biz_msg:
-                raise Exception(
-                    f"DeepSeek 登录失败（{biz_code or 'unknown'}: {biz_msg or 'unknown'}）"
+                reason_map = {
+                    "2": "bad_credentials",
+                    "10": "banned",
+                    "11": "risk_device",
+                }
+                raise AccountLoginError(
+                    reason_map.get(str(biz_code), f"biz_{biz_code}"),
+                    f"DeepSeek 登录失败（{biz_code or 'unknown'}: {biz_msg or 'unknown'}）",
                 )
         raise Exception("DeepSeek 登录成功但响应中没有找到 Token")
     return token
@@ -1044,7 +1121,8 @@ def get_tokens():
     conn = get_db()
     rows = conn.execute(
         "SELECT id, alias, token, status, last_checked_at, last_check_error, "
-        "account_id, last_used, limited_until FROM tokens ORDER BY id"
+        "account_id, last_used, limited_until, quarantine_reason, mute_until "
+        "FROM tokens ORDER BY id"
     ).fetchall()
     conn.close()
     return [
@@ -1058,6 +1136,8 @@ def get_tokens():
             "account_id": r[6],
             "last_used": r[7],
             "limited_until": r[8],
+            "quarantine_reason": r[9],
+            "mute_until": r[10],
         }
         for r in rows
     ]
@@ -1319,7 +1399,11 @@ def pick_token(exclude=None):
         if cooling:
             return min(cooling, key=lambda e: (e[1], e[0]))[0]
 
-        row = conn.execute("SELECT id FROM tokens ORDER BY id LIMIT 1").fetchone()
+        # 禁言隔离行不得作为「无可用账号」时的兜底被选中，否则会继续用
+        # 死号发请求；其余状态沿用既有兜底语义（v89.7 的隔离约束）。
+        row = conn.execute(
+            "SELECT id FROM tokens WHERE status != 'QUARANTINED' ORDER BY id LIMIT 1"
+        ).fetchone()
         return row[0] if row else None
     finally:
         conn.close()
@@ -1357,6 +1441,201 @@ def mark_active(token_id):
     conn.close()
 
 
+def mark_quarantined(token_id, reason, mute_until=None):
+    """账号退出轮换，直到管理员显式恢复。
+
+    移植自 1515asd/rh-deeperseeker v89.7。与 RATE_LIMITED 不同，隔离没有
+    计时器：pick_token 只接纳 ACTIVE / RATE_LIMITED，故隔离行不会被冷却
+    到期逻辑误恢复。reason 与 mute_until 同步落库供面板展示。
+    """
+    logger.warning(
+        "Token #%d QUARANTINED (manual return required): %s", token_id, reason
+    )
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET status = 'QUARANTINED', limited_until = NULL, "
+        "quarantine_reason = ?, mute_until = ? WHERE id = ?",
+        (str(reason or ""), mute_until, token_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def restore_token(token_id):
+    """隔离的唯一出口：清空原因并回到 ACTIVE。
+
+    移植自 1515asd/rh-deeperseeker v89.7。last_used 刻意不动，使恢复的
+    账号按「最久未用」温和回到轮换，而非立刻承接突发流量。
+    """
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET status = 'ACTIVE', limited_until = NULL, "
+        "quarantine_reason = NULL, mute_until = NULL WHERE id = ?",
+        (token_id,),
+    )
+    conn.commit()
+    conn.close()
+    logger.info("Token #%d restored to ACTIVE", token_id)
+
+
+# ── 桥内登录自动重登（移植自 1515asd/rh-deeperseeker v89.12）──────────────
+# 红线：
+#   * 未通过账号登录加入的令牌没有凭据，模块保持惰性（零上游请求）
+#   * 自动重登保守节流，默认 6 小时；宁可不自愈，绝不形成异常登录节奏
+#   * 密码以本机密钥加密后落库，不写入日志、不返回给页面
+#   * 登录请求形态沿用本项目已验证可用的 web 形态与已采集的设备指纹，
+#     不改为 rh 的 android 形态，避免重新触发 RISK_DEVICE_DETECTED
+_RELOGIN_MIN_INTERVAL = float(os.getenv("DEEPSEEKER_RELOGIN_MIN_INTERVAL", "21600"))
+_relogin_inflight: set = set()
+_ACCOUNT_KEY_FILE = os.path.join(data_dir(), "account_secret.key")
+
+
+def _account_key():
+    """读取或生成本地密钥，用于加密账号密码。
+
+    与数据库同目录，随持久卷保留；文件权限尽力限制为仅属主可读。
+    """
+    try:
+        with open(_ACCOUNT_KEY_FILE, "rb") as f:
+            key = f.read()
+        if len(key) >= 32:
+            return key
+    except OSError:
+        pass
+    key = os.urandom(32)
+    try:
+        os.makedirs(os.path.dirname(_ACCOUNT_KEY_FILE) or ".", exist_ok=True)
+        with open(_ACCOUNT_KEY_FILE, "wb") as f:
+            f.write(key)
+        os.chmod(_ACCOUNT_KEY_FILE, 0o600)
+    except OSError:
+        logger.warning("账号密钥持久化失败，凭据加密在本次进程内仍可用")
+    return key
+
+
+def _seal_password(password):
+    """用本地密钥与随机 nonce 派生流密钥，加密密码后作 base64 编码。"""
+    nonce = os.urandom(16)
+    stream = hashlib.pbkdf2_hmac(
+        "sha256", _account_key() + nonce, b"deeperseeker-account", 100_000
+    )
+    raw = str(password).encode("utf-8")
+    cipher = bytes(b ^ stream[i % len(stream)] for i, b in enumerate(raw))
+    return base64.b64encode(nonce + cipher).decode("ascii")
+
+
+def _unseal_password(blob):
+    """解密 _seal_password 的产物；格式非法时返回 None。"""
+    try:
+        packed = base64.b64decode(blob)
+        nonce, cipher = packed[:16], packed[16:]
+        stream = hashlib.pbkdf2_hmac(
+            "sha256", _account_key() + nonce, b"deeperseeker-account", 100_000
+        )
+        raw = bytes(b ^ stream[i % len(stream)] for i, b in enumerate(cipher))
+        return raw.decode("utf-8")
+    except (ValueError, TypeError, OSError, UnicodeDecodeError):
+        return None
+
+
+def get_relogin_credentials(token_id):
+    """读取令牌所属账号的重登凭据；非账号登录的令牌返回 None。"""
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT a.email, a.password_secret, a.relogin_at, a.relogin_disabled "
+            "FROM accounts a JOIN tokens t ON t.account_id = a.id WHERE t.id = ?",
+            (token_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        # 旧数据卷尚未执行 init_db 的幂等 ALTER 时凭据列不存在；此时保持
+        # 惰性即可，不应影响正常请求链路。
+        conn.close()
+        return None
+    conn.close()
+    if not row or not row[1] or row[3]:
+        return None
+    password = _unseal_password(row[1])
+    if not password:
+        return None
+    return {"email": row[0], "password": password, "relogin_at": row[2] or 0.0}
+
+
+def update_relogin_token(token_id, new_token):
+    """重登成功后原地替换令牌材料并复位轮换状态。"""
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET token = ?, status = 'ACTIVE', limited_until = NULL, "
+        "quarantine_reason = NULL, mute_until = NULL WHERE id = ?",
+        (new_token, token_id),
+    )
+    conn.execute(
+        "UPDATE accounts SET relogin_at = ?, last_error = NULL, status = 'ACTIVE' "
+        "WHERE id = (SELECT account_id FROM tokens WHERE id = ?)",
+        (time.time(), token_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _disable_relogin(token_id, reason):
+    """密码错误 / 封号 / 风控设备属终态，停止该账号的自动重登。"""
+    conn = get_db()
+    conn.execute(
+        "UPDATE accounts SET relogin_disabled = 1, last_error = ? "
+        "WHERE id = (SELECT account_id FROM tokens WHERE id = ?)",
+        (str(reason)[:300], token_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+async def relogin_account(token_id):
+    """保守自动重登：节流内绝不尝试；结果如实入库。
+
+    移植自 1515asd/rh-deeperseeker v89.12，登录链路复用本项目已有的
+    login_deepseek_account（沿用已验证的 web 形态与设备指纹复用）。
+    并发去重保证同一令牌同一时刻只跑一个重登任务。
+    """
+    if token_id in _relogin_inflight:
+        return
+    _relogin_inflight.add(token_id)
+    try:
+        creds = await asyncio.to_thread(get_relogin_credentials, token_id)
+        if not creds:
+            return
+        now = time.time()
+        if now - creds["relogin_at"] < _RELOGIN_MIN_INTERVAL:
+            logger.info(
+                "[relogin] token #%s 距上次登录不足 %.0fs，跳过自动重登",
+                token_id,
+                _RELOGIN_MIN_INTERVAL,
+            )
+            return
+        try:
+            auth_token = await login_deepseek_account(creds["email"], creds["password"])
+        except AccountLoginError as exc:
+            if exc.reason in ("banned", "risk_device", "bad_credentials", "no_token"):
+                await asyncio.to_thread(_disable_relogin, token_id, str(exc))
+            logger.warning(
+                "[relogin] token #%s 桥内登录被拒（%s），停止自动重试",
+                token_id,
+                exc.reason,
+            )
+            return
+        except Exception as exc:
+            logger.warning(
+                "[relogin] token #%s 桥内登录失败，按节流重试：%s",
+                token_id,
+                str(exc)[:200],
+            )
+            return
+        await asyncio.to_thread(update_relogin_token, token_id, auth_token)
+        logger.info("[relogin] token #%s 已通过桥内登录自愈", token_id)
+    finally:
+        _relogin_inflight.discard(token_id)
+
+
 def get_accounts():
     conn = get_db()
     rows = conn.execute(
@@ -1389,8 +1668,12 @@ def _set_account_result(account_id, status, error=None, token_id=None):
     conn.close()
 
 
-def save_account_login(email, alias, auth_token):
-    """Create or replace an account and its corresponding pool token."""
+def save_account_login(email, alias, auth_token, password=None):
+    """Create or replace an account and its corresponding pool token.
+
+    password 仅在通过面板添加账号时传入，经本地密钥加密后落库，供令牌
+    失效时的自动重登使用；手动粘贴的令牌不携带凭据，重登保持惰性。
+    """
     conn = get_db()
     existing = conn.execute(
         "SELECT id, token_id FROM accounts WHERE email = ?", (email,)
@@ -1432,6 +1715,12 @@ def save_account_login(email, alias, auth_token):
             "UPDATE accounts SET alias = ?, status = 'ACTIVE', last_login_at = ?, last_error = NULL WHERE id = ?",
             (alias, datetime.now(timezone.utc).isoformat(), account_id),
         )
+    if password is not None:
+        conn.execute(
+            "UPDATE accounts SET password_secret = ?, relogin_at = ?, "
+            "relogin_disabled = 0 WHERE id = ?",
+            (_seal_password(password), time.time(), account_id),
+        )
     conn.commit()
     conn.close()
     return account_id
@@ -1455,11 +1744,152 @@ def update_token_check(token_id, status, error=None):
     conn.close()
 
 
+# ── 只读令牌探测（移植自 1515asd/rh-deeperseeker v89.7）──────────────────
+# GET /api/v0/users/current 是官方客户端的个人信息接口：免 PoW、只读、
+# 禁言账号照常应答，返回 biz_data.chat.is_muted / mute_until；已作废令牌
+# 返回 code=40003。探测本身不写状态，由调用方按证据等级决定后续动作。
+async def probe_token_mute(auth_token):
+    """主动探测令牌在上游的真实状态，返回结构化判定（不含任何凭据）。"""
+    session = await get_session()
+    try:
+        async with session.get(
+            UPSTREAM_BASES[0] + "/api/v0/users/current",
+            headers=get_headers(auth_token),
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            body = await resp.json(content_type=None)
+    except Exception as exc:
+        return {
+            "verdict": "error",
+            "detail": f"probe failed: {exc}",
+            "mute_until": None,
+        }
+    if not isinstance(body, dict):
+        return {
+            "verdict": "error",
+            "detail": "unexpected non-JSON body",
+            "mute_until": None,
+        }
+    data = body.get("data") if isinstance(body.get("data"), dict) else None
+    biz = data.get("biz_data") if isinstance(data, dict) else None
+    chat = biz.get("chat") if isinstance(biz, dict) else None
+    if isinstance(chat, dict) and chat.get("is_muted") == 1:
+        return {
+            "verdict": "muted",
+            "detail": "user is muted",
+            "mute_until": chat.get("mute_until"),
+        }
+    if body.get("code") == 40003:
+        return {
+            "verdict": "invalid",
+            "detail": str(body.get("msg") or "upstream 40003"),
+            "mute_until": None,
+        }
+    if body.get("code") == 0 and isinstance(biz, dict):
+        return {"verdict": "ok", "detail": "", "mute_until": None}
+    return {
+        "verdict": "error",
+        "detail": f"unexpected envelope: code={body.get('code')}",
+        "mute_until": None,
+    }
+
+
+# ── x-hif-leim 风控令牌（移植自 1515asd/rh-deeperseeker v89.8 / v89.11）──
+# 官方网页客户端在对话请求上携带该短期令牌；rh 在 v89.11 依据抓包把默认值
+# 改为关闭，理由是安卓客户端从不发送该头，安卓形态携带网页专属头反而构成
+# 混合身份信号。本桥默认使用安卓请求头，故同样默认关闭。
+_HIF_QUERY_URL = os.getenv("DEEPSEEKER_HIF_URL", "https://hif-leim.deepseek.com/query")
+_HIF_ENABLED = os.getenv("DEEPSEEKER_HIF_ENABLED", "0").strip().lower() not in (
+    "0",
+    "false",
+    "off",
+)
+_HIF_DEFAULT_TTL = 600.0
+_HIF_REFRESH_MARGIN = 30.0
+_HIF_FAIL_BACKOFF = 60.0
+_HIF_FETCH_TIMEOUT = 5.0
+_hif_cache: dict = {"value": None, "expire_at": 0.0, "retry_at": 0.0}
+_hif_lock = asyncio.Lock()
+
+
+async def get_hif_token():
+    """取 x-hif-leim 风控令牌；任何失败返回 None，调用方降级为不带该头。
+
+    按 x-hif-ttl 缓存并提前 30s 过期，失败退避 60s；绝不发送过期令牌，
+    绝不阻断对话请求。缓存命中时零网络、零等待。
+    """
+    if not _HIF_ENABLED:
+        return None
+    now = time.time()
+    if _hif_cache["value"] and now < _hif_cache["expire_at"]:
+        return _hif_cache["value"]
+    if now < _hif_cache["retry_at"]:
+        return None
+    async with _hif_lock:
+        now = time.time()
+        if _hif_cache["value"] and now < _hif_cache["expire_at"]:
+            return _hif_cache["value"]
+        if now < _hif_cache["retry_at"]:
+            return None
+        try:
+            session = await get_session()
+            async with session.get(
+                _HIF_QUERY_URL,
+                timeout=aiohttp.ClientTimeout(total=_HIF_FETCH_TIMEOUT),
+            ) as resp:
+                try:
+                    ttl = float(resp.headers.get("x-hif-ttl"))
+                except (TypeError, ValueError):
+                    ttl = _HIF_DEFAULT_TTL
+                js = await resp.json(content_type=None)
+            value = ((js.get("data") or {}).get("biz_data") or {}).get("value")
+            if value:
+                _hif_cache["value"] = value
+                _hif_cache["expire_at"] = now + max(ttl - _HIF_REFRESH_MARGIN, 1.0)
+                _hif_cache["retry_at"] = 0.0
+                return value
+            logger.warning("[hif] 风控令牌端点应答异常（缺 value），60s 后重试")
+        except Exception as exc:
+            logger.warning("[hif] 取风控令牌失败（降级为不带该头）: %s", exc)
+        _hif_cache["retry_at"] = time.time() + _HIF_FAIL_BACKOFF
+        return None
+
+
 async def check_token_status(token_id):
-    """Probe authentication without creating a chat or sending model content."""
+    """探测令牌在上游的真实状态（禁言 / 作废 / 正常），不创建会话。
+
+    移植自 1515asd/rh-deeperseeker v89.7：优先用只读的 users/current
+    识别禁言硬证据；探测失败或无法下结论时回退到原有的 PoW 认证挑战
+    逻辑，保证行为不劣于移植前。
+    """
     token = get_token(token_id)
     if not token:
         return {"id": token_id, "status": "NOT_FOUND", "error": "Token 不存在"}
+
+    probe = await probe_token_mute(token["token"])
+    verdict = probe["verdict"]
+    if verdict == "muted":
+        until = _format_mute_until(probe.get("mute_until"))
+        mark_quarantined(
+            token_id, f"user is muted (until {until})", probe.get("mute_until")
+        )
+        return {
+            "id": token_id,
+            "status": "MUTED",
+            "error": f"上游确认禁言，解禁时间 {until}；已自动隔离",
+            "mute_until": probe.get("mute_until"),
+        }
+    if verdict == "ok":
+        # 上游确认账号已解禁时解除此前的禁言隔离，无需管理员另行操作。
+        current = get_token(token_id)
+        if current and current.get("status") == "QUARANTINED":
+            restore_token(token_id)
+        update_token_check(token_id, "ACTIVE")
+        return {"id": token_id, "status": "ACTIVE", "error": None}
+    if verdict == "invalid":
+        error = "令牌已被上游作废（过期或被登出），需重新添加账号或令牌"
+        update_token_check(token_id, "INVALID", error)
+        return {"id": token_id, "status": "INVALID", "error": error}
 
     try:
         # The challenge endpoint authenticates the bearer token and has no model
@@ -2525,6 +2955,7 @@ _ORPHAN_CLOSER_RE = re.compile(
     re.IGNORECASE,
 )
 
+
 def _strip_stray_markers(text):
     """清理正文中的残损标记、裸装饰串和孤立闭标签。"""
     if not text:
@@ -3559,6 +3990,11 @@ async def _send_message_unlocked(
     headers = get_headers(
         auth_token, await solve_create_pow("/api/v0/chat/completion", auth_token)
     )
+    # 移植自 1515asd/rh-deeperseeker v89.8：默认关闭时零网络、零行为变化；
+    # 开启后取不到令牌即降级为不带该头，绝不阻断对话请求。
+    _hif = await get_hif_token()
+    if _hif:
+        headers["x-hif-leim"] = _hif
     json_data = {
         "chat_session_id": chat_id,
         "parent_message_id": parent_message_id,
@@ -3630,6 +4066,13 @@ async def _send_message_unlocked(
                 continue
             recent_events.append(data)
             recent_events = recent_events[-5:]
+
+            # 移植自 1515asd/rh-deeperseeker v89.7：禁言报文藏在外层
+            # code=0 的嵌套业务信封里，只按外层状态判断会把它当成正常
+            # 应答并继续用死号发请求。命中布尔硬证据即抛隔离异常。
+            _envelope = data.get("data") if isinstance(data, dict) else None
+            if isinstance(_envelope, dict):
+                _raise_if_muted_envelope(_envelope.get("biz_data"))
 
             # c181d06：上游 error 事件携带真实状态码（429/403/502），必须按码
             # 上报；此前一律被归类为「上下文超限」，会误导排查方向。

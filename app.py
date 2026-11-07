@@ -45,6 +45,7 @@ from functions import (  # noqa: E402
     ReasoningMarkupFilter,
     StreamToolParser,
     TokenLease,
+    UpstreamMutedError,
     add_token,
     check_token_status,
     close_session,
@@ -69,6 +70,7 @@ from functions import (  # noqa: E402
     login_deepseek_account,
     mark_active,
     mark_limited,
+    mark_quarantined,
     next_parent,
     parse_tools,
     peek_cached_input,
@@ -76,6 +78,7 @@ from functions import (  # noqa: E402
     record_cached_input,
     record_file,
     record_rotation,
+    relogin_account,
     request_effort,
     request_tools,
     reset_cached_input,
@@ -698,6 +701,33 @@ def check_key(request: Request):
 def _upstream_http_code(exc):
     m = re.match(r"HTTP (\d{3}):", str(exc))
     return int(m.group(1)) if m else None
+
+
+async def _safe_relogin(token_id):
+    """后台重登的异常边界：fire-and-forget 任务不得留下未检索异常。"""
+    try:
+        await relogin_account(token_id)
+    except Exception as exc:
+        logger.warning("[relogin] 后台重登失败：%s", exc)
+
+
+async def _handle_upstream_failure(e, token_id):
+    """上游 401/403/429 失败入库的统一入口。
+
+    移植自 1515asd/rh-deeperseeker v89.7 / v89.12：
+      * 确认禁言（UpstreamMutedError，上游布尔硬证据）立即隔离并记录解禁
+        时间，不再进入限流冷却后重新参与轮换；
+      * 其余失败沿用本地既有的 mark_limited 冷却通道；
+      * 仅鉴权形态失效（401）触发桥内登录自动重登，重登自带节流与并发
+        去重；未通过账号登录加入的令牌在该分支内零开销返回。
+    """
+    if isinstance(e, UpstreamMutedError):
+        await _db(mark_quarantined, token_id, str(e), e.mute_until)
+        return
+    await _db(mark_limited, token_id)
+    if _upstream_http_code(e) == 401:
+        with suppress(Exception):
+            asyncio.create_task(_safe_relogin(token_id))
 
 
 def _api_error_response(e, is_anthropic=False):
@@ -1680,7 +1710,7 @@ async def handle_chat(
         # 与真正的故障混为一谈。会话映射在两种路径下都必须清除，否则已失效的
         # parent_message_id 会让下一轮从错误分支继续，造成会话分叉。
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id)
+            await _handle_upstream_failure(e, token_id)
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning(
                 "Chat request rejected by upstream (session %s, parent %s): %s",
@@ -1903,7 +1933,7 @@ async def stream_response(
         # c181d06：限流属可预期状态，以 warning 记录并按码标记；其它异常才是
         # 故障，走 exception。两条路径都清除会话映射，避免失效的 parent 造成分叉。
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id)
+            await _handle_upstream_failure(e, token_id)
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_response upstream HTTP %s: %s", code, e)
         else:
@@ -2108,7 +2138,7 @@ async def stream_anthropic_response(
         # c181d06：与 stream_response 同理，限流按 warning 记录并标记，其它异常
         # 走 exception；两条路径均清除会话映射。
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id)
+            await _handle_upstream_failure(e, token_id)
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_anthropic_response upstream HTTP %s: %s", code, e)
         else:
@@ -3180,7 +3210,7 @@ async def stream_responses_response(
         failed = True
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id)
+            await _handle_upstream_failure(e, token_id)
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_responses_response upstream HTTP %s: %s", code, e)
         else:
@@ -4018,6 +4048,8 @@ async def dashboard_status(request: Request):
                     "status": tok["status"],
                     "inflight": inflight.get(tok["id"], 0),
                     "limited_until": tok["limited_until"],
+                    "quarantine_reason": tok.get("quarantine_reason"),
+                    "mute_until": tok.get("mute_until"),
                     "last_checked_at": tok["last_checked_at"],
                     "last_check_error": tok["last_check_error"],
                     "rotation": rotations.get(tok["id"]),
@@ -4143,7 +4175,7 @@ async def accounts_add(request: Request):
         )
     try:
         auth_token = await login_deepseek_account(email, password)
-        save_account_login(email, alias, auth_token)
+        save_account_login(email, alias, auth_token, password=password)
         return RedirectResponse(
             "/dashboard?account_message=" + quote("账号登录成功，已加入 Token 号池"),
             status_code=303,
