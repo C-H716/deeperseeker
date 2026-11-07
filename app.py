@@ -1,5 +1,6 @@
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
 import mimetypes
@@ -157,6 +158,7 @@ from plugin_helper import (
     build_prompt,
     build_summary_request_prompt,
     context_window_tokens,
+    estimate_conversation_tokens,
     extract_and_upload_files,
     generate_signature,
     generate_signature_sync,
@@ -952,6 +954,76 @@ async def _record_usage_safe(
     return None
 
 
+ROLLOVER_SUPPRESS_SECONDS = int(os.getenv("DEEPSEEKER_ROLLOVER_SUPPRESS_SECONDS", "600"))
+# 自上次滚动以来客户端历史至少新增这么多（相对上下文预算的比例）token，才
+# 允许再次滚动。保证抑制不会把远超上游上限的内容硬塞进新 chat。
+ROLLOVER_RESUME_FRACTION = float(
+    os.getenv("DEEPSEEKER_ROLLOVER_RESUME_FRACTION", "0.25")
+)
+_ROLLOVER_LAST = OrderedDict()
+_ROLLOVER_LAST_MAX = 4096
+
+
+def _conversation_root(messages, model, scope):
+    """One stable key per client conversation, immune to per-turn sig drift."""
+    first_user = next((m for m in messages if m.get("role") == "user"), None)
+    seed = ""
+    if first_user is not None:
+        c = first_user.get("content", "")
+        if isinstance(c, list):
+            seed = " ".join(
+                p.get("text", "")
+                for p in c
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        else:
+            seed = str(c)
+    return hashlib.sha256(f"{model}_{scope}_{seed[:2000]}".encode()).hexdigest()
+
+
+def _should_rollover(messages, model, scope, tools=None):
+    """needs_rollover() 加上「刚滚过就别再滚」的抑制窗口。
+
+    客户端每轮重发完整历史，rollover 只迁移上游 chat，不会让客户端历史变短。
+    因此一旦越线，needs_rollover() 在之后每个用户轮都为真，每轮都多跑一次
+    摘要请求（实测 +20~30s）。抑制窗口让同一会话在刚滚过的这段时间里跳过
+    重复摘要，直到历史又明显增长或窗口过期。
+    """
+    if not needs_rollover(messages, tools):
+        return False
+    key = _conversation_root(messages, model, scope)
+    last = _ROLLOVER_LAST.get(key)
+    if last is None:
+        return True
+    last_ts, last_tokens = last
+    age = time.time() - last_ts
+    if age >= ROLLOVER_SUPPRESS_SECONDS:
+        return True
+    current = estimate_conversation_tokens(messages)
+    resume_at = last_tokens + max(
+        1, int(context_window_tokens() * ROLLOVER_RESUME_FRACTION)
+    )
+    if current >= resume_at:
+        return True
+    logger.info(
+        "Context rollover suppressed (root=%s age=%ds tokens=%d resume_at=%d)",
+        key[:12],
+        int(age),
+        current,
+        resume_at,
+    )
+    return False
+
+
+def _note_rollover(messages, model, scope):
+    """记录一次已完成的滚动，供后续轮次跳过重复摘要。"""
+    key = _conversation_root(messages, model, scope)
+    _ROLLOVER_LAST[key] = (time.time(), estimate_conversation_tokens(messages))
+    _ROLLOVER_LAST.move_to_end(key)
+    while len(_ROLLOVER_LAST) > _ROLLOVER_LAST_MAX:
+        _ROLLOVER_LAST.popitem(last=False)
+
+
 def _resp_parent(parent_message_id):
     """Parent for the turn after this reply: the reply's real id when DeepSeek
     reported it (a fork gets ids after everything already in the chat)."""
@@ -1183,7 +1255,9 @@ async def handle_chat(
                         new_session_id = await create_new_chat(new_tok["token"])
                         rot_owner = await _own_chat_lock(new_session_id)
                         await _db(save_session, sig, new_token_id, new_session_id, 0)
-                        if _context_retried or needs_rollover(messages, tools):
+                        if _context_retried or _should_rollover(
+                            messages, model, scope, tools
+                        ):
                             scratch_chat = await create_new_chat(new_tok["token"])
                             summary_gen = send_message(
                                 scratch_chat,
@@ -1197,6 +1271,8 @@ async def handle_chat(
                             rollover_summary = strip_summary_tags(
                                 await collect_response(summary_gen)
                             )[: MAX_SUMMARY_TOKENS * 4]
+                            # 记录本次滚动，后续轮次据此跳过重复摘要。
+                            _note_rollover(messages, model, scope)
                         prompt = await build_prompt(
                             messages,
                             tools or [],
@@ -1443,7 +1519,9 @@ async def handle_chat(
                 # bare 500 with the dead token never marked. Route it through
                 # the same classifier the send path uses.
                 try:
-                    if _context_retried or needs_rollover(messages, tools):
+                    if _context_retried or _should_rollover(
+                        messages, model, scope, tools
+                    ):
                         scratch_chat = await create_new_chat(tok["token"])
                         summary_gen = send_message(
                             scratch_chat,
@@ -1465,6 +1543,8 @@ async def handle_chat(
                             count_tok(rollover_summary),
                             scratch_chat,
                         )
+                        # 记录本次滚动，后续轮次据此跳过重复摘要。
+                        _note_rollover(messages, model, scope)
 
                     session_id = await create_new_chat(tok["token"])
                     await _db(save_session, sig, token_id, session_id, 0)
@@ -1555,7 +1635,7 @@ async def handle_chat(
                 parent_message_id = fresh["parent_message_id"]
 
         if parent_message_id != 0 and (
-            _context_retried or needs_rollover(messages, tools)
+            _context_retried or _should_rollover(messages, model, scope, tools)
         ):
             logger.info(
                 "Context rollover: accumulated context over limit; purging session mappings for chat %s",
@@ -1575,6 +1655,8 @@ async def handle_chat(
             rollover_summary = strip_summary_tags(await collect_response(summary_gen))[
                 : MAX_SUMMARY_TOKENS * 4
             ]
+            # 记录本次滚动，后续轮次据此跳过重复摘要。
+            _note_rollover(messages, model, scope)
             session_id = await create_new_chat(tok["token"])
             await _db(save_session, sig, token_id, session_id, 0)
             parent_message_id = 0
