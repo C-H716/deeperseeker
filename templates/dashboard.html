@@ -17,24 +17,24 @@
             </div>
             {% if tokens %}
             <div class="table-wrap">
-                <table>
+                <table class="pool-table">
                     <thead>
                         <tr>
-                            <th>编号</th>
-                            <th>别名</th>
-                            <th>状态</th>
-                            <th>说明</th>
-                            <th>占用</th>
-                            <th>最近使用</th>
-                            <th>冷却</th>
-                            <th class="ta-right">操作</th>
+                            <th class="col-id">编号</th>
+                            <th class="col-alias">别名</th>
+                            <th class="col-status">状态</th>
+                            <th class="col-note">说明</th>
+                            <th class="col-inflight">占用</th>
+                            <th class="col-last">最近使用</th>
+                            <th class="col-cool">冷却</th>
+                            <th class="col-ops ta-right">操作</th>
                         </tr>
                     </thead>
                     <tbody>
                         {% for tok in tokens %}
                         <tr data-token-id="{{ tok['id'] }}">
                             <td class="mono muted">{{ tok['id'] }}</td>
-                            <td>{{ tok['label'] }}</td>
+                            <td class="alias-cell" title="{{ tok['label'] }}">{{ tok['label'] }}</td>
                             <td data-cell="status">
                                 <span class="status {{ tok['state_class'] }}">
                                     {% if tok['status'] == 'ACTIVE' %}有效{% elif tok['status'] == 'RATE_LIMITED' %}限流冷却{% elif tok['status'] == 'PARKED' %}已停放{% elif tok['status'] == 'QUARANTINED' %}已隔离{% elif tok['status'] == 'INVALID' %}已失效{% elif tok['status'] == 'CHECK_ERROR' %}检查失败{% else %}{{ tok['status'] }}{% endif %}
@@ -44,7 +44,7 @@
                             <td data-cell="inflight">{{ tok['in_flight'] }}</td>
                             <td class="muted nowrap" data-cell="last_used">{{ tok['last_used'] }}</td>
                             <td class="muted nowrap" data-cell="cooldown">{{ tok['cooldown'] }}</td>
-                            <td class="ta-right nowrap">
+                            <td class="ta-right ops-cell">
                                 {% if tok['can_restore'] %}
                                 <form method="post" action="/tokens/{{ tok['id'] }}/restore" class="inline-form">
                                     <button type="submit" class="btn-sm btn-secondary" title="清空冷却与停放状态，立即放回轮换">恢复</button>
@@ -134,19 +134,22 @@
                 <h2>添加 Token</h2>
             </div>
             <div class="card-body">
-                <details class="guide">
-                    <summary>如何获取 Token？</summary>
+                <div class="guide">
+                    <p class="guide-title">如何获取 Token？</p>
                     <ol>
                         <li>打开浏览器无痕/隐私窗口</li>
                         <li>访问 <a href="https://chat.deepseek.com" target="_blank" rel="noopener">chat.deepseek.com</a> 并完整走完登录流程（可能要求邮箱验证码）</li>
                         <li>打开开发者工具（F12）→ Console，粘贴并回车：</li>
                     </ol>
-                    <code class="block">JSON.parse(localStorage.getItem("userToken")).value</code>
+                    <button type="button" class="code-copy" id="copy-token-expr" title="点击复制到剪贴板">
+                        <code>JSON.parse(localStorage.getItem("userToken")).value</code>
+                        <span class="code-copy-hint">点击复制</span>
+                    </button>
                     <ol start="4">
                         <li>复制返回的 Token，去掉首尾引号</li>
                         <li>关闭无痕窗口以保留登录状态</li>
                     </ol>
-                </details>
+                </div>
                 <div class="warning">在浏览器里退出 DeepSeek 会让该 Token 立即失效。建议在自己设备、住宅网络下获取，机房 IP 出生的会话更容易被风控。</div>
                 <form method="post" action="/tokens/add" class="stack" id="add-token-form">
                     <label class="field">
@@ -159,6 +162,49 @@
                     </label>
                     <button type="submit" class="btn-block">加入号池</button>
                 </form>
+                <script>
+                // 点击代码块即复制；优先 Clipboard API，非安全上下文回退到 execCommand。
+                (function() {
+                    const btn = document.getElementById('copy-token-expr');
+                    if (!btn) return;
+                    const hint = btn.querySelector('.code-copy-hint');
+                    const expr = btn.querySelector('code').textContent;
+                    let timer = null;
+                    function flash(text, ok) {
+                        hint.textContent = text;
+                        btn.classList.toggle('copied', !!ok);
+                        clearTimeout(timer);
+                        timer = setTimeout(function() {
+                            hint.textContent = '点击复制';
+                            btn.classList.remove('copied');
+                        }, 1600);
+                    }
+                    function fallbackCopy(text) {
+                        const ta = document.createElement('textarea');
+                        ta.value = text;
+                        ta.setAttribute('readonly', '');
+                        ta.style.position = 'fixed';
+                        ta.style.opacity = '0';
+                        document.body.appendChild(ta);
+                        ta.select();
+                        let ok = false;
+                        try { ok = document.execCommand('copy'); } catch (e) {}
+                        document.body.removeChild(ta);
+                        return ok;
+                    }
+                    btn.addEventListener('click', function() {
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            navigator.clipboard.writeText(expr).then(function() {
+                                flash('已复制', true);
+                            }).catch(function() {
+                                flash(fallbackCopy(expr) ? '已复制' : '复制失败', true);
+                            });
+                        } else {
+                            flash(fallbackCopy(expr) ? '已复制' : '复制失败', true);
+                        }
+                    });
+                })();
+                </script>
                 <script>
                 (function() {
                     const inp = document.getElementById('auth-token-input');
