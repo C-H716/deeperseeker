@@ -1035,7 +1035,7 @@ def test_send_message_includes_shumei_device_id_when_cookie_present(monkeypatch)
         mock.AsyncMock(
             return_value={
                 "aws-waf-token": "cookie-val",
-                ".thumbcache_abc": "test%2Bthumb%3D%3D",
+                ".thumbcache_abc": "Btest%2Bthumb%3D%3D",
             }
         ),
     )
@@ -1077,6 +1077,23 @@ def test_send_message_includes_shumei_device_id_when_cookie_present(monkeypatch)
     asyncio.run(run())
     assert captured_json.get("shumei_device_id") == "Btest+thumb=="
     assert "parent_message_id" not in captured_json
+
+    # 非 B 开头的值不是真机指纹：不发实值，但键必须保留（发 null）。PR #107
+    # 新版在这里选择「整个键省略」，与 rh v90.2 的实测冲突——带
+    # parent_message_id 的后续轮次缺该键会被 biz_code 26 拒绝，而 null 放行。
+    monkeypatch.setattr(
+        functions,
+        "get_cookies_safely",
+        mock.AsyncMock(
+            return_value={
+                "aws-waf-token": "cookie-val",
+                ".thumbcache_abc": "non_b_token%3D%3D",
+            }
+        ),
+    )
+    asyncio.run(run())
+    assert "shumei_device_id" in captured_json
+    assert captured_json["shumei_device_id"] is None
 
 
 def test_send_message_always_sends_shumei_device_id_key(monkeypatch):
@@ -1277,16 +1294,17 @@ def test_40303_challenge_required_parks_token_and_returns_generic_error(monkeypa
     assert row["status"] == "PARKED"
     assert row["rate_limited_until"] > time.time() + 1700
 
-    # Test client error formatting delivers captcha challenge message
+    # 对外只回通用 500 + 固定文案：40303 的「验证码/风控」细节不暴露给客户端
+    # （PR #107 评审意见：公开仓库不该把这类信息写进响应体）。
     resp_openai = app._api_error_response(err, is_anthropic=False)
-    assert resp_openai.status_code == 403
+    assert resp_openai.status_code == 500
     data_openai = json.loads(resp_openai.body.decode())
-    assert data_openai["error"]["message"] == functions.CAPTCHA_PARK_REASON
+    assert data_openai["error"]["message"] == "Internal server error"
 
     resp_anthropic = app._api_error_response(err, is_anthropic=True)
-    assert resp_anthropic.status_code == 403
+    assert resp_anthropic.status_code == 500
     data_anthropic = json.loads(resp_anthropic.body.decode())
-    assert data_anthropic["error"]["message"] == functions.CAPTCHA_PARK_REASON
+    assert data_anthropic["error"]["message"] == "Internal server error"
 
 
 def test_solve_captcha_interactive(monkeypatch, tmp_path):

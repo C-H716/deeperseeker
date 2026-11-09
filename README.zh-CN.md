@@ -14,6 +14,7 @@
 
 ```bash
 uv sync
+uv run patchright install chromium          # 安装浏览器内核（Linux 上如缺少系统依赖可加 --with-deps）
 cp .env.example .env      # 修改面板口令与 API Key
 uv run deeperseeker
 ```
@@ -23,8 +24,11 @@ uv run deeperseeker
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+patchright install chromium                 # 安装浏览器内核（Linux 上如缺少系统依赖可加 --with-deps）
 python3 app.py
 ```
+
+> **说明：** DeeperSeeker 1:1 模拟桌面端 Chrome 客户端，包括 Sec-CH-UA hints、WebAssembly PoW 挑战求解、数美（Shumei）设备令牌转发与 HIF 认证令牌。绕过 DeepSeek 的 Cloudflare / AWS WAF 护盾以及获取数美设备标识，需要系统安装 Patchright（防检测加固版 Playwright）与 Chromium 内核——执行上面的安装命令即可。缺少时启动会直接失败并报 `CookieGenerationError: playwright is not installed`。
 
 ### Docker / Podman
 

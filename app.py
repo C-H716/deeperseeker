@@ -392,7 +392,9 @@ async def lifespan(app: FastAPI):
     if restore_message != "backup disabled":
         logger.info("[ds_backup] %s", restore_message)
     _install_key_access_formatter()
-    asyncio.create_task(_warmup_cookies_startup())
+    # 启动预热改为阻塞：新版预热在「所有令牌都已有 shumei 指纹」时零浏览器
+    # 启动，阻塞成本很低；换来的是服务就绪时 cookie 一定可用（PR #107 评审）。
+    await _warmup_cookies_startup()
     _backup_task = asyncio.create_task(ds_backup.background_loop(), name="token-backup")
     yield
     if _backup_task:
@@ -745,8 +747,10 @@ def _api_error_response(e, is_anthropic=False):
     # client-visible error body passes the secret scrub, one discipline.
     message = _redact_secret_material(str(e)[:500])
     if getattr(e, "biz_code", None) == 40303 or "40303" in str(e):
-        captcha_message = CAPTCHA_PARK_REASON
-        message = captcha_message
+        # 40303 是上游人机验证拦截。对外只回通用 500，不暴露「验证码/风控」
+        # 这类可被用来探测桥行为的细节（PR #107 评审意见）。
+        code = 500
+        message = "Internal server error"
     if is_anthropic:
         payload = {
             "type": "error",
@@ -798,8 +802,9 @@ def _terminal_error_response(e, is_anthropic=False):
         trace = uuid.uuid4().hex  # direct invocation path (tests, scripts)
     message = _redact_secret_material(str(e)[:500])
     if getattr(e, "biz_code", None) == 40303 or "40303" in str(e):
-        captcha_message = CAPTCHA_PARK_REASON
-        message = captcha_message
+        # 同上：40303 对外只回通用 500。
+        code = 500
+        message = "Internal server error"
     if is_anthropic:
         payload = {
             "type": "error",
@@ -3718,7 +3723,7 @@ AUTO_MODE_REGEX = re.compile(r"\s+".join(_AUTO_MODE_WORDS))
 
 
 def is_auto_mode_mock_enabled() -> bool:
-    return os.getenv("DEEPSEEKER_AUTO_MODE_MOCK", "").strip().lower() in (
+    return os.getenv("DEEPSEEKER_AUTO_MODE_MOCK", "false").strip().lower() in (
         "1",
         "true",
         "yes",
