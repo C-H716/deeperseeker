@@ -29,7 +29,7 @@ frozenlist==1.8.0
     #   aiohttp
     #   aiosignal
 greenlet==3.5.6
-    # via playwright
+    # via patchright
 h11==0.16.0
     # via uvicorn
 idna==3.20
@@ -46,7 +46,7 @@ multidict==6.9.1
     #   yarl
 opentelemetry-api==1.45.0
     # via fastapi
-playwright==1.63.0
+patchright==1.64.4
     # via -r requirements-waf-backup.in
 propcache==0.5.4
     # via
@@ -56,8 +56,8 @@ pydantic==2.13.5
     # via fastapi
 pydantic-core==2.46.5
     # via pydantic
-pyee==13.0.1
-    # via playwright
+pyee==14.0.0
+    # via patchright
 python-dotenv==1.2.4
     # via -r requirements.in
 python-multipart==0.0.32

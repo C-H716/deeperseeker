@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 
 # 本机代理转发 deb.debian.org 时会出现 500/502 与连接重置，导致
-# `playwright install --with-deps` 拉不齐 Debian 包并以退出码 100 失败。此处
+# `patchright install --with-deps` 拉不齐 Debian 包并以退出码 100 失败。此处
 # 提高 apt 的重试次数与超时，并把源端点由 HTTP 改为 HTTPS，规避代理对明文
 # HTTP 的干扰。该配置对本文件后续所有 apt 调用（含 Playwright 的内部调用）生效。
 RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries
@@ -33,19 +33,20 @@ COPY pyproject.toml uv.lock requirements-waf-backup.txt ./
 
 # Upstream switched this step to `uv sync`, which installs only the default
 # dependency group. The local login risk check still needs headless Chromium,
-# so install the self-contained waf-backup superset (base deps + playwright)
+# so install the self-contained waf-backup superset (base deps + patchright)
 # instead of the plain lock, then fetch the matching browser build.
 RUN uv pip install --system --no-cache -r requirements-waf-backup.txt
 
-# Headless Chromium is required at runtime: the DeepSeek login risk check only
-# accepts the device ID published by the web client's fingerprint SDK. The
-# browser install pulls dozens of Debian packages through the same unstable
-# proxy as the base image, so it is retried; if the mirrors stay unreachable it
-# is skipped with a warning, because only the optional Playwright fallback needs
-# Chromium while the primary Android-header login path does not.
+# Headless Chromium is required at runtime: WAF cookie harvesting and Shumei
+# device-id acquisition both drive a real browser through Patchright, and
+# startup warmup now runs before the service is ready. The browser install
+# pulls dozens of Debian packages through the same unstable proxy as the base
+# image, so it is retried; if the mirrors stay unreachable it is skipped with a
+# warning, but cookie generation will then fail at startup — treat a missing
+# Chromium as a broken deployment, not a degraded one.
 RUN ok=0; for attempt in 1 2 3; do \
-      if playwright install --with-deps chromium; then ok=1; break; fi; \
-      echo "playwright install attempt $attempt failed; retrying in 10s"; \
+      if patchright install --with-deps chromium; then ok=1; break; fi; \
+      echo "patchright install attempt $attempt failed; retrying in 10s"; \
       sleep 10; \
     done; \
     if [ "$ok" = "1" ]; then echo "chromium ready"; \
