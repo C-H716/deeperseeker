@@ -229,7 +229,7 @@ def test_handle_chat_retries_empty_sse_on_parent_zero():
             ("delete_sessions_for_chat", lambda *a: None),
             ("save_session", lambda *a: None),
             ("parse_tools", lambda t: ([], t)),
-            ("format_response", lambda text, model, messages, tools=None: text),
+            ("format_response", lambda text, model, messages, tools=None, **kw: text),
         ]
         saved = [(name, getattr(app_module, name)) for name, _ in patches]
         for name, fn in patches:
@@ -324,7 +324,7 @@ def test_handle_chat_rotates_to_another_token_on_429():
         ("delete_sessions_for_chat", lambda *a: None),
         ("save_session", lambda *a: None),
         ("parse_tools", lambda t: ([], t)),
-        ("format_response", lambda text, model, messages, tools=None: text),
+        ("format_response", lambda text, model, messages, tools=None, **kw: text),
     ]
 
     async def run():
@@ -415,7 +415,7 @@ def test_handle_chat_rotates_on_40029_fetch_files():
         ("delete_sessions_for_chat", lambda *a: None),
         ("save_session", lambda *a: None),
         ("parse_tools", lambda t: ([], t)),
-        ("format_response", lambda text, model, messages, tools=None: text),
+        ("format_response", lambda text, model, messages, tools=None, **kw: text),
     ]
 
     async def run():

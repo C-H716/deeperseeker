@@ -1053,6 +1053,31 @@ def _remember_prompt_tokens(next_sig, prompt_tokens):
         record_cached_input(next_sig, prompt_tokens)
 
 
+def _cache_hit_for(sig, prior_sig, prompt_tokens):
+    """本轮可从上游 prompt 缓存复用的 token 数。
+
+    上一轮以 next_sig（该轮 messages + 该轮回复）为键记下前缀大小；本轮
+    prior_sig 是「截到最后一个 assistant」的签名，二者相等才算命中。sig
+    含本轮新增的 user 消息，与写入键永不相等，只能作为首轮回退。
+    """
+    return _cached_prompt_tokens(prior_sig or sig, prompt_tokens)
+
+
+def _usage_cached_tokens(usage):
+    """从 OpenAI 风格 usage 里取缓存命中数，兼容桥接响应与官方响应。"""
+    if not isinstance(usage, dict):
+        return 0
+    details = usage.get("prompt_tokens_details")
+    candidates = []
+    if isinstance(details, dict):
+        candidates.append(details.get("cached_tokens"))
+    candidates.append(usage.get("cache_read_input_tokens"))
+    for value in candidates:
+        if isinstance(value, (int, float)):
+            return max(0, int(value))
+    return 0
+
+
 def _resp_parent(parent_message_id):
     """Parent for the turn after this reply: the reply's real id when DeepSeek
     reported it (a fork gets ids after everything already in the chat)."""
@@ -1860,18 +1885,20 @@ async def handle_chat(
                 if is_anthropic
                 else ("responses" if is_responses else "openai")
             )
+            in_tokens = count_tok(_messages_text(messages))
+            cached = _cache_hit_for(sig, prior_sig, in_tokens)
             await _record_usage_safe(
                 scope,
                 surface,
                 req_model or model,
-                count_tok(_messages_text(messages)),
+                in_tokens,
                 count_tok(_completion_usage_text(clean_text, parsed_tools)),
                 token_id=token_id,
-                cached_tokens=_cached_prompt_tokens(
-                    sig, count_tok(_messages_text(messages))
-                ),
+                cached_tokens=cached,
             )
-            return format_response(resp_text, model, messages, tools)
+            return format_response(
+                resp_text, model, messages, tools, cached_tokens=cached
+            )
     except asyncio.CancelledError:
         # B2 (Stage 1 audit): the client went away mid-request — the exchange
         # never completed upstream, so the stored parent_message_id would fork
@@ -2243,6 +2270,7 @@ async def stream_response(
                 # SDKs simply ignore it. Skipped on aborted/failed streams so a
                 # partial response never pollutes billing.
                 in_tokens = count_tok(_messages_text(messages))
+                cached = _cache_hit_for(sig, prior_sig, in_tokens)
                 # B7: usage on the cleaned completion, not raw full_text —
                 # think-tag reasoning and tool markup are not billed output.
                 usage_out = _completion_usage_text(clean_text, parsed_tools)
@@ -2257,13 +2285,16 @@ async def stream_response(
                     in_tokens,
                     out_tokens,
                     token_id=token_id,
-                    cached_tokens=_cached_prompt_tokens(sig, in_tokens),
+                    cached_tokens=cached,
                 )
                 usage_chunk = _chat_chunk([], cid=cid, created=created, model=model)
                 usage_chunk["usage"] = {
                     "prompt_tokens": in_tokens,
                     "completion_tokens": out_tokens,
                     "total_tokens": in_tokens + out_tokens,
+                    # prompt_tokens 含缓存部分；客户端按 prompt - cacheRead
+                    # 推出未命中输入，缺这个字段会把命中率读成恒 0。
+                    "prompt_tokens_details": {"cached_tokens": cached},
                 }
                 yield f"data: {json.dumps(usage_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -2286,8 +2317,11 @@ async def stream_anthropic_response(
 ):
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     in_tokens = count_tok(_messages_text(messages))
+    cached = _cache_hit_for(sig, prior_sig, in_tokens)
     model_name = req_model if req_model else model
-    start_evt = f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model_name, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': in_tokens, 'output_tokens': 1}}})}\n\n"
+    # Anthropic 口径：input_tokens 不含缓存读，缓存部分单列，客户端把两者
+    # 相加即得到完整输入；保持 input_tokens 为全量会把缓存重复计一次。
+    start_evt = f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model_name, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': in_tokens - cached, 'output_tokens': 1, 'cache_read_input_tokens': cached}}})}\n\n"
     yield start_evt
 
     parser = StreamToolParser()
@@ -2482,7 +2516,7 @@ async def stream_anthropic_response(
                     in_tokens,
                     out_tokens,
                     token_id=token_id,
-                    cached_tokens=_cached_prompt_tokens(sig, in_tokens),
+                    cached_tokens=cached,
                 )
                 for evt in tail_events.split("\n\n"):
                     if evt.strip():
@@ -2508,7 +2542,9 @@ def _completion_usage_text(clean_text, parsed_tools):
     return "\n".join(parts)
 
 
-def format_response(text, model, messages, tools=None, response_format=None):
+def format_response(
+    text, model, messages, tools=None, response_format=None, cached_tokens=0
+):
     if response_format is None:
         response_format = request_response_format.get()
 
@@ -2529,6 +2565,7 @@ def format_response(text, model, messages, tools=None, response_format=None):
         clean_text = json_mode_coerce(clean_text)
 
     in_tokens = count_tok(_messages_text(messages))
+    cached = max(0, min(int(cached_tokens or 0), in_tokens))
     # B7: bill the CLEANED completion (see _completion_usage_text), not the
     # raw upstream text whose thinking + markup share the client never asked
     # to pay for.
@@ -2539,7 +2576,7 @@ def format_response(text, model, messages, tools=None, response_format=None):
     # 的逐小时聚合仍以采样落库时的小时键为准，两者对同一小时不会给出不同档位。
     charge = cost_of_hour(
         model,
-        {"cache_hit": 0, "cache_miss": in_tokens, "output": out_tokens},
+        {"cache_hit": cached, "cache_miss": in_tokens - cached, "output": out_tokens},
         hour_key(beijing_now()),
     )
     cost = charge["total"]
@@ -2568,6 +2605,9 @@ def format_response(text, model, messages, tools=None, response_format=None):
             "prompt_tokens": in_tokens,
             "completion_tokens": out_tokens,
             "total_tokens": in_tokens + out_tokens,
+            # prompt_tokens 含缓存部分；DSH 等客户端按 prompt - cacheRead
+            # 推出未命中输入，缺这个字段会把命中率读成恒 0。
+            "prompt_tokens_details": {"cached_tokens": cached},
             "cost": round(cost, 6),
         },
     }
@@ -2597,6 +2637,8 @@ def format_anthropic_response(result, model):
                 }
             )
     usage = result.get("usage", {})
+    cached = _usage_cached_tokens(usage)
+    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
     msg_id = result["id"]
     if not msg_id.startswith("msg_"):
         msg_id = f"msg_{msg_id.replace('chatcmpl-', '')}"
@@ -2609,8 +2651,10 @@ def format_anthropic_response(result, model):
         "stop_reason": "tool_use" if msg.get("tool_calls") else "end_turn",
         "stop_sequence": None,
         "usage": {
-            "input_tokens": usage.get("prompt_tokens", 0),
+            # 与流式 message_start 同口径：input_tokens 不含缓存读。
+            "input_tokens": max(0, prompt_tokens - cached),
             "output_tokens": usage.get("completion_tokens", 0),
+            "cache_read_input_tokens": cached,
         },
     }
 
@@ -2657,11 +2701,14 @@ def _normalize_responses_tools(tools):
     return out
 
 
-def _responses_usage(in_tokens, out_tokens):
+def _responses_usage(in_tokens, out_tokens, cached_tokens=0):
+    # input_tokens 是全量输入，cached_tokens 是其中可复用的前缀；客户端按
+    # input - cached 推出未命中输入，写死 0 会让命中率永远显示 0%。
+    cached = max(0, min(int(cached_tokens or 0), int(in_tokens or 0)))
     return {
         "input_tokens": in_tokens,
         "input_tokens_details": {
-            "cached_tokens": 0,
+            "cached_tokens": cached,
             "cache_write_tokens": 0,
         },
         "output_tokens": out_tokens,
@@ -2833,6 +2880,7 @@ def format_responses_response(result, model=None, opts=None):
     raw_usage = result.get("usage", {})
     in_tokens = raw_usage.get("prompt_tokens", raw_usage.get("input_tokens", 0))
     out_tokens = raw_usage.get("completion_tokens", raw_usage.get("output_tokens", 0))
+    cached = _usage_cached_tokens(raw_usage)
     preset_id = opts.get("_resp_id") if isinstance(opts, dict) else None
     raw_id = str(result.get("id", ""))
     if preset_id:
@@ -2852,7 +2900,7 @@ def format_responses_response(result, model=None, opts=None):
         model_name,
         output,
         status="completed",
-        usage=_responses_usage(in_tokens, out_tokens),
+        usage=_responses_usage(in_tokens, out_tokens, cached),
         completed_at=completed_at,
         error=None,
         opts=opts,
@@ -3177,6 +3225,7 @@ async def stream_responses_response(
         combined_stream_text = msg_text + "".join(flushed_chunks)
         final_text = combined_stream_text if combined_stream_text else clean_text
         in_tokens = count_tok(_messages_text(messages))
+        cached = _cache_hit_for(sig, prior_sig, in_tokens)
         usage_out = _completion_usage_text(clean_text, parsed_tools)
         out_tokens = count_tok(usage_out) if usage_out else 0
 
@@ -3334,7 +3383,7 @@ async def stream_responses_response(
                     model_name,
                     completed_output,
                     status="completed",
-                    usage=_responses_usage(in_tokens, out_tokens),
+                    usage=_responses_usage(in_tokens, out_tokens, cached),
                     completed_at=int(time.time()),
                     error=None,
                     opts=opts,
@@ -3349,7 +3398,7 @@ async def stream_responses_response(
                     in_tokens,
                     out_tokens,
                     token_id=token_id,
-                    cached_tokens=_cached_prompt_tokens(sig, in_tokens),
+                    cached_tokens=cached,
                 )
             except asyncio.CancelledError:
                 pass

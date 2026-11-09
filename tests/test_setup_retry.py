@@ -86,7 +86,7 @@ def _run_create_path_scenario():
         ("delete_sessions_for_chat", lambda *a: None),
         ("save_session", fake_save),
         ("parse_tools", lambda t: ([], t)),
-        ("format_response", lambda text, model, messages, tools=None: text),
+        ("format_response", lambda text, model, messages, tools=None, **kw: text),
         ("needs_rollover", lambda messages, tools: False),
     ]
 
@@ -173,7 +173,7 @@ def test_create_path_waf_202_rotates_and_recovers():
         ("delete_sessions_for_chat", lambda *a: None),
         ("save_session", lambda *a, **k: None),
         ("parse_tools", lambda t: ([], t)),
-        ("format_response", lambda text, model, messages, tools=None: text),
+        ("format_response", lambda text, model, messages, tools=None, **kw: text),
         ("needs_rollover", lambda messages, tools: False),
     ]
 
