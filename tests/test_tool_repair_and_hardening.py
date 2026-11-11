@@ -1078,9 +1078,8 @@ def test_send_message_includes_shumei_device_id_when_cookie_present(monkeypatch)
     assert captured_json.get("shumei_device_id") == "Btest+thumb=="
     assert "parent_message_id" not in captured_json
 
-    # 非 B 开头的值不是真机指纹：不发实值，但键必须保留（发 null）。PR #107
-    # 新版在这里选择「整个键省略」，与 rh v90.2 的实测冲突——带
-    # parent_message_id 的后续轮次缺该键会被 biz_code 26 拒绝，而 null 放行。
+    # Shumei web cookie (.thumbcache_) omits leading 'B', while SMSdk.getDeviceId()
+    # and completion payload always normalize with leading 'B':
     monkeypatch.setattr(
         functions,
         "get_cookies_safely",
@@ -1092,8 +1091,8 @@ def test_send_message_includes_shumei_device_id_when_cookie_present(monkeypatch)
         ),
     )
     asyncio.run(run())
-    assert "shumei_device_id" in captured_json
-    assert captured_json["shumei_device_id"] is None
+    assert captured_json.get("shumei_device_id") == "Bnon_b_token=="
+    assert captured_json.get("shumei_device_id").startswith("B")
 
 
 def test_send_message_always_sends_shumei_device_id_key(monkeypatch):
