@@ -37,6 +37,10 @@ COPY pyproject.toml uv.lock requirements-waf-backup.txt ./
 # instead of the plain lock, then fetch the matching browser build.
 RUN uv pip install --system --no-cache -r requirements-waf-backup.txt
 
+# 把浏览器装到固定路径并放开读权限：运行用户切到非特权账号后仍能读到内核，
+# 同时清掉 apt 索引减小镜像体积（移植自 PR #107 5f4ac1d15）。
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
 # Headless Chromium is required at runtime: WAF cookie harvesting and Shumei
 # device-id acquisition both drive a real browser through Patchright, and
 # startup warmup now runs before the service is ready. The browser install
@@ -49,8 +53,9 @@ RUN ok=0; for attempt in 1 2 3; do \
       echo "patchright install attempt $attempt failed; retrying in 10s"; \
       sleep 10; \
     done; \
-    if [ "$ok" = "1" ]; then echo "chromium ready"; \
-    else echo "WARN: chromium unavailable (mirror unreachable); Playwright fallback disabled"; fi
+    if [ "$ok" = "1" ]; then \
+      chmod -R 755 /ms-playwright && rm -rf /var/lib/apt/lists/* && echo "chromium ready"; \
+    else echo "WARN: chromium unavailable (mirror unreachable); Patchright fallback disabled"; fi
 
 COPY . .
 
@@ -67,9 +72,8 @@ ENV HOST=0.0.0.0
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD curl -sf http://localhost:4000/health || exit 1
 
-# If reverting to backup Playwright cookie generation, run under xvfb:
+# If reverting to visible-browser Patchright cookie generation, run under xvfb:
 # CMD ["sh", "-c", "xvfb-run -a -s '-screen 0 1280x720x24' python3 app.py"]
-# might also need requirements-waf-backup edition
 # Upstream runs `uv sync`, which also installs this project and creates the
 # `deeperseeker` console script. This image installs dependencies only (from the
 # waf-backup lock), so invoke the entrypoint module directly instead.

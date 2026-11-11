@@ -37,13 +37,13 @@ security = HTTPBasic()
 
 
 from functions import (
-    CAPTCHA_PARK_REASON,
     CookieGenerationError,
     ReasoningMarkupFilter,
     StreamToolParser,
     UpstreamError,
     acquire_token_slot,
     add_token,
+    are_all_tokens_busy,
     captcha_park_token,
     close_session,
     cookie_file_path,
@@ -584,8 +584,16 @@ class _OwnedChatLock:
 
 async def _own_chat_lock(session_id):
     """Acquire this chat's lock and return its ownership token."""
-    token = _OwnedChatLock(_chat_lock(session_id))
+    chat_l = _chat_lock(session_id)
+    # 排队可观测性：同一会话被并发请求打进来时，等待与获得各记一条，
+    # 便于区分「上游慢」与「自己在排队」（移植自 PR #107 5f4ac1d15）。
+    was_locked = chat_l.locked()
+    if was_locked:
+        logger.info("Chat lock: session %s busy, request waiting", session_id)
+    token = _OwnedChatLock(chat_l)
     await token.acquire()
+    if was_locked:
+        logger.info("Chat lock: session %s acquired, proceeding", session_id)
     return token
 
 
@@ -1237,6 +1245,11 @@ async def handle_chat(
         return JSONResponse(
             {"error": "No auth token. Add via dashboard."}, status_code=401
         )
+
+    # 号池全忙时提前留一条日志：后续若卡在排队，日志里能看出原因
+    # （移植自 PR #107 5f4ac1d15）。
+    if are_all_tokens_busy():
+        logger.info("Token pool: all tokens busy, request waiting for available slot")
 
     has_prior_turn = any(
         m.get("role") in ("assistant", "tool") for m in messages
@@ -2200,7 +2213,7 @@ async def stream_response(
                 yield part
         else:
             err_msg = (
-                CAPTCHA_PARK_REASON
+                "Internal server error"
                 if (getattr(e, "biz_code", None) == 40303 or "40303" in str(e))
                 else str(e)[:300]
             )
@@ -2411,7 +2424,7 @@ async def stream_anthropic_response(
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.exception("stream_anthropic_response failed")
         err_msg = (
-            CAPTCHA_PARK_REASON
+            "Internal server error"
             if (getattr(e, "biz_code", None) == 40303 or "40303" in str(e))
             else str(e)[:300]
         )
