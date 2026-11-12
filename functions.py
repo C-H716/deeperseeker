@@ -1500,7 +1500,7 @@ async def warmup_all_tokens_cookies():
 
 
 async def solve_captcha_interactive(token_id: int) -> bool:
-    """Launch a real visible Playwright browser for the given token on chat.deepseek.com.
+    """Launch a real visible Patchright browser for the given token on chat.deepseek.com.
 
     Injects the user's auth_token into localStorage and any existing cookies,
     allowing the operator to solve any Cloudflare/Shumei captcha
@@ -3544,16 +3544,34 @@ def parse_tools(text):
                         items = (
                             parsed_obj if isinstance(parsed_obj, list) else [parsed_obj]
                         )
-                        if isinstance(parsed_obj, dict) and isinstance(
+                        wrapped = isinstance(parsed_obj, dict) and isinstance(
                             parsed_obj.get("tool_calls") or parsed_obj.get("calls"),
                             list,
-                        ):
+                        )
+                        if wrapped:
                             items = parsed_obj.get("tool_calls") or parsed_obj.get(
                                 "calls"
                             )
+                        # 整段回复就是 JSON 时，允许按参数推断工具名（模型在输出
+                        # 裸工具调用）；嵌在散文里的 JSON 则必须有显式工具标记，
+                        # 否则只要注册了一个 schema，普通的 JSON 例子也会被吞成
+                        # 工具调用（PR #107 review）。
+                        pure_json = clean_text.lstrip().startswith(("{", "["))
                         recognized = []
                         for it in items:
                             if not isinstance(it, dict):
+                                continue
+                            has_marker = any(
+                                k in it
+                                for k in (
+                                    "name",
+                                    "tool",
+                                    "tool_name",
+                                    "function",
+                                    "action",
+                                )
+                            )
+                            if not wrapped and not has_marker and not pure_json:
                                 continue
                             c_name = (
                                 it.get("name")

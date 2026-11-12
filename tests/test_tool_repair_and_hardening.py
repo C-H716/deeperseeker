@@ -186,6 +186,22 @@ def test_bare_json_ignored_when_no_tools_in_request():
         request_tools.reset(token)
 
 
+def test_prose_json_example_not_swallowed_with_single_schema():
+    """只注册一个 schema 时，散文里的 JSON 例子不能被当成工具调用。
+
+    移植自 PR #107 review：旧实现对每个 {/[ 都 raw_decode，只要参数键碰巧
+    命中 schema，普通 JSON 示例就会被吞掉并转成工具调用。
+    """
+    token = request_tools.set([_tool("only_tool", ["path"], ["path"])])
+    try:
+        text = 'Here is an example: {"path": "/tmp/demo", "note": "ordinary prose"}'
+        tools, clean = parse_tools(text)
+        assert tools == []
+        assert '{"path": "/tmp/demo"' in clean
+    finally:
+        request_tools.reset(token)
+
+
 def test_corrupted_dsml_markers_stripped():
     corrupt = "<｜触｜DSML｜｜ calls>"
     text = f"Hello {corrupt} World </｜｜DSML｜｜>"

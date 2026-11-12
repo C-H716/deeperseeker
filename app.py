@@ -373,11 +373,31 @@ async def _db(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
+# 启动预热状态供 /health 读取：预热在后台跑，服务不会被它拖住
+# （PR #107 review：多令牌串行预热会让服务数分钟不可达）。
+_WARMUP_STATE = {
+    "status": "idle",
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+}
+_warmup_task = None
+
+
 async def _warmup_cookies_startup():
+    _WARMUP_STATE["status"] = "running"
+    _WARMUP_STATE["started_at"] = time.time()
+    _WARMUP_STATE["error"] = None
     try:
         await warmup_all_tokens_cookies()
     except Exception as e:
+        _WARMUP_STATE["status"] = "failed"
+        _WARMUP_STATE["error"] = _redact_secret_material(str(e))[:200]
         logger.warning("Startup cookie warmup error: %s", e)
+    else:
+        _WARMUP_STATE["status"] = "done"
+    finally:
+        _WARMUP_STATE["finished_at"] = time.time()
 
 
 _backup_task = None
@@ -385,18 +405,22 @@ _backup_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _backup_task
+    global _backup_task, _warmup_task
     await _db(init_db)
     # 号池为空时尝试从加密备份恢复；未配置备份时保持静默。
     restore_message = await _db(ds_backup.restore_if_needed)
     if restore_message != "backup disabled":
         logger.info("[ds_backup] %s", restore_message)
     _install_key_access_formatter()
-    # 启动预热改为阻塞：新版预热在「所有令牌都已有 shumei 指纹」时零浏览器
-    # 启动，阻塞成本很低；换来的是服务就绪时 cookie 一定可用（PR #107 评审）。
-    await _warmup_cookies_startup()
+    # 预热放后台：服务立即就绪，/health 用 warmup 字段报告进度。
+    _warmup_task = asyncio.create_task(_warmup_cookies_startup(), name="cookie-warmup")
     _backup_task = asyncio.create_task(ds_backup.background_loop(), name="token-backup")
     yield
+    if _warmup_task and not _warmup_task.done():
+        _warmup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _warmup_task
+    _warmup_task = None
     if _backup_task:
         _backup_task.cancel()
         with suppress(asyncio.CancelledError):
@@ -714,11 +738,9 @@ def _upstream_http_code(exc):
     if biz in (40029, 50006, "40029", "50006"):
         return 429
     status = getattr(exc, "status", None)
-    if status == 202 or (
-        isinstance(exc, Exception)
-        and "202" in str(exc)
-        and ("mimetype" in str(exc) or "text/html" in str(exc) or "WAF" in str(exc))
-    ):
+    # 只认结构化字段：错误正文里恰好出现 "202"（日期 2025-…、消息 ID 12023）
+    # 不能当成 WAF 202，否则会误触发 cookie 失效与浏览器重启（PR #107 review）。
+    if str(status) == "202" or str(biz) == "202":
         return 429
     if isinstance(status, int) and 400 <= status <= 599:
         return status
@@ -728,7 +750,10 @@ def _upstream_http_code(exc):
 async def _record_upstream_limit(token_id, exc, code):
     biz = getattr(exc, "biz_code", None)
     retry_after = getattr(exc, "retry_after", None)
-    if "WAF" in str(exc) or "202" in str(exc):
+    # 同上：WAF 202 只依据 status / biz_code 判断，避免正文里的 "202" 子串
+    # 触发全局 cookie 失效与浏览器重启风暴（PR #107 review）。
+    status = getattr(exc, "status", None)
+    if str(status) == "202" or str(biz) == "202":
         await _db(invalidate_token_cookies, token_id)
     if biz == 40303 or code == 40303 or "40303" in str(exc):
         captcha_park_duration = retry_after or 1800
@@ -4882,12 +4907,19 @@ def _strip_token_quotes(token: str) -> str:
     return token
 
 
+_TOKEN_VALUE_PREFIX_RE = re.compile(r'^["\']?value["\']?\s*[:=]\s*(.+)$', re.IGNORECASE)
+
+
 def clean_auth_token(raw: str) -> str:
     """把粘贴进来的 Token 洗成裸串。
 
     面板粘贴的形态五花八门：首尾引号与空格、``value: 'xxx'`` 前缀、
     ``{"value":"xxx"}`` 整段 JSON。这里反复清洗到稳定，一次调用即可覆盖
     ``value: "'xxx'"`` 这类叠加包裹。
+
+    注意：``value: xxx`` 这种**裸前缀**不会被剥离——以 ``value:`` 开头的
+    合法 Token 必须原样保留（PR #107 review）。只有值被引号包裹、或整体是
+    JSON 对象时，才认定它是粘贴包装。
     """
     if not raw:
         return ""
@@ -4899,9 +4931,12 @@ def clean_auth_token(raw: str) -> str:
                 parsed = json.loads(token)
                 if isinstance(parsed, dict) and "value" in parsed:
                     token = str(parsed["value"])
-        m = re.match(r'^(?:"?value"?)\s*[:=]\s*(.+)$', token.strip(), re.IGNORECASE)
+        m = _TOKEN_VALUE_PREFIX_RE.match(token.strip())
         if m:
-            token = m.group(1)
+            candidate = m.group(1).strip()
+            unwrapped = _strip_token_quotes(candidate)
+            if unwrapped != candidate:
+                token = unwrapped
         token = _strip_token_quotes(token)
         if token == before:
             break
@@ -5058,7 +5093,7 @@ async def tokens_restore(token_id: int, request: Request):
 
 @app.post("/tokens/{token_id}/solve_captcha")
 async def tokens_solve_captcha(token_id: int, request: Request):
-    """Launch real visible Playwright browser to solve captcha on chat.deepseek.com for this account."""
+    """Launch a real visible Patchright browser to solve captcha on chat.deepseek.com for this account."""
     try:
         get_current_admin(request)
     except HTTPException:
@@ -5153,10 +5188,18 @@ async def health(request: Request):
     if deep and not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
     data = {"status": "ok" if ok else "degraded"}
+    # 预热在后台进行：让探针能看到它是否还在跑，而不是误把「服务起不来」
+    # 当成故障（PR #107 review）。
+    data["warmup"] = _WARMUP_STATE["status"]
     if check_key(request):
         data["active_tokens"] = active
         data["cookies_valid"] = cookies_valid
         data["version"] = APP_VERSION
+        data["warmup_detail"] = {
+            "started_at": _WARMUP_STATE["started_at"],
+            "finished_at": _WARMUP_STATE["finished_at"],
+            "error": _WARMUP_STATE["error"],
+        }
 
         # P0-9 (Day 26): deep probe. Authenticated callers can ask for one
         # real end-to-end upstream round trip (PoW challenge -> solve ->

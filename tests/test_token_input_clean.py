@@ -59,9 +59,17 @@ def test_curly_and_fullwidth_quotes_are_stripped():
 
 
 def test_value_prefix_is_stripped():
-    assert clean_auth_token("value: " + TOKEN) == TOKEN
-    assert clean_auth_token("value=" + TOKEN) == TOKEN
+    """带引号的 value 包装会被剥掉；裸 value: 前缀见下一个测试。"""
+    assert clean_auth_token("value: '" + TOKEN + "'") == TOKEN
+    assert clean_auth_token('value="' + TOKEN + '"') == TOKEN
     assert clean_auth_token('"value": "' + TOKEN + '"') == TOKEN
+
+
+def test_token_starting_with_value_prefix_is_untouched():
+    """以 value: / value= 开头的合法 Token 不能被误剥（PR #107 review）。"""
+    for prefix in ("value:", "value=", "value: ", "value = "):
+        raw = prefix + TOKEN
+        assert clean_auth_token(raw) == raw
 
 
 def test_json_wrapper_is_unwrapped():

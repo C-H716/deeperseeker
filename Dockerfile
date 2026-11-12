@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 本机代理转发 deb.debian.org 时会出现 500/502 与连接重置，导致
 # `patchright install --with-deps` 拉不齐 Debian 包并以退出码 100 失败。此处
 # 提高 apt 的重试次数与超时，并把源端点由 HTTP 改为 HTTPS，规避代理对明文
-# HTTP 的干扰。该配置对本文件后续所有 apt 调用（含 Playwright 的内部调用）生效。
+# HTTP 的干扰。该配置对本文件后续所有 apt 调用（含 Patchright 的内部调用）生效。
 RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries
 RUN echo 'Acquire::http::Timeout "30";' >> /etc/apt/apt.conf.d/80-retries
 RUN echo 'Acquire::https::Timeout "30";' >> /etc/apt/apt.conf.d/80-retries

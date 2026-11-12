@@ -29,3 +29,5 @@ deeperseeker.db-wal
 deeperseeker.db-shm
 .python-version
 .ruff_cache
+# 本地工作记忆/项目数据，仅保留在本机，不进入版本库
+.workbuddy-ai/
