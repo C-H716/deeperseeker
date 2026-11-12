@@ -10,8 +10,6 @@
 Run:  python _fix_strip.py   （已执行，不要再次运行）
 """
 
-import io
-
 PATH = "functions.py"
 
 NEW = r'''# 残损/退化 DSML 标记的兜底：结构化正则要求「干净的」标签形状，模型退化时
@@ -64,7 +62,8 @@ _STREAM_ENTRY_TAGS = (
 
 MARK = "# 残损/退化 DSML 标记的兜底"
 
-lines = io.open(PATH, encoding="utf-8").read().split("\n")
+with open(PATH, encoding="utf-8") as f:
+    lines = f.read().split("\n")
 idx = [i for i, ln in enumerate(lines) if ln.startswith(MARK)]
 assert len(idx) == 1, idx
 i = idx[0]
@@ -77,5 +76,6 @@ if new_lines and new_lines[-1] == "":
     new_lines.pop()
 lines[i : i + 2] = new_lines
 
-io.open(PATH, "w", encoding="utf-8", newline="\n").write("\n".join(lines))
+with open(PATH, "w", encoding="utf-8", newline="\n") as f:
+    f.write("\n".join(lines))
 print("已写回，新行数:", len(lines))

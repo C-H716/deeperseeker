@@ -122,10 +122,7 @@ def is_peak_hour(dt):
     """该时刻是否落在高峰窗口内（仅工作日）。"""
     if dt.weekday() >= 5:  # 周六、周日全天低峰
         return False
-    for start, end in PEAK_WINDOWS:
-        if start <= dt.hour < end:
-            return True
-    return False
+    return any(start <= dt.hour < end for start, end in PEAK_WINDOWS)
 
 
 def is_peak_hour_key(key):
